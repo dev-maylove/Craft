@@ -1115,6 +1115,13 @@ and every edit its builder made would have been refused. A rule drawn from one l
 misses the other: build it from the typed list the code already keeps (`OWN_NAMES`), and test
 both layouts.
 
+**A message that only `ps` delivered.** `rebuild - "<note>" --continue-in <dir> --resume` threw the
+note away (`--resume` meant "the request is ignored"), and five notes sent to a running rebuild
+that way still reached the builder: it ran `ps`, read the CLI's command line and quoted "a note on
+this run's command line". The sixth was cut short there and the builder repeated its last check.
+Everything a person types to a run reaches the builder through the run, never by luck; and when a
+builder quotes something you never saw it receive, find out how it got there.
+
 **A retry that took "no message" for "brand new".** A run with no message and no `continuing`
 flag was read as a first build, and Try again starts exactly that run. A browser that died during
 the final check failed a finished build; Try again then studied the original again and gave the
