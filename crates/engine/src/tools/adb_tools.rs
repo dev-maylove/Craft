@@ -879,7 +879,8 @@ type MapCapture<'a> = dyn FnMut(&mut adb_ui::ScreenMap, &str, &str, &[String]) -
 /// screen's first position, and from each further focus position on it the keys that act on the
 /// focus or move it on. A skipped screen is never walked from, the first one included.
 /// `capture(map, from, key, path)` reads the screen `path` reaches; `limit` ends the walk before
-/// a key when a budget is spent.
+/// a key when a budget is spent. A screen the device couldn't read is noted in `unreadable` and
+/// the walk goes on.
 fn walk_map(
     map: &mut adb_ui::ScreenMap,
     start: Arrived,
@@ -887,6 +888,7 @@ fn walk_map(
     explore: &[String],
     capture: &mut MapCapture<'_>,
     limit: &dyn Fn(&adb_ui::ScreenMap) -> Option<MapStop>,
+    unreadable: &mut Vec<Value>,
 ) -> Result<MapStop, ToolError> {
     let start = match start {
         Arrived::New(id) | Arrived::Seen { id, .. } => id,
@@ -900,10 +902,12 @@ fn walk_map(
             }
             let mut next = path.clone();
             next.push(key.clone());
-            match capture(map, &from, key, &next)? {
-                Arrived::New(id) => frontier.push_back((id, next, true)),
-                Arrived::Seen { id, new_focus: true } => frontier.push_back((id, next, false)),
-                Arrived::Seen { .. } | Arrived::Skipped | Arrived::Left => {}
+            match capture(map, &from, key, &next) {
+                Ok(Arrived::New(id)) => frontier.push_back((id, next, true)),
+                Ok(Arrived::Seen { id, new_focus: true }) => frontier.push_back((id, next, false)),
+                Ok(Arrived::Seen { .. } | Arrived::Skipped | Arrived::Left) => {}
+                Err(e) if is_unreadable(&e) => unreadable.push(json!({"from": from, "key": key, "path": next})),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -2283,6 +2287,9 @@ fn adb_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError
     // Counters the capture closure and the loop both read.
     let presses = std::cell::Cell::new(0u64);
     let captures = std::cell::Cell::new(0u64);
+    // Screens the device couldn't read (a dump that stayed empty): the key is noted and the walk
+    // goes on; one such reading used to end a map an hour in, with nothing written.
+    let mut unreadable: Vec<Value> = Vec::new();
     // One capture: launch afresh, press `path`, read the screen into a temporary folder, then
     // keep it under the state's id (new), drop it (seen before, skipped, or not the app at all).
     let capture = |map: &mut adb_ui::ScreenMap, from: Option<&str>, key: Option<&str>, path: &[String]| -> Result<Arrived, ToolError> {
@@ -2334,7 +2341,7 @@ fn adb_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError
     let limit = |map: &adb_ui::ScreenMap| {
         if cancel.is_cancelled() {
             Some(MapStop::Cancelled)
-        } else if map.len() >= p.max_states {
+        } else if kept_states(map) >= p.max_states {
             Some(MapStop::MaxStates)
         } else if presses.get() >= u64::from(p.max_presses) {
             Some(MapStop::MaxPresses)
@@ -2344,8 +2351,8 @@ fn adb_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError
             None
         }
     };
-    let stop = walk_map(&mut map, first, &start_path, &explore, &mut |m, from, key, path| capture(m, Some(from), Some(key), path), &limit)?;
-    let kept = map.states().iter().filter(|s| s.skipped.is_none()).count();
+    let stop = walk_map(&mut map, first, &start_path, &explore, &mut |m, from, key, path| capture(m, Some(from), Some(key), path), &limit, &mut unreadable)?;
+    let kept = kept_states(&map);
     let skipped = map.len() - kept;
     let meta = json!({
         "serial": serial,
@@ -2361,6 +2368,7 @@ fn adb_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError
         "presses": presses.get(),
         "captures": captures.get(),
         "seconds": started.elapsed().as_secs(),
+        "unreadable": unreadable,
     });
     let screens = map.to_json(meta);
     let file = outdir.join("screens.json");
@@ -2394,9 +2402,29 @@ fn adb_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError
             format!("The map is partial: {why}. Raise the limit, or map from a deeper screen with start_keys (or adb_ui_walkthrough_record)."),
         ));
     }
+    if let Some(n) = screens["unreadable"].as_array().map(Vec::len).filter(|n| *n > 0) {
+        e = e.limitation(Limitation::new(
+            "unreadable",
+            format!(
+                "{n} key press(es) led to a screen the device couldn't read (listed under `unreadable` in screens.json); whatever they open is not on the map."
+            ),
+        ));
+    }
     let e = e.build()?;
     made.keep();
     done(e)
+}
+
+/// Screens a map keeps (a row left alone by skip_texts is in the map, but isn't a kept screen).
+fn kept_states(map: &adb_ui::ScreenMap) -> usize {
+    map.states().iter().filter(|s| s.skipped.is_none()).count()
+}
+
+/// A capture that ended because the screen's controls couldn't be read (an empty dump after its
+/// retries): the map goes on without it. Anything else (adb gone, a folder that can't be made)
+/// still ends the map.
+fn is_unreadable(e: &ToolError) -> bool {
+    e.code == ErrorCode::GarbledOutput
 }
 
 /// The crash-log lines grouped by the crashing process, keeping the groups that name `package`.
@@ -2576,7 +2604,7 @@ mod tests {
             Ok(arrive_at(m, Some(from), Some(key), path, &nodes, fp, &skip, 8))
         };
         let limit = |_: &adb_ui::ScreenMap| (read.borrow().len() > 200).then_some(MapStop::MaxPresses);
-        let stop = walk_map(&mut map, first, &[], &explore, &mut capture, &limit).unwrap();
+        let stop = walk_map(&mut map, first, &[], &explore, &mut capture, &limit, &mut Vec::new()).unwrap();
         (map, read.into_inner(), stop)
     }
 
@@ -2627,6 +2655,33 @@ mod tests {
         let home = &map.states()[0];
         let titles: Vec<&str> = home.focuses.iter().map(|f| f.title.as_str()).collect();
         assert_eq!(titles, ["Play", "Info", "Play"], "three positions, the titles kept as they read");
+    }
+
+    /// A map ends at max_states kept screens: rows left alone by skip_texts don't count, and a
+    /// screen the device couldn't read is noted, not fatal.
+    #[test]
+    fn a_map_counts_kept_screens_and_survives_an_unreadable_one() {
+        let mut map = adb_ui::ScreenMap::new();
+        let state = |id: String, skipped: Option<String>| adb_ui::MapState {
+            id,
+            name: "x".into(),
+            fingerprint: String::new(),
+            path: Vec::new(),
+            parent: None,
+            key: None,
+            skipped,
+            focused_title: None,
+            count: 0,
+            files: None,
+            focuses: Vec::new(),
+        };
+        map.arrive(None, None, "a", |id| state(id, None));
+        map.arrive(Some("s01"), Some("DPAD_DOWN"), "b", |id| state(id, Some("Programme".into())));
+        map.arrive(Some("s01"), Some("DPAD_UP"), "c", |id| state(id, None));
+        assert_eq!(map.len(), 3);
+        assert_eq!(kept_states(&map), 2, "the skipped row is in the map but not kept");
+        assert!(is_unreadable(&ToolError::new(ErrorCode::GarbledOutput, "none")));
+        assert!(!is_unreadable(&ToolError::new(ErrorCode::EngineMissing, "adb gone")));
     }
 
     /// The walkthrough and the map (R2.12) check every step and limit before adb is run, run in
