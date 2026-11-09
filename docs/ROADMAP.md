@@ -1694,7 +1694,7 @@ Gaps found while using the app for real projects.
       — claimed: tanish2k09, branch bugfix/r2.9-plugin-args-bad-list
 - [ ] The plugin form doesn't check that a command exists or that the plugin answers before it's
       saved; #2153 also asks for that (a found-program check, a test call)
-- [ ] Prevent the native macOS Touch Bar shutdown crash by adopting the published AccessKit KVO
+- [x] Prevent the native macOS Touch Bar shutdown crash by adopting the published AccessKit KVO
       fix through the coordinated GUI stack, preserving accessibility and normal shutdown;
       add dependency regression coverage and verify native Quit/window close — claimed: dbzx6r,
       branch bugfix/r2.9-macos-touchbar-upstream

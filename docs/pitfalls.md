@@ -1337,3 +1337,11 @@ exclusive-creation checks after selecting a name.
 then a fixed number of frames left the next action outside the settled layout. Wait for the
 background operation to finish and run immediate repaints after scrolling before clicking;
 otherwise a missed click looks like a backend mutation that never completed.
+
+**A passing headless suite did not exercise native macOS shutdown.** Touch Bar AppKit
+observers can abort during AccessKit window teardown after the app's own exit hook returns.
+Keep accessibility enabled and adopt the released observer-preservation fix; an early
+`process::exit` can skip asynchronous preference writes and process-ownership cleanup.
+Test actual Quit and window close on the affected hardware, check new crash reports and
+reopen to verify persistence. A dependency-version guard prevents downgrades but does not
+replace that native test. See `docs/macos-touchbar-crash.md`.
