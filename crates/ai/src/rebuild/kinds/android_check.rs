@@ -173,6 +173,38 @@ pub fn weakest_from_claims(claims: &[Claim], n: usize) -> Vec<String> {
     by_screen.into_iter().take(n).map(|(who, total, failed)| format!("{who} ({} of {total} claims fail)", failed)).collect()
 }
 
+/// The longest wait a saved map's `timing` can ask for: the map tool's own limit.
+const MAX_WAIT_MS: u64 = 60_000;
+
+/// Wait `d` in short steps, so a pause or the round's time limit ends it within a moment.
+fn wait(stop: &CheckStop, d: Duration) -> Result<(), ToolError> {
+    let end = Instant::now() + d;
+    loop {
+        stop.check()?;
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// Whether the crash log names the package: `None` when it couldn't be read, since a log that
+/// wasn't read is no evidence of no crash.
+fn crash_of(log: Result<ToolOutput, ToolError>) -> Option<bool> {
+    match log {
+        Ok(ToolOutput::Evidence(e)) => e.result.get("crashed").and_then(Value::as_bool),
+        _ => None,
+    }
+}
+
+/// The "no crash" claim for one device; it holds only when the log was read and names no crash.
+fn crash_claim(prefix: &str, package: &str, serial: &str, crashed: Option<bool>) -> Claim {
+    let how = if crashed.is_some() { "the device's crash log names it" } else { "the device's crash log couldn't be read" };
+    let no = if prefix.is_empty() { "No" } else { "no" };
+    Claim::new(format!("{prefix}{no} crash of {package} on {serial}"), crashed == Some(false), how)
+}
+
 /// The check: install, replay, judge; then the gate device when set and the first was good enough.
 pub struct DeviceCheck;
 
@@ -186,15 +218,18 @@ impl DeviceCheck {
     }
 
     /// One pass on one device: install, every kept screen, the crash log. `dir` is this pass's
-    /// folder; returns the states, whether it crashed, and the installed APK.
-    fn pass(cx: &mut CheckCx, serial: &str, package: &str, apk: &Path, screens: &Value, dir: &Path) -> Result<(Vec<StateScore>, bool), ToolError> {
+    /// folder; returns the states and whether it crashed (`None` when the crash log couldn't be
+    /// read). A pause or the round's time limit ends it with an error, waits included.
+    fn pass(cx: &mut CheckCx, serial: &str, package: &str, apk: &Path, screens: &Value, dir: &Path) -> Result<(Vec<StateScore>, Option<bool>), ToolError> {
         let build = cx.build_settings();
         cx.call("adb_app_install", json!({"serial": serial, "apk_path": apk, "replace": true}))?;
         let category = screens.get("launch_category").and_then(Value::as_str).unwrap_or("leanback");
         let timing = &screens["timing"];
-        let wait_ms = timing.get("wait_ms").and_then(Value::as_u64).unwrap_or(u64::from(build.android_wait_ms));
-        let lead_ms = timing.get("dump_lead_ms").and_then(Value::as_u64).unwrap_or(u64::from(build.android_dump_lead_ms));
-        let launch_wait = Duration::from_millis(timing.get("launch_wait_ms").and_then(Value::as_u64).unwrap_or(u64::from(build.android_launch_wait_ms)));
+        // A saved map is a file anyone can edit: its waits are held to what the map tool allows.
+        let ms = |key: &str, setting: u32| timing.get(key).and_then(Value::as_u64).unwrap_or(u64::from(setting)).min(MAX_WAIT_MS);
+        let wait_ms = ms("wait_ms", build.android_wait_ms);
+        let lead_ms = ms("dump_lead_ms", build.android_dump_lead_ms);
+        let launch_wait = Duration::from_millis(ms("launch_wait_ms", build.android_launch_wait_ms));
         let map_dir = cx.ws.capture_dir().join("map");
         let read = |p: &Path| std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
         // Each screen's capture makes its own folder and needs the parent to be there.
@@ -214,7 +249,7 @@ impl DeviceCheck {
             let launched = cx.call("adb_app_launch", json!({"serial": serial, "package": package, "category": category})).is_ok();
             let mut built = Value::Null;
             if launched {
-                std::thread::sleep(launch_wait);
+                wait(&cx.stop(), launch_wait)?;
                 let got = cx.call(
                     "adb_screen_state_capture",
                     json!({"serial": serial, "keys": path, "wait_ms": wait_ms, "dump_lead_ms": lead_ms, "output_directory": out.display().to_string()}),
@@ -225,7 +260,7 @@ impl DeviceCheck {
                 // The focus lands a moment after the controls are drawn (Compose asks for it
                 // once the screen is up): a dump with nothing focused is read once more.
                 if focus_not_yet(&original, &built) {
-                    std::thread::sleep(Duration::from_millis(wait_ms.min(10_000)));
+                    wait(&cx.stop(), Duration::from_millis(wait_ms.min(10_000)))?;
                     let again = match cx.call("adb_ui_read", json!({"serial": serial})) {
                         Ok(ToolOutput::Evidence(e)) => e.result.clone(),
                         _ => Value::Null,
@@ -242,11 +277,10 @@ impl DeviceCheck {
             let files = out.strip_prefix(&cx.ws.root).ok().map(|p| p.to_string_lossy().to_string()).filter(|_| out.join("ui.json").is_file());
             states.push(StateScore { likeness: likeness(&claims), id, name, claims, files });
         }
-        let crashed = match cx.call("adb_crash_log_read", json!({"serial": serial, "package": package, "count": 500})) {
-            Ok(ToolOutput::Evidence(e)) => e.result.get("crashed").and_then(Value::as_bool).unwrap_or(false),
-            _ => false,
-        };
-        Ok((states, crashed))
+        let log = cx.call("adb_crash_log_read", json!({"serial": serial, "package": package, "count": 500}));
+        // A log read cut by a pause or the limit ends the pass; any other failure leaves it unknown.
+        cx.stop().check()?;
+        Ok((states, crash_of(log)))
     }
 }
 
@@ -312,10 +346,13 @@ impl Check for DeviceCheck {
             Err(e) => return Ok(CheckResult::new(DEVICE, round, false, format!("Couldn't install or drive the build on {serial}: {}", e.message))),
         };
         let mut claims: Vec<Claim> = states.iter().flat_map(|s| s.claims.clone()).collect();
-        claims.push(Claim::new(format!("No crash of {package} on {serial}"), !crashed, "the device's crash log names it"));
+        claims.push(crash_claim("", &package, &serial, crashed));
         let read_any = states.iter().any(|s| s.files.is_some());
         let mut unknowns: Vec<String> =
             states.iter().filter(|s| s.files.is_none()).map(|s| format!("{} {} couldn't be read on the device", s.id, s.name)).collect();
+        if crashed.is_none() {
+            unknowns.push(format!("the crash log of {package} on {serial} couldn't be read"));
+        }
         let mut score = likeness(&claims);
         let mut note = format!(
             "Device check on {serial}: {score:.0}% alike over {} screen(s) ({} of {} claims hold).",
@@ -327,25 +364,35 @@ impl Check for DeviceCheck {
         if !weak.is_empty() {
             note.push_str(&format!(" Weakest: {}.", weak.join(", ")));
         }
-        if crashed {
-            note.push_str(&format!(" {package} crashed on the device: see the crash claim."));
+        match crashed {
+            Some(true) => note.push_str(&format!(" {package} crashed on the device: see the crash claim.")),
+            None => note.push_str(" The device's crash log couldn't be read, so a crash isn't ruled out."),
+            Some(false) => {}
         }
         // The gate: the same pass on the second device, once the first is good enough.
         let mut gate = None;
         let mut gate_ok = true;
         if let Some(gs) = gate_serial {
-            if score >= good_enough && !crashed {
+            if score >= good_enough && crashed == Some(false) {
                 let gdir = dir.join("gate");
                 std::fs::create_dir_all(&gdir).map_err(|e| ToolError::io(gdir.display(), e))?;
                 match Self::pass(cx, &gs, &package, &apk, &screens, &gdir) {
                     Ok((gstates, gcrashed)) => {
                         let mut gclaims: Vec<Claim> =
                             gstates.iter().flat_map(|s| s.claims.clone()).map(|c| Claim { title: format!("Test device: {}", c.title), ..c }).collect();
-                        gclaims.push(Claim::new(format!("Test device: no crash of {package} on {gs}"), !gcrashed, "the device's crash log names it"));
+                        gclaims.push(crash_claim("Test device: ", &package, &gs, gcrashed));
+                        if gcrashed.is_none() {
+                            unknowns.push(format!("the crash log of {package} on the test device {gs} couldn't be read"));
+                        }
                         let gscore = likeness(&gclaims);
-                        gate_ok = !gcrashed && gscore >= good_enough;
-                        note.push_str(&format!(" On the test device {gs}: {gscore:.0}% alike{}.", if gcrashed { ", and it crashed" } else { "" }));
-                        gate = Some(scorecard(&gs, &package, &original, &apk, &gstates, Some(gcrashed), None));
+                        gate_ok = gcrashed == Some(false) && gscore >= good_enough;
+                        let how = match gcrashed {
+                            Some(true) => ", and it crashed",
+                            None => ", and its crash log couldn't be read",
+                            Some(false) => "",
+                        };
+                        note.push_str(&format!(" On the test device {gs}: {gscore:.0}% alike{how}."));
+                        gate = Some(scorecard(&gs, &package, &original, &apk, &gstates, gcrashed, None));
                         score = score.min(gscore);
                         claims.extend(gclaims);
                     }
@@ -359,12 +406,12 @@ impl Check for DeviceCheck {
                 note.push_str(&format!(" The test device {gs} waits until the build device is good enough."));
             }
         }
-        let card = scorecard(&serial, &package, &original, &apk, &states, Some(crashed), gate);
+        let card = scorecard(&serial, &package, &original, &apk, &states, crashed, gate);
         let file = dir.join("device.json");
         let text = serde_json::to_string_pretty(&card).map_err(|e| ToolError::internal(e.to_string()))?;
         craft_anything_engine::project::write_atomic(&file, text.as_bytes())?;
         let artifacts = file.strip_prefix(&cx.ws.root).ok().map(Path::to_path_buf).into_iter().collect();
-        let passed = read_any && !crashed && gate_ok;
+        let passed = read_any && crashed == Some(false) && gate_ok;
         Ok(CheckResult { similarity: Some(score), claims, unknowns, artifacts, ..CheckResult::new(DEVICE, round, passed, note) })
     }
 }
@@ -508,5 +555,48 @@ mod tests {
         std::fs::write(&not_apk, b"not a zip").unwrap();
         assert_eq!(apk_package(&not_apk), None);
         assert_eq!(apk_package(&d.path().join("missing.apk")), None);
+    }
+
+    /// A wait after a launch ends within a moment of a pause or the round's limit, whatever the
+    /// saved map asked for; a map's wait is held to the map tool's limit.
+    #[test]
+    fn a_launch_wait_stops_at_a_pause_or_the_limit() {
+        let day = Duration::from_millis(86_400_000);
+        let began = Instant::now();
+        let e = wait(&CheckStop::limited(Instant::now() + Duration::from_millis(200)), day).unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(5), "the wait ran past the round's limit: {} ms", began.elapsed().as_millis());
+        assert!(e.message.contains("time limit"), "{}", e.message);
+        let paused = CancelToken::default();
+        let stop = CheckStop::from(&paused);
+        let pauser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            paused.cancel();
+        });
+        let began = Instant::now();
+        assert!(wait(&stop, day).is_err(), "a pause ends the wait");
+        assert!(began.elapsed() < Duration::from_secs(5), "the wait ran past the pause: {} ms", began.elapsed().as_millis());
+        pauser.join().unwrap();
+        assert!(wait(&CheckStop::default(), Duration::from_millis(20)).is_ok(), "an ordinary wait runs out by itself");
+        assert_eq!(86_400_000u64.min(MAX_WAIT_MS), 60_000);
+    }
+
+    /// A crash log that couldn't be read leaves the crash unknown: the claim fails, it isn't a pass.
+    #[test]
+    fn an_unreadable_crash_log_is_no_evidence_of_no_crash() {
+        use craft_anything_evidence::{Environment, EvidenceBuilder, Subject};
+        let log = |crashed: Value| {
+            let e =
+                EvidenceBuilder::new("adb_crash_log_read", Subject::default(), Environment::builtin(true)).result(json!({"crashed": crashed})).build().unwrap();
+            Ok(ToolOutput::Evidence(Box::new(e)))
+        };
+        assert_eq!(crash_of(log(json!(false))), Some(false));
+        assert_eq!(crash_of(log(json!(true))), Some(true));
+        assert_eq!(crash_of(log(Value::Null)), None, "a log without the answer");
+        assert_eq!(crash_of(Err(ToolError::new(ErrorCode::EngineMissing, "device gone"))), None, "a device that went away");
+        assert!(crash_claim("", "com.example.tv", "tv:5555", Some(false)).passed);
+        assert!(!crash_claim("", "com.example.tv", "tv:5555", Some(true)).passed);
+        let unknown = crash_claim("Test device: ", "com.example.tv", "tv:5555", None);
+        assert!(!unknown.passed, "an unread log doesn't pass the required claim");
+        assert_eq!(unknown.title, "Test device: no crash of com.example.tv on tv:5555");
     }
 }
