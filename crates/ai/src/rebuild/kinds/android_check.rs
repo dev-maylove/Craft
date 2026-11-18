@@ -20,21 +20,29 @@ pub const DEVICE: &str = "device";
 /// hour later; a clock moves on), as the screen fingerprint reads them.
 /// And nothing the clock writes does either: AM and PM, the names of days and months read as
 /// one each, and a row's cells that repeat ("Programme # & more" three times at one hour, four
-/// at another) fold into one, so a guide row is the same row at any hour. The key is cut after
-/// all that, so a longer number can't move the cut.
+/// at another) fold into one, so a guide row is the same row at any hour. The key is all of the
+/// words: two long labels that start alike are two controls. Only what is shown is cut short.
 fn key_of(label: &str) -> String {
     let flat =
         craft_anything_engines::adb_ui::digits_as_one(&label.split_whitespace().collect::<Vec<_>>().join(" ").trim_end_matches(':').trim().to_lowercase());
-    let words = fold_repeats(flat.split(' ').filter(|w| !w.is_empty()).map(clock_word).collect());
-    let mut key = words.join(" ");
-    if key.len() > KEY_LEN {
-        key.truncate(key.floor_char_boundary(KEY_LEN));
-    }
-    key.trim_end().to_string()
+    fold_repeats(flat.split(' ').filter(|w| !w.is_empty()).map(clock_word).collect()).join(" ")
 }
 
-/// How much of a control's normalised words make its key.
-const KEY_LEN: usize = 60;
+/// How long a focused control's title can be before the dump has cut it: the words inside a
+/// wordless control end after about 80 bytes (`adb_ui::control_words`).
+const CUT_TITLE: usize = 80;
+
+/// Whether two focused controls are the same one: the same key, or, when the dump cut both
+/// titles short (so a longer number on one side can leave its last word out), one key is where
+/// the other starts, at a word.
+fn same_focus(a: &str, b: &str) -> bool {
+    let (ka, kb) = (key_of(a), key_of(b));
+    if ka == kb {
+        return true;
+    }
+    let (short, long) = if ka.len() <= kb.len() { (&ka, &kb) } else { (&kb, &ka) };
+    a.len() > CUT_TITLE && b.len() > CUT_TITLE && !short.is_empty() && long.strip_prefix(short.as_str()).is_some_and(|rest| rest.starts_with(' '))
+}
 
 /// A word as the key holds it: what a clock or a calendar writes becomes one token per kind.
 fn clock_word(word: &str) -> String {
@@ -149,7 +157,7 @@ pub fn state_claims(id: &str, name: &str, original: &Value, built: &Value, toler
     if let Some(focus) = original.get("focused_title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
         let ours = built.get("focused_title").and_then(Value::as_str).unwrap_or("");
         let detail = if ours.trim().is_empty() { "nothing has the focus".to_string() } else { format!("the focus is on \"{ours}\"") };
-        claims.push(Claim::new(format!("{who}: the focus is on \"{focus}\""), key_of(focus) == key_of(ours), detail));
+        claims.push(Claim::new(format!("{who}: the focus is on \"{focus}\""), same_focus(focus, ours), detail));
     }
     let theirs = landable(original);
     let ours = landable(built);
@@ -938,7 +946,6 @@ mod tests {
         assert_eq!(key_of("03:00 — 04:30 AM"), key_of("11:00 — 12:30pm"));
         assert_ne!(key_of("Channels list"), key_of("Recordings"), "words that aren't the clock's still tell controls apart");
         assert_ne!(key_of("26 Channel 412 News Programme 31859 & more"), key_of("26 Channel 412 Sports Programme 31859 & more"));
-        assert!(key_of(&"word ".repeat(40)).len() <= KEY_LEN);
         // On a screen: the original's row has three cells and an AM header, the build's four and PM.
         let node = |t: &str, focusable: bool, depth: u64, y: i64| json!({"title": t, "focusable": focusable, "clickable": false, "depth": depth, "dp": {"x": 0, "y": y, "width": 100, "height": 20}});
         let screen = |header: &str, cells: usize| {
@@ -1263,5 +1270,28 @@ mod tests {
         let unknown = crash_claim("Test device: ", "com.example.tv", "tv:5555", None);
         assert!(!unknown.passed, "an unread log doesn't pass the required claim");
         assert_eq!(unknown.title, "Test device: no crash of com.example.tv on tv:5555");
+    }
+
+    /// Two long controls that start alike are two controls: the one the build leaves out fails
+    /// its claim, and a focus on the other one isn't the same focus.
+    #[test]
+    fn long_labels_that_start_alike_stay_apart() {
+        let fore = "Allow this application to access your saved documents while running in foreground";
+        let back = "Allow this application to access your saved documents while running in background";
+        assert_ne!(key_of(fore), key_of(back));
+        let node = |t: &str, focused: bool, y: i64| json!({"title": t, "focusable": true, "focused": focused, "depth": 1, "dp": {"x": 0, "y": y, "width": 100, "height": 20}});
+        let original = json!({"count": 2, "focused_title": back, "nodes": [node(fore, false, 0), node(back, true, 30)]});
+        let built = json!({"count": 1, "focused_title": fore, "nodes": [node(fore, true, 0)]});
+        let claims = state_claims("s03", "Permissions", &original, &built, 1);
+        let failed: Vec<&str> = claims.iter().filter(|c| !c.passed).map(|c| c.title.as_str()).collect();
+        assert!(failed.iter().any(|t| t.contains(&format!("it has \"{back}\""))), "the left-out control fails: {failed:?}");
+        assert!(failed.iter().any(|t| t.contains("the focus is on")), "the focus moved to the other control: {failed:?}");
+        assert!(!failed.iter().any(|t| t.contains(&format!("it has \"{fore}\""))), "the one that is there holds: {failed:?}");
+        // A focused row the dump cut short (its words end after about 80 bytes) is the same row
+        // when a longer number on one side left its last word out.
+        let row = |n: &str, last: &str| format!("{n} Channel 382 News Programme 29582 & more Weather and traffic at the top of every hour {last}");
+        assert!(same_focus(&row("23", "Sports"), &row("123456", "")));
+        assert!(!same_focus(&row("23", "Sports"), &row("23", "Movies")), "two different rows");
+        assert!(!same_focus("Settings", "Settings and more"), "titles the dump didn't cut must match whole");
     }
 }
