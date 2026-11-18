@@ -827,6 +827,81 @@ enum Arrived {
     Seen { id: String, new_focus: bool },
     /// A screen not seen before, kept.
     New(String),
+    /// A screen a skip text matched: a row in the map, never walked from, so no key (OK above
+    /// all) is pressed on it.
+    Skipped,
+}
+
+/// Where a reading of the screen lands in the map: a skipped row, a new screen, or one seen
+/// before (with a new focus position or not). `path` is the keys from the launch.
+#[allow(clippy::too_many_arguments)]
+fn arrive_at(
+    map: &mut adb_ui::ScreenMap,
+    from: Option<&str>,
+    key: Option<&str>,
+    path: &[String],
+    nodes: &[adb_ui::UiNode],
+    fingerprint: &str,
+    skip_texts: &[String],
+    max_focus: usize,
+) -> Arrived {
+    let skipped = adb_ui::matches_skip(nodes, skip_texts);
+    let title = adb_ui::focus_title(nodes);
+    let (id, new) = map.arrive(from, key, fingerprint, |id| adb_ui::MapState {
+        id,
+        name: adb_ui::state_name(nodes),
+        fingerprint: String::new(),
+        path: path.to_vec(),
+        parent: from.map(str::to_string),
+        key: key.map(str::to_string),
+        skipped: skipped.clone(),
+        focused_title: if skipped.is_some() { None } else { title.clone() },
+        count: if skipped.is_some() { 0 } else { nodes.len() },
+        files: None,
+        focuses: Vec::new(),
+    });
+    if skipped.is_some() {
+        return Arrived::Skipped;
+    }
+    let new_focus = adb_ui::focus_key(nodes).is_some_and(|k| map.note_focus(&id, &k, title.as_deref().unwrap_or(""), path, max_focus));
+    if new { Arrived::New(id) } else { Arrived::Seen { id, new_focus } }
+}
+
+/// One reading of the map's walk: `(map, from, key, path)` to where the screen landed.
+type MapCapture<'a> = dyn FnMut(&mut adb_ui::ScreenMap, &str, &str, &[String]) -> Result<Arrived, ToolError> + 'a;
+
+/// The walk, breadth first over (screen, path) from where the launch landed: every key from a
+/// screen's first position, and from each further focus position on it the keys that act on the
+/// focus or move it on. A skipped screen is never walked from, the first one included.
+/// `capture(map, from, key, path)` reads the screen `path` reaches; `limit` ends the walk before
+/// a key when a budget is spent.
+fn walk_map(
+    map: &mut adb_ui::ScreenMap,
+    start: Arrived,
+    explore: &[String],
+    capture: &mut MapCapture<'_>,
+    limit: &dyn Fn(&adb_ui::ScreenMap) -> Option<MapStop>,
+) -> Result<MapStop, ToolError> {
+    let start = match start {
+        Arrived::New(id) | Arrived::Seen { id, .. } => id,
+        Arrived::Skipped | Arrived::Left => return Ok(MapStop::Exhausted),
+    };
+    let mut frontier = std::collections::VecDeque::from([(start, Vec::<String>::new(), true)]);
+    while let Some((from, path, all_keys)) = frontier.pop_front() {
+        for key in explore.iter().filter(|k| all_keys || adb_ui::FOCUS_KEYS.contains(&k.as_str())) {
+            if let Some(stop) = limit(map) {
+                return Ok(stop);
+            }
+            let mut next = path.clone();
+            next.push(key.clone());
+            match capture(map, &from, key, &next)? {
+                Arrived::New(id) => frontier.push_back((id, next, true)),
+                Arrived::Seen { id, new_focus: true } => frontier.push_back((id, next, false)),
+                Arrived::Seen { .. } | Arrived::Skipped | Arrived::Left => {}
+            }
+        }
+    }
+    Ok(MapStop::Exhausted)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2196,7 +2271,6 @@ fn adb_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError
     // Counters the capture closure and the loop both read.
     let presses = std::cell::Cell::new(0u64);
     let captures = std::cell::Cell::new(0u64);
-    let mut stop = MapStop::Exhausted;
     // One capture: launch afresh, press `path`, read the screen into a temporary folder, then
     // keep it under the state's id (new), drop it (seen before, skipped, or not the app at all).
     let capture = |map: &mut adb_ui::ScreenMap, from: Option<&str>, key: Option<&str>, path: &[String]| -> Result<Arrived, ToolError> {
@@ -2224,76 +2298,40 @@ fn adb_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError
             map.leave(from, key, &other);
             return Ok(Arrived::Left);
         }
-        let skipped = adb_ui::matches_skip(&got.nodes, &p.skip_texts);
-        let name = adb_ui::state_name(&got.nodes);
-        // A focus position's key: what the focused control says, else which control it is.
-        let focus = got.focused_title().filter(|t| !t.is_empty()).or_else(|| got.tree["focused"].as_u64().map(|i| format!("#{i}")));
-        let (id, new) = map.arrive(from, key, &got.fingerprint, |id| adb_ui::MapState {
-            id,
-            name,
-            fingerprint: String::new(),
-            path: path.to_vec(),
-            parent: from.map(str::to_string),
-            key: key.map(str::to_string),
-            skipped: skipped.clone(),
-            focused_title: if skipped.is_some() { None } else { got.focused_title() },
-            count: if skipped.is_some() { 0 } else { got.nodes.len() },
-            files: None,
-            focuses: Vec::new(),
-        });
-        if skipped.is_some() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Ok(if new { Arrived::New(id) } else { Arrived::Seen { id, new_focus: false } });
-        }
-        let new_focus = focus.as_deref().is_some_and(|t| map.note_focus(&id, t, path, p.max_focus_per_screen));
-        if new {
-            let dir = states_dir.join(&id);
+        let arrived = arrive_at(map, from, key, path, &got.nodes, &got.fingerprint, &p.skip_texts, p.max_focus_per_screen);
+        if let Arrived::New(id) = &arrived {
+            let dir = states_dir.join(id);
             std::fs::rename(&tmp, &dir).map_err(|e| ToolError::io(dir.display(), e))?;
             let rel = |p: &Path| {
                 p.file_name().map(|n| dir.join(n)).and_then(|q| q.strip_prefix(&outdir).ok().map(|r| r.to_string_lossy().to_string())).unwrap_or_default()
             };
-            map.set_files(&id, json!({"ui": rel(&got.ui_file), "screen": got.screen_file.as_deref().map(rel), "keys": rel(&got.keys_file)}));
-            return Ok(Arrived::New(id));
+            map.set_files(id, json!({"ui": rel(&got.ui_file), "screen": got.screen_file.as_deref().map(rel), "keys": rel(&got.keys_file)}));
+        } else {
+            // Skipped or seen before: nothing of it is kept, but a new focus position on a seen
+            // screen is walked from.
+            let _ = std::fs::remove_dir_all(&tmp);
         }
-        // Seen before: nothing of it is kept, but a new focus position on it is walked from.
-        let _ = std::fs::remove_dir_all(&tmp);
-        Ok(Arrived::Seen { id, new_focus })
+        Ok(arrived)
     };
-    let start = match capture(&mut map, None, None, &[])? {
-        Arrived::New(id) | Arrived::Seen { id, .. } => id,
-        Arrived::Left => return Err(ToolError::new(ErrorCode::NotFound, format!("The screen after launching {package} wasn't the app's."))),
-    };
-    // Breadth first over (screen, path): every key from a screen's first position, and from each
-    // further focus position on it the keys that act on the focus or move it on.
-    let mut frontier = std::collections::VecDeque::from([(start, Vec::<String>::new(), true)]);
-    'outer: while let Some((from, path, all_keys)) = frontier.pop_front() {
-        let keys: Vec<&String> = explore.iter().filter(|k| all_keys || adb_ui::FOCUS_KEYS.contains(&k.as_str())).collect();
-        for key in keys {
-            if ctx.cancel.is_cancelled() {
-                stop = MapStop::Cancelled;
-                break 'outer;
-            }
-            if map.len() >= p.max_states {
-                stop = MapStop::MaxStates;
-                break 'outer;
-            }
-            if presses.get() >= u64::from(p.max_presses) {
-                stop = MapStop::MaxPresses;
-                break 'outer;
-            }
-            if started.elapsed() > budget {
-                stop = MapStop::TimeBudget;
-                break 'outer;
-            }
-            let mut next = path.clone();
-            next.push(key.clone());
-            match capture(&mut map, Some(&from), Some(key), &next)? {
-                Arrived::New(id) => frontier.push_back((id, next, true)),
-                Arrived::Seen { id, new_focus: true } => frontier.push_back((id, next, false)),
-                Arrived::Seen { .. } | Arrived::Left => {}
-            }
-        }
+    let first = capture(&mut map, None, None, &[])?;
+    if let Arrived::Left = first {
+        return Err(ToolError::new(ErrorCode::NotFound, format!("The screen after launching {package} wasn't the app's.")));
     }
+    let cancel = ctx.cancel.clone();
+    let limit = |map: &adb_ui::ScreenMap| {
+        if cancel.is_cancelled() {
+            Some(MapStop::Cancelled)
+        } else if map.len() >= p.max_states {
+            Some(MapStop::MaxStates)
+        } else if presses.get() >= u64::from(p.max_presses) {
+            Some(MapStop::MaxPresses)
+        } else if started.elapsed() > budget {
+            Some(MapStop::TimeBudget)
+        } else {
+            None
+        }
+    };
+    let stop = walk_map(&mut map, first, &explore, &mut |m, from, key, path| capture(m, Some(from), Some(key), path), &limit)?;
     let kept = map.states().iter().filter(|s| s.skipped.is_none()).count();
     let skipped = map.len() - kept;
     let meta = json!({
@@ -2484,6 +2522,97 @@ mod tests {
             let err = refused(&e, id, json!({"serial": "emulator-5554", "keys": ["OK"], "text": "hi", "package": "com.example.app"}));
             assert_eq!(err.code, ErrorCode::EngineMissing, "{id} gave {:?}", err.code);
         }
+    }
+
+    /// What a stand-in app shows after some keys: (fingerprint, controls' texts, focused index).
+    type StandInScreen = dyn Fn(&[String]) -> (&'static str, Vec<&'static str>, usize);
+
+    /// A stand-in app for the map's walk: `screen(path)` is what the keys from the launch reach,
+    /// as (fingerprint, controls' texts, focused index). Returns the map, every path read, and why
+    /// the walk ended.
+    fn walk_stand_in(explore: &[&str], skip_texts: &[&str], screen: &StandInScreen) -> (adb_ui::ScreenMap, Vec<Vec<String>>, MapStop) {
+        let nodes_of = |path: &[String]| {
+            let (fp, texts, focused) = screen(path);
+            let nodes: Vec<adb_ui::UiNode> = texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| adb_ui::UiNode {
+                    index: i,
+                    class: "android.widget.Button".into(),
+                    package: "com.example.tv".into(),
+                    text: (*t).into(),
+                    focused: i == focused,
+                    focusable: true,
+                    visible: true,
+                    enabled: true,
+                    ..Default::default()
+                })
+                .collect();
+            (fp, nodes)
+        };
+        let explore: Vec<String> = explore.iter().map(|k| k.to_string()).collect();
+        let skip: Vec<String> = skip_texts.iter().map(|k| k.to_string()).collect();
+        let mut map = adb_ui::ScreenMap::new();
+        let (fp, nodes) = nodes_of(&[]);
+        let first = arrive_at(&mut map, None, None, &[], &nodes, fp, &skip, 8);
+        let read = std::cell::RefCell::new(vec![Vec::new()]);
+        let mut capture = |m: &mut adb_ui::ScreenMap, from: &str, key: &str, path: &[String]| {
+            read.borrow_mut().push(path.to_vec());
+            let (fp, nodes) = nodes_of(path);
+            Ok(arrive_at(m, Some(from), Some(key), path, &nodes, fp, &skip, 8))
+        };
+        let limit = |_: &adb_ui::ScreenMap| (read.borrow().len() > 200).then_some(MapStop::MaxPresses);
+        let stop = walk_map(&mut map, first, &explore, &mut capture, &limit).unwrap();
+        (map, read.into_inner(), stop)
+    }
+
+    /// A screen a skip text matches is a row in the map that no key is pressed on: OK on a
+    /// confirmation it was meant to leave alone would act on it. A skipped first screen is the
+    /// whole map.
+    #[test]
+    fn a_skipped_screen_is_never_walked_from() {
+        let home_or_confirm = |path: &[String]| {
+            if path.iter().any(|k| k == "DPAD_CENTER") {
+                ("fp-confirm", vec!["Delete every recording?", "Delete"], 1)
+            } else {
+                ("fp-home", vec!["Guide", "Settings"], path.len() % 2)
+            }
+        };
+        let (map, read, stop) = walk_stand_in(&["DPAD_DOWN", "DPAD_CENTER"], &["Delete every recording"], &home_or_confirm);
+        assert!(matches!(stop, MapStop::Exhausted));
+        assert_eq!(map.len(), 2, "home and the skipped confirmation");
+        assert!(map.states()[1].skipped.is_some());
+        assert!(read.iter().any(|p| p.last().is_some_and(|k| k == "DPAD_CENTER")), "the confirmation was reached");
+        for p in &read {
+            let at = p.iter().position(|k| k == "DPAD_CENTER");
+            assert!(at.is_none_or(|i| i + 1 == p.len()), "a key was pressed on the skipped screen: {p:?}");
+        }
+        let (map, read, _) =
+            walk_stand_in(&["DPAD_DOWN", "DPAD_CENTER"], &["Delete every recording"], &|_| ("fp-confirm", vec!["Delete every recording?", "Delete"], 1));
+        assert_eq!((map.len(), read.len()), (1, 1), "a skipped first screen: one reading, nothing pressed");
+    }
+
+    /// Two controls that say the same are two focus positions: the screen the second "Play"
+    /// opens is found, though its title is the first one's.
+    #[test]
+    fn two_controls_that_say_the_same_are_both_walked() {
+        let app = |path: &[String]| {
+            let mut focus = 0;
+            for k in path {
+                match k.as_str() {
+                    "DPAD_DOWN" => focus = (focus + 1).min(2),
+                    "DPAD_CENTER" if focus == 2 => return ("fp-details", vec!["Details", "Back"], 0),
+                    _ => {}
+                }
+            }
+            ("fp-home", vec!["Play", "Info", "Play"], focus)
+        };
+        let (map, _, stop) = walk_stand_in(&["DPAD_DOWN", "DPAD_CENTER"], &[], &app);
+        assert!(matches!(stop, MapStop::Exhausted));
+        assert_eq!(map.len(), 2, "home and the screen the second Play opens");
+        let home = &map.states()[0];
+        let titles: Vec<&str> = home.focuses.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(titles, ["Play", "Info", "Play"], "three positions, the titles kept as they read");
     }
 
     /// The walkthrough and the map (R2.12) check every step and limit before adb is run, run in

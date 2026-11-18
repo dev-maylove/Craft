@@ -462,6 +462,24 @@ pub fn focus_title(nodes: &[UiNode]) -> Option<String> {
     Some(if words.is_empty() { f.resource_id.clone() } else { words })
 }
 
+/// Which focus position a screen is in, as the map walks it: what the focused control says
+/// (see [`focus_title`]) and which of the controls saying the same it is, so two "Play" buttons
+/// or two rows with one identifier are two positions; `#N` (its node) when it says nothing.
+/// The first of a kind is its title alone. None without a focused control.
+pub fn focus_key(nodes: &[UiNode]) -> Option<String> {
+    let i = nodes.iter().position(|n| n.focused)?;
+    let says = |j: usize| {
+        let words = control_words(nodes, j);
+        if words.is_empty() { nodes[j].resource_id.clone() } else { words }
+    };
+    let title = says(i);
+    if title.is_empty() {
+        return Some(format!("#{}", nodes[i].index));
+    }
+    let before = (0..i).filter(|&j| (nodes[j].focusable || nodes[j].clickable) && says(j) == title).count();
+    Some(if before == 0 { title } else { format!("{title} #{}", before + 1) })
+}
+
 /// What control `i` says: its own label, else the labels of the nodes inside it (a Compose
 /// button is a group with no text of its own and a text child), joined, at most about 80 bytes.
 pub fn control_words(nodes: &[UiNode], i: usize) -> String {
@@ -822,6 +840,9 @@ pub struct MapState {
 pub struct MapFocus {
     pub title: String,
     pub path: Vec<String>,
+    /// Which position it is (see [`focus_key`]): what the walk tells positions apart by.
+    #[serde(skip)]
+    pub key: String,
 }
 
 /// A key that left the app: what was on screen belonged to another package.
@@ -927,13 +948,14 @@ impl ScreenMap {
     }
 
     /// A focus position seen on screen `id`, reached by `path`: true when it is new there and
-    /// the screen has fewer than `max` so far (so it is worth pressing keys from).
-    pub fn note_focus(&mut self, id: &str, title: &str, path: &[String], max: usize) -> bool {
+    /// the screen has fewer than `max` so far (so it is worth pressing keys from). Positions are
+    /// told apart by `key` (see [`focus_key`]); `title` is what the focused control says.
+    pub fn note_focus(&mut self, id: &str, key: &str, title: &str, path: &[String], max: usize) -> bool {
         let Some(s) = self.states.iter_mut().find(|s| s.id == id) else { return false };
-        if s.focuses.iter().any(|f| f.title == title) || s.focuses.len() >= max {
+        if s.focuses.iter().any(|f| f.key == key) || s.focuses.len() >= max {
             return false;
         }
-        s.focuses.push(MapFocus { title: title.to_string(), path: path.to_vec() });
+        s.focuses.push(MapFocus { title: title.to_string(), path: path.to_vec(), key: key.to_string() });
         true
     }
 
@@ -1063,11 +1085,11 @@ mod map_tests {
         assert_eq!(map.len(), 1);
         assert_eq!(map.exits().len(), 1);
         // The focus walked down the home screen: each new position once, bounded.
-        assert!(map.note_focus("s01", "Channels", &["DPAD_DOWN".into()], 2));
-        assert!(!map.note_focus("s01", "Channels", &["DPAD_DOWN".into(), "DPAD_UP".into(), "DPAD_DOWN".into()], 2), "seen already");
-        assert!(map.note_focus("s01", "Settings", &["DPAD_DOWN".into(), "DPAD_DOWN".into()], 2));
-        assert!(!map.note_focus("s01", "About", &["DPAD_DOWN".into(), "DPAD_DOWN".into(), "DPAD_DOWN".into()], 2), "at the cap");
-        assert!(!map.note_focus("s07", "About", &[], 2), "no such screen");
+        assert!(map.note_focus("s01", "Channels", "Channels", &["DPAD_DOWN".into()], 2));
+        assert!(!map.note_focus("s01", "Channels", "Channels", &["DPAD_DOWN".into(), "DPAD_UP".into(), "DPAD_DOWN".into()], 2), "seen already");
+        assert!(map.note_focus("s01", "Settings", "Settings", &["DPAD_DOWN".into(), "DPAD_DOWN".into()], 2));
+        assert!(!map.note_focus("s01", "About", "About", &["DPAD_DOWN".into(), "DPAD_DOWN".into(), "DPAD_DOWN".into()], 2), "at the cap");
+        assert!(!map.note_focus("s07", "About", "About", &[], 2), "no such screen");
         let json = map.to_json(json!({}));
         assert_eq!(json["exits"][0], json!({"from": "s01", "key": "BACK", "package": "com.android.tvlauncher"}));
         assert_eq!(json["states"][0]["focuses"][1], json!({"title": "Settings", "path": ["DPAD_DOWN", "DPAD_DOWN"]}));
@@ -1092,6 +1114,16 @@ mod map_tests {
         bare[0].resource_id = "app:id/row".into();
         assert_eq!(focus_title(&bare).as_deref(), Some("app:id/row"), "an identifier when nothing has words");
         assert_eq!(focus_title(&screen(&["a"], 9)), None, "nothing focused");
+        // Positions: two controls that say the same are two, the first by its title alone.
+        let plays = screen(&["Play", "Info", "Play"], 2);
+        assert_eq!(focus_key(&plays).as_deref(), Some("Play #2"));
+        assert_eq!(focus_key(&screen(&["Play", "Info", "Play"], 0)).as_deref(), Some("Play"));
+        let mut rows = screen(&["", ""], 1);
+        rows[0].resource_id = "app:id/row".into();
+        rows[1].resource_id = "app:id/row".into();
+        assert_eq!(focus_key(&rows).as_deref(), Some("app:id/row #2"), "wordless rows with one identifier");
+        assert_eq!(focus_key(&screen(&["", ""], 1)).as_deref(), Some("#1"), "nothing to say: its node");
+        assert_eq!(focus_key(&screen(&["a"], 9)), None);
         assert_eq!(ui_tree_json(&nodes, None, None)["focused_title"], "Settings");
     }
 
