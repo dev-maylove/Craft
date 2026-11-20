@@ -28,20 +28,34 @@ fn key_of(label: &str) -> String {
     fold_repeats(flat.split(' ').filter(|w| !w.is_empty()).map(clock_word).collect()).join(" ")
 }
 
-/// How long a focused control's title can be before the dump has cut it: the words inside a
-/// wordless control end after about 80 bytes (`adb_ui::control_words`).
+/// How long a focused control's title is once the dump has cut it: the words gathered from
+/// inside a wordless control end after about 80 bytes (`adb_ui::control_words`). A control's
+/// own label is never cut, however long.
 const CUT_TITLE: usize = 80;
 
+/// Whether a screen's focused title may have been cut short: the focused control has no label
+/// of its own, so its title was gathered from the controls inside it, and it ran past the cut.
+/// A title that is the control's own label is whole, whatever its length. False when the tree
+/// names no focused control: nothing says the title was cut.
+fn focus_cut(tree: &Value) -> bool {
+    let nodes = tree.get("nodes").and_then(Value::as_array);
+    let Some(focused) = nodes.into_iter().flatten().find(|n| n["focused"].as_bool() == Some(true)) else { return false };
+    let own = focused.get("title").and_then(Value::as_str).unwrap_or("");
+    let shown = tree.get("focused_title").and_then(Value::as_str).unwrap_or("");
+    own.trim().is_empty() && shown.len() > CUT_TITLE
+}
+
 /// Whether two focused controls are the same one: the same key, or, when the dump cut both
-/// titles short (so a longer number on one side can leave its last word out), one key is where
-/// the other starts, at a word.
-fn same_focus(a: &str, b: &str) -> bool {
+/// titles short (`both_cut`, from [`focus_cut`]; a longer number on one side can then leave
+/// its last word out), one key is where the other starts, at a word. Two whole labels are the
+/// same only by the same key: one long label that starts another is another control.
+fn same_focus(a: &str, b: &str, both_cut: bool) -> bool {
     let (ka, kb) = (key_of(a), key_of(b));
     if ka == kb {
         return true;
     }
     let (short, long) = if ka.len() <= kb.len() { (&ka, &kb) } else { (&kb, &ka) };
-    a.len() > CUT_TITLE && b.len() > CUT_TITLE && !short.is_empty() && long.strip_prefix(short.as_str()).is_some_and(|rest| rest.starts_with(' '))
+    both_cut && !short.is_empty() && long.strip_prefix(short.as_str()).is_some_and(|rest| rest.starts_with(' '))
 }
 
 /// A word as the key holds it: what a clock or a calendar writes becomes one token per kind.
@@ -157,7 +171,7 @@ pub fn state_claims(id: &str, name: &str, original: &Value, built: &Value, toler
     if let Some(focus) = original.get("focused_title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
         let ours = built.get("focused_title").and_then(Value::as_str).unwrap_or("");
         let detail = if ours.trim().is_empty() { "nothing has the focus".to_string() } else { format!("the focus is on \"{ours}\"") };
-        claims.push(Claim::new(format!("{who}: the focus is on \"{focus}\""), same_focus(focus, ours), detail));
+        claims.push(Claim::new(format!("{who}: the focus is on \"{focus}\""), same_focus(focus, ours, focus_cut(original) && focus_cut(built)), detail));
     }
     let theirs = landable(original);
     let ours = landable(built);
@@ -1290,8 +1304,47 @@ mod tests {
         // A focused row the dump cut short (its words end after about 80 bytes) is the same row
         // when a longer number on one side left its last word out.
         let row = |n: &str, last: &str| format!("{n} Channel 382 News Programme 29582 & more Weather and traffic at the top of every hour {last}");
-        assert!(same_focus(&row("23", "Sports"), &row("123456", "")));
-        assert!(!same_focus(&row("23", "Sports"), &row("23", "Movies")), "two different rows");
-        assert!(!same_focus("Settings", "Settings and more"), "titles the dump didn't cut must match whole");
+        assert!(same_focus(&row("23", "Sports"), &row("123456", ""), true));
+        assert!(!same_focus(&row("23", "Sports"), &row("23", "Movies"), true), "two different rows");
+        assert!(!same_focus("Settings", "Settings and more", false), "titles the dump didn't cut must match whole");
+    }
+
+    /// A control's own label is whole however long it is: when one long label is where another
+    /// starts, and both controls are on both screens, a focus on the other one is another focus.
+    /// Only a title gathered from inside a wordless control (which the dump cuts) may match by
+    /// its start.
+    #[test]
+    fn a_long_whole_label_that_starts_another_is_another_focus() {
+        let alone = "Allow this application to read the documents you have saved on this device while it is open";
+        let shared = format!("{alone} and shared with other users");
+        assert!(alone.len() > CUT_TITLE && key_of(&shared).starts_with(&key_of(alone)));
+        let node = |t: &str, focused: bool, y: i64| json!({"title": t, "focusable": true, "focused": focused, "depth": 1, "dp": {"x": 0, "y": y, "width": 100, "height": 20}});
+        let screen = |on_shared: bool| json!({"count": 2, "focused_title": if on_shared { shared.as_str() } else { alone }, "nodes": [node(alone, !on_shared, 0), node(&shared, on_shared, 30)]});
+        let focus = |original: &Value, built: &Value| {
+            let claims = state_claims("s04", "Sharing", original, built, 1);
+            assert!(claims.iter().filter(|c| !c.title.contains("the focus is on")).all(|c| c.passed), "both controls are there, in place: {claims:?}");
+            claims.iter().find(|c| c.title.contains("the focus is on")).map(|c| c.passed)
+        };
+        assert_eq!(focus(&screen(false), &screen(true)), Some(false), "the focus moved to the longer label");
+        assert_eq!(focus(&screen(true), &screen(false)), Some(false), "the focus moved to the shorter label");
+        assert_eq!(focus(&screen(true), &screen(true)), Some(true), "the same control");
+        assert!(!focus_cut(&screen(true)), "an own label isn't a cut title");
+
+        // The same words gathered from inside a wordless row are a title the dump cut: there a
+        // longer number on one side leaves the last word out, and it is still the same row.
+        let row =
+            |n: &str, last: &str| format!("{n} Channel 382 News Programme 29582 & more Weather and traffic at the top of every hour {last}").trim().to_string();
+        let gathered = |title: &str| {
+            json!({"count": 2, "focused_title": title, "nodes": [
+                {"title": "", "focusable": true, "focused": true, "depth": 1},
+                {"title": title, "depth": 2},
+            ]})
+        };
+        let (theirs, ours) = (gathered(&row("23", "Sports")), gathered(&row("123456", "")));
+        assert!(focus_cut(&theirs) && focus_cut(&ours));
+        assert_eq!(state_claims("s05", "Guide", &theirs, &ours, 1).iter().find(|c| c.title.contains("the focus is on")).map(|c| c.passed), Some(true));
+        // One side whole, one side cut: no start-of match.
+        let whole = json!({"count": 1, "focused_title": row("23", "Sports"), "nodes": [node(&row("23", "Sports"), true, 0)]});
+        assert_eq!(state_claims("s05", "Guide", &whole, &ours, 1).iter().find(|c| c.title.contains("the focus is on")).map(|c| c.passed), Some(false));
     }
 }
