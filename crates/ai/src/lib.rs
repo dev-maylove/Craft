@@ -1,3 +1,5 @@
+// Modifications (c) 2026 SuperSfera LLC, MIT OR Apache-2.0.
+
 //! AI backends, the agent loop and crews.
 //!
 //! The UI talks to this crate only through [`AiHub`] and [`Conversation`]: start a conversation,
@@ -285,6 +287,32 @@ pub fn default_builder<'a>(backends: &'a [BackendConfig], chosen: Option<&str>) 
         .and_then(|n| on().find(|b| b.name == n))
         .or_else(|| on().find(|b| b.kind == BackendKind::AgentCli))
         .or_else(|| on().find(|b| b.kind != BackendKind::AgentCli))
+}
+
+/// Whether a backend can start right now, without sending it anything: a local server's port
+/// answers, an agent app's program is found, a cloud API is switched on. Used to pick the first
+/// working builder from the fallback chain (slava/local).
+pub fn backend_reachable(b: &BackendEntry) -> bool {
+    if !b.config.enabled {
+        return false;
+    }
+    match b.config.kind {
+        BackendKind::OpenaiCompatible => detect::port_open(b.config.base_url.as_deref().unwrap_or("http://127.0.0.1:11434/v1"), Duration::from_millis(500)),
+        BackendKind::AgentCli => {
+            if b.config.ssh_host.as_deref().is_some_and(|h| !h.trim().is_empty()) {
+                return true;
+            }
+            cli_agents::program_of(&b.config, &b.options).is_ok_and(|p| {
+                let path = std::path::Path::new(&p);
+                if path.components().count() > 1 {
+                    path.is_file()
+                } else {
+                    !craft_anything_platform::which::which_in(&p, craft_anything_platform::which::search_path()).is_empty()
+                }
+            })
+        }
+        _ => true,
+    }
 }
 
 /// Whether `name` is a saved AI that is switched on. One saved but switched off is not set up:
@@ -580,6 +608,29 @@ impl AiHub {
             }
         }
         self.save_config(&cfg)
+    }
+
+    /// slava/local: make local AI the default. `servers` (already added, in order of preference)
+    /// become lead, worker and builder; the rest of them, then `fallback` (say Grok Build), form
+    /// the fallback chain; `local_first` is turned on so nothing cloud is chosen implicitly.
+    pub fn use_local(&self, servers: &[String], fallback: &[String]) -> Result<AiConfig, ToolError> {
+        let mut cfg = self.config_to_change()?;
+        let Some(first) = servers.first() else {
+            return Err(ToolError::new(ErrorCode::BadSettings, "No local AI server answered.")
+                .with_remediation("Start Lemonade (lemond) or LM Studio's server, then run this again."));
+        };
+        for n in servers.iter().chain(fallback) {
+            if cfg.get(n).is_none() {
+                return Err(ToolError::invalid(format!("No AI backend named {n:?}")));
+            }
+        }
+        cfg.local_first = true;
+        for role in ["lead", "worker", "builder"] {
+            cfg.roles.insert(role.into(), first.clone());
+        }
+        cfg.fallback_chain = servers.iter().skip(1).chain(fallback).cloned().collect();
+        self.save_config(&cfg)?;
+        Ok(cfg)
     }
 
     /// Add (or replace) a backend, storing its key in the keychain when given.
