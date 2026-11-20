@@ -1280,15 +1280,15 @@ impl Worker {
         let mut prompt = prompt.to_string();
         let mut tries = 0u64;
         let mut retry = false;
+        // Kept across retries and the fresh start: whichever conversation is lost, every note
+        // taken in this turn so far is one the feed already shows as delivered.
+        self.taken_in_turn.clear();
         loop {
-            self.taken_in_turn.clear();
             let result = self.converse_turn(ws, agent, &prompt, retry);
             let lost = result.is_err() && agent.session_lost();
-            // Taken by a conversation that's gone: the feed already shows them as delivered.
-            let taken = if lost { std::mem::take(&mut self.taken_in_turn) } else { Vec::new() };
             if lost {
                 // The id is for a session this computer doesn't have: never ask for it again.
-                Self::remember_session(ws, None, deep)?;
+                Self::remember_session(ws, None, deep).map_err(|e| self.give_back_taken(e))?;
             } else if let Some(id) = agent.session_id() {
                 Self::remember_session(ws, Some(id), deep)?;
             }
@@ -1299,15 +1299,13 @@ impl Worker {
                         Step::Build,
                         Status::Building,
                         "The builder's earlier conversation isn't on this computer, or has grown too long to continue. Starting a new one from what the project already has…",
-                    )?;
-                    prompt = f + &taken_prompt(&taken);
+                    )
+                    .map_err(|e| self.give_back_taken(e))?;
+                    prompt = f + &taken_prompt(&self.taken_in_turn);
                     retry = false;
                 }
                 // Nothing to start a new conversation from: the run ends, and the next one sends them.
-                Err(e) if lost => {
-                    self.notes.lock().unwrap_or_else(PoisonError::into_inner).splice(0..0, taken);
-                    return Err(e);
-                }
+                Err(e) if lost => return Err(self.give_back_taken(e)),
                 // A missing session can only start fresh above, never resume. Only backend
                 // Error events become ProgramFailed here; a simultaneous backend failure must
                 // not make an inbox or workspace write failure retryable.
@@ -1429,6 +1427,14 @@ impl Worker {
 
     /// Notes the builder took at a step of this turn (its hook claimed them): they join the feed
     /// now and aren't sent again after the turn.
+    /// A turn whose conversation was lost ends with `e`: the notes it took wait for the next run,
+    /// which sends them after its turn with the Just-ask answers they carry.
+    fn give_back_taken(&mut self, e: ToolError) -> ToolError {
+        let taken = std::mem::take(&mut self.taken_in_turn);
+        self.notes.lock().unwrap_or_else(PoisonError::into_inner).splice(0..0, taken);
+        e
+    }
+
     fn relay_read_notes(&mut self, ws: &Workspace) {
         let dir = notes::notes_dir(&ws.inbox_dir());
         let read: Vec<Note> = {
