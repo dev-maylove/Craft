@@ -275,7 +275,7 @@ pub enum Done {
     Created {
         ws: Box<craft_anything_engine::workspace::Workspace>,
         request: String,
-        backend: String,
+        backend: Option<String>,
         /// Why the pictures couldn't be copied, if they couldn't.
         pictures: Option<String>,
         /// The folder already held a project: the request is its follow-up, not a new project's.

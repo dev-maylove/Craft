@@ -6,7 +6,7 @@ use crate::output::Format;
 use crate::{Cli, INTERRUPTED, emit, fail, make_engine, out};
 use clap::{Args, Subcommand};
 use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, BackendEntry, BackendKind, BackendOptions, Effort};
-use craft_anything_evidence::ToolError;
+use craft_anything_evidence::{ErrorCode, ToolError};
 use serde_json::{Value, json};
 use std::io::{Read as _, Write as _};
 use std::sync::atomic::Ordering;
@@ -133,9 +133,15 @@ pub enum AiCommand {
 }
 
 fn hub(cli: &Cli) -> Result<AiHub, ToolError> {
+    hub_with(cli, true)
+}
+
+/// `persist_session` saves an OpenCode Go session id when one is missing. A dry run leaves the
+/// settings file alone, so that save is skipped.
+fn hub_with(cli: &Cli, persist_session: bool) -> Result<AiHub, ToolError> {
     let hub = AiHub::new(make_engine(cli.project.as_deref(), cli.deep_for_run())?);
     // Before any command runs, while no session lock is held (#1225).
-    if let Err(e) = hub.ensure_session_id() {
+    if persist_session && let Err(e) = hub.ensure_session_id() {
         log::warn!("couldn't save the OpenCode Go session id: {e}");
     }
     Ok(hub)
@@ -253,7 +259,8 @@ fn read_key(key_env: &Option<String>, key_stdin: bool) -> Result<Option<String>,
 /// Dispatch AI configuration, discovery and model-selection commands through the shared hub.
 /// Render results in the requested format and return an exit status for success or failure.
 pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
-    let hub = match hub(cli) {
+    let persist_session = !matches!(c, AiCommand::UseLocal { dry_run: true, .. });
+    let hub = match hub_with(cli, persist_session) {
         Ok(h) => h,
         Err(e) => return fail(&e, f),
     };
@@ -552,6 +559,12 @@ fn use_local(hub: &AiHub, lemonade: &str, lmstudio: &str, grok: Option<&str>, dr
             eprintln!("note: {name} doesn't answer at {url}; skipped");
         }
     }
+    // Checked before anything is saved, including a dry run that would otherwise report success.
+    if let Some(program) = grok
+        && let Err(e) = require_grok_program(program)
+    {
+        return fail(&e, f);
+    }
     if dry_run {
         emit(&json!({"found": found.iter().map(|(n, u)| json!({"name": n, "base_url": u})).collect::<Vec<_>>(), "grok": grok, "changed": false}), f);
         return 0;
@@ -562,6 +575,14 @@ fn use_local(hub: &AiHub, lemonade: &str, lmstudio: &str, grok: Option<&str>, dr
             Ok(_) => servers.push(name.to_string()),
             Err(e) => eprintln!("note: {name} at {url} answered but couldn't be added: {}", e.message),
         }
+    }
+    // Grok Build is only a fallback. With no local server it must not be saved on the way to the error.
+    if servers.is_empty() {
+        return fail(
+            &ToolError::new(ErrorCode::BadSettings, "No local AI server answered.")
+                .with_remediation("Start Lemonade (lemond) or LM Studio's server, then run this again."),
+            f,
+        );
     }
     let mut fallback = Vec::new();
     if let Some(program) = grok {
@@ -578,5 +599,61 @@ fn use_local(hub: &AiHub, lemonade: &str, lmstudio: &str, grok: Option<&str>, dr
             0
         }
         Err(e) => fail(&e, f),
+    }
+}
+
+/// Grok Build's program must exist and say it is Grok. Cursor's command-line tool is also called `agent`.
+fn require_grok_program(program: &str) -> Result<(), ToolError> {
+    let path = resolve_grok_program(program)?;
+    let out =
+        craft_anything_platform::process::Process::new(&path).arg("--version").timeout(Duration::from_secs(8)).stdout_cap(64 * 1024).run().map_err(|e| {
+            ToolError::new(ErrorCode::EngineMissing, format!("Couldn't run {} --version ({})", path.display(), e.message))
+                .with_remediation("Pass Grok Build's program, for example ~/.grok/bin/agent. Cursor's command-line tool is also called agent.")
+        })?;
+    let text = format!("{}\n{}", out.stdout_text(), out.stderr_text());
+    grok_version_identity(&text, out.success).map_err(|message| {
+        ToolError::invalid(message).with_remediation("Pass Grok Build's program (it lives in ~/.grok/bin). Cursor's command-line tool is also called agent.")
+    })
+}
+
+fn resolve_grok_program(program: &str) -> Result<std::path::PathBuf, ToolError> {
+    let path = std::path::PathBuf::from(program);
+    let found = if path.components().count() > 1 {
+        path.is_file().then_some(path)
+    } else {
+        craft_anything_platform::which::which_in(program, craft_anything_platform::which::search_path()).into_iter().next()
+    };
+    found.ok_or_else(|| {
+        ToolError::new(ErrorCode::NotFound, format!("Grok Build's program {program:?} isn't on this computer."))
+            .with_remediation("Install Grok Build, or pass its program with --grok (for example ~/.grok/bin/agent).")
+    })
+}
+
+/// Whether `--version` output is Grok Build rather than another program of the same name.
+fn grok_version_identity(text: &str, success: bool) -> Result<(), String> {
+    if !success {
+        return Err("Grok Build's program exited without a version.".into());
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("cursor") {
+        return Err("That program is Cursor's agent, not Grok Build.".into());
+    }
+    if !lower.contains("grok") {
+        return Err("That program's --version output doesn't say it is Grok Build.".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod grok_program_tests {
+    use super::grok_version_identity;
+
+    #[test]
+    fn version_output_has_to_name_grok_and_not_cursor() {
+        assert!(grok_version_identity("grok version 1.2.3\n", true).is_ok());
+        assert!(grok_version_identity("Grok Build 0.4\n", true).is_ok());
+        assert!(grok_version_identity("Cursor Agent 2026.1.1\n", true).unwrap_err().contains("Cursor"));
+        assert!(grok_version_identity("2026.1.1\n", true).unwrap_err().contains("doesn't say"));
+        assert!(grok_version_identity("grok version 1\n", false).is_err());
     }
 }

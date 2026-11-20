@@ -142,6 +142,16 @@ impl CraftApp {
         self.default_builder().is_some()
     }
 
+    /// What a build is given. `None` means nothing can build. `Some(None)` means the person didn't
+    /// choose and `local_first` is on: the build picks the first server that answers, instead of
+    /// being pinned to the name [`Self::default_builder`] shows. Any other automatic choice, and
+    /// every choice the person made, is `Some(Some(name))`.
+    pub fn build_with(&mut self, wanted: Option<&str>) -> Option<Option<String>> {
+        let explicit = wanted.map(str::trim).filter(|name| !name.is_empty());
+        let resolved = self.builder_backend(explicit)?;
+        if explicit.is_none() && self.local_builders.is_some() { Some(None) } else { Some(Some(resolved)) }
+    }
+
     /// The AI to build with: `wanted` while it can build, else the default. An agent app that was
     /// only found is set up now (it needs no key, and the person pressed Start).
     pub fn builder_backend(&mut self, wanted: Option<&str>) -> Option<String> {
@@ -524,6 +534,7 @@ mod local_first_tests {
         app.backends = app.hub.backends();
         app.local_builders = crate::local_builders(&app.hub.config());
         assert_eq!(app.default_builder().as_deref(), Some("Claude Code"), "upstream rule while local_first is off");
+        assert_eq!(app.build_with(None), Some(Some("Claude Code".into())));
 
         let mut cfg = app.hub.config();
         cfg.local_first = true;
@@ -531,6 +542,9 @@ mod local_first_tests {
         app.hub.save_config(&cfg).unwrap();
         app.local_builders = crate::local_builders(&app.hub.config());
         assert_eq!(app.default_builder().as_deref(), Some("Lemonade"));
+        assert_eq!(app.build_with(None), Some(None), "nothing chosen: the build selects a server that answers");
+        assert_eq!(app.build_with(Some("Claude Code")), Some(Some("Claude Code".into())));
+        assert_eq!(app.default_builder().as_deref(), Some("Lemonade"), "the hint still names the default");
         assert!(app.can_build());
 
         cfg.backends.retain(|b| b.config.name != "Lemonade");
