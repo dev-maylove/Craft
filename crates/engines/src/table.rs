@@ -122,10 +122,13 @@ impl ExternalEngine {
     }
 
     /// Its folder in the engine store: named after its id, unless a guided setup unpacks it
-    /// elsewhere (the Java Ghidra's setup brings goes in `jdk`).
+    /// elsewhere (the Java Ghidra's setup brings goes in `jdk`). The Android compiler's `jdk`
+    /// entry uses `android-jdk` so that it cannot share Ghidra's managed Java folder.
     pub fn store_folder(&self) -> &'static str {
         match self.install {
             Install::Guided { folder, .. } => folder,
+            // Ghidra owns `jdk`; the Android compiler entry must not share that managed folder.
+            Install::Manual if self.id == "jdk" => "android-jdk",
             Install::Manual | Install::Pinned(_) => self.id,
         }
     }
