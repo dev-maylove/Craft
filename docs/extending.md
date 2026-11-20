@@ -17,6 +17,7 @@ place to add yours. Follow `AGENTS.md` (never crash, layers, external programs t
 | An external engine | `crates/engines/src/table.rs` | One `ExternalEngine` entry (exes, known paths, what it's for, install pins with SHA-256 checked against the publisher), plus a `tool_paths!` id in `settings.rs` if people can point at their own install. |
 | A front end for builds | anywhere above L5 | Hold a `rebuild::RunSet` (it queues past its limit) and `poll` it; test it with `RunSet::with_starter(StandIns::starter())`, whose runs report only what the test sends. |
 | A persisted file | its owner module | A version field and a migration step; see [file-formats.md](file-formats.md). |
+| A screen, a control or a size in the desktop app | `crates/ui-egui/src/` | Use the components in `widgets.rs` and the scale in `theme.rs`; a new size or colour goes into the scale, never into a screen. See [the design system](design-system.md). |
 | A UI language | `crates/ui-egui/src/i18n/` and `i18n.rs` | Add a TSV catalog and a language registry entry; preserve placeholders and run the catalog tests and `cargo xtask i18n-coverage`. See [localisation](localization.md) for scope and font setup. |
 
 ## Plugins: external MCP servers
@@ -104,3 +105,28 @@ a plugin exports the interfaces at the version it was built against
 Code that defines tools at run time itself (a WASM host, a proxy for another protocol) uses
 `registry::RuntimeTool` with `Engine::shared_with`: owned names, a JSON schema, and a function that
 serves its tools, telling them apart by `ctx.tool`.
+
+## Workspace map
+
+```text
+crates/
+  evidence   L0  Evidence records, canonical ids, confidence, unknowns, ToolError (the error contract)
+  formats    L0  Standalone parsers (no workspace deps, no I/O): ELF/PE/Mach-O/WASM/DEX/APK/ASAR/plist/.NET/Go/…
+  disasm     L1  Our own native engine (Clean room): decode, functions, CFG, xrefs, call graph, pseudo-C
+  js         L1  JavaScript/Electron/web bundles: parse, module graph, IPC, source maps, unbundling
+  analysis   L2  Analyzers producing evidence (triage, dossiers, trace, compare, app graph, rebuild ledger)
+  platform   L2  Native services: owned processes, PTY capture, sandbox, engine store, atomic files
+  engines    L3  Optional external engines: Ghidra bridge (Deep mode), adb, CDP, Frida, JADX, Apktool…
+  engine     L4  Session, projects (.cany), workspaces (what the person is making), the inbox
+                 (questions/approvals), ToolSpec registry, settings, consent, the tool list
+  ai         L5  AI backends (Anthropic, OpenAI, OpenRouter, local, agent CLIs, SSH) + agent loop + crews,
+                 and the rebuild workflow (study → build → check → refine)
+  mcp        L5  MCP server: progressive toolsets, resources, prompts
+  setup      L5  Connect to coding-agent apps; doctor; uninstall
+  ui-egui    L6  The egui interface (Beginner + Experienced). The only crate that may use egui/eframe/winit/rfd.
+  testkit        Test helpers and synthetic sample builders
+apps/  craft-anything (desktop) · craft-anything-cli (CLI + `mcp`) · craft-anything-web (browser viewer)
+xtask/ cargo xtask layers | fmt [--check] | tools [--check] | wasm | secrets [--history] | ci | version [set X.Y.Z]
+```
+
+Layering is enforced by `cargo xtask layers`.

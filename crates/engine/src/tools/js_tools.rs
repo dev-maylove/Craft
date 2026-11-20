@@ -1,7 +1,7 @@
 //! JavaScript applications: static analysis of Electron apps (ASAR or unpacked), web bundles and
 //! Node packages into an application graph, and reconciling that graph with runtime captures.
 
-use super::artifact_tools::{WalkOptions, abs_path, env, is_path_input, read_capped, resolve_evidence_input, walk_dir};
+use super::artifact_tools::{WALK_CUT_NOTE, WalkOptions, abs_path, env, is_path_input, read_capped, resolve_evidence_input, walk_dir};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use craft_anything_analysis::js_app::{AppFile, AppGraph, AppInput, AppOptions, analyze_application, is_script};
 use craft_anything_analysis::js_trace::{RuntimeScript, reconcile, runtime_scripts_from};
@@ -205,7 +205,7 @@ pub(crate) fn load_app_input(ctx: &Ctx<'_>, p: &AnalyzeParams) -> Result<(AppInp
                 &ctx.cancel,
             )?;
             if walked.truncated {
-                input.notes.push("the folder listing was cut short by the file-count or depth limit".into());
+                input.notes.push(WALK_CUT_NOTE.into());
             }
             listing_truncated |= walked.truncated;
             unlisted.extend(walked.unlisted.iter().cloned());
@@ -339,7 +339,7 @@ pub(crate) fn load_app_input(ctx: &Ctx<'_>, p: &AnalyzeParams) -> Result<(AppInp
                 walk_dir(&ep, &WalkOptions { max_files: p.max_files, max_depth: 48, skip_dir: &skip, gitignore: false, include_hidden: false }, &ctx.cancel)?;
             listing_truncated |= walked.truncated;
             if walked.truncated {
-                input.notes.push(format!("{base}: the folder listing was cut short by the file-count or depth limit"));
+                input.notes.push(format!("{base}: {WALK_CUT_NOTE}"));
             }
             unlisted.extend(walked.unlisted.iter().map(|(rel, e)| (format!("{base}/{rel}"), e.clone())));
             for f in &walked.files {
@@ -484,26 +484,35 @@ fn js_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError>
 
 /// Read an application graph from evidence or analyse a path. Returns the graph and the evidence id.
 pub(crate) fn load_graph(ctx: &Ctx<'_>, v: &Value) -> Result<(AppGraph, Option<String>), ToolError> {
+    let (g, id, _) = load_graph_with_limitations(ctx, v)?;
+    Ok((g, id))
+}
+
+/// [`load_graph`] with the limitations that apply to the graph: the path analysis's, or the saved
+/// evidence's (the full re-analysis's when a paged record had to be expanded).
+pub(crate) fn load_graph_with_limitations(ctx: &Ctx<'_>, v: &Value) -> Result<(AppGraph, Option<String>, Vec<Limitation>), ToolError> {
     if let Some(path) = is_path_input(v) {
-        let (g, _, _, _) = analyze_to_graph(ctx, &AnalyzeParams::for_path(path))?;
-        return Ok((g, None));
+        let (g, _, lims, _) = analyze_to_graph(ctx, &AnalyzeParams::for_path(path))?;
+        return Ok((g, None, lims));
     }
     let ev = resolve_evidence_input(ctx, v, &["js_app_map"])?;
     let total = ev.result.get("modules_total").and_then(Value::as_u64).unwrap_or(0);
     let shown = ev.result.get("modules").and_then(Value::as_array).map_or(0, Vec::len) as u64;
     let mut g: AppGraph =
         serde_json::from_value(ev.result.clone()).map_err(|e| ToolError::invalid(format!("evidence {} does not hold an application graph: {e}", ev.id)))?;
+    let mut lims = ev.limitations.clone();
     if shown < total {
         // A paged record: re-analyse the recorded input for the full module list.
         if let Some(path) = ev.params.get("input_path").and_then(Value::as_str) {
-            let (full, _, _, _) = analyze_to_graph(ctx, &AnalyzeParams::for_path(path))?;
+            let (full, _, full_lims, _) = analyze_to_graph(ctx, &AnalyzeParams::for_path(path))?;
             if full.graph_id != g.graph_id {
                 return Err(ToolError::new(ErrorCode::FileChanged, format!("{path} changed since evidence {} was recorded", ev.id)));
             }
             g = full;
+            lims = full_lims;
         }
     }
-    Ok((g, Some(ev.id)))
+    Ok((g, Some(ev.id), lims))
 }
 
 // ---------------------------------------------------------------------------------------------

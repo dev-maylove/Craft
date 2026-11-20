@@ -4,9 +4,10 @@
 //! evidence (or over a path, analysed on the spot).
 
 use super::artifact_tools::{
-    WalkOptions, abs_path, env, inventory_path, is_path_input, recorded_inventory, resolve_evidence_input, skipped_gitignores_limitation, walk_dir,
+    WalkOptions, abs_path, env, inventory_path, is_path_input, recorded_inventory, resolve_evidence_input, skipped_gitignores_limitation, unlisted_limitation,
+    walk_dir,
 };
-use super::js_tools::load_graph;
+use super::js_tools::{load_graph, load_graph_with_limitations};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use craft_anything_analysis::js_inventory::{InvLimits, Inventory};
 use craft_anything_analysis::js_ledger::{Binding, Review, build_ledger, evaluate_coverage};
@@ -129,6 +130,11 @@ fn with_links(mut b: EvidenceBuilder, ids: impl IntoIterator<Item = Option<Strin
         b = b.link(id);
     }
     b
+}
+
+/// A side's analysis limitations, labelled so a pair's reader knows which side they belong to.
+fn side_limitations(side: &str, lims: Vec<Limitation>) -> Vec<Limitation> {
+    lims.into_iter().map(|l| Limitation::new(l.code, format!("{side}: {}", l.message))).collect()
 }
 
 fn app_subject(label: &str) -> Subject {
@@ -323,9 +329,9 @@ pub struct PairParams {
 
 fn app_graphs_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: PairParams = parse_params(params)?;
-    let (l, lid) = load_graph(ctx, &p.left)?;
+    let (l, lid, llims) = load_graph_with_limitations(ctx, &p.left)?;
     ctx.cancel.check()?;
-    let (r, rid) = load_graph(ctx, &p.right)?;
+    let (r, rid, rlims) = load_graph_with_limitations(ctx, &p.right)?;
     let d = js_compare::compare_versions(&l, &r);
     let rows_capped = d["rows_capped"].as_bool().unwrap_or(false);
     let summary = format!(
@@ -353,7 +359,9 @@ fn app_graphs_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     .limitation(Limitation::new(
         "tiered_matching",
         "Modules match by path, then identical content, then the same name apart from a bundler's build hash (one on each side; `was` gives the old name), then identical structure; a heavily rewritten module shows as removed + added.",
-    ));
+    ))
+    .limitations(side_limitations("left", llims))
+    .limitations(side_limitations("right", rlims));
     if rows_capped {
         b = b
             .limitation(Limitation::new(
@@ -367,8 +375,8 @@ fn app_graphs_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
 
 fn js_exports_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: PairParams = parse_params(params)?;
-    let (l, lid) = load_graph(ctx, &p.left)?;
-    let (r, rid) = load_graph(ctx, &p.right)?;
+    let (l, lid, llims) = load_graph_with_limitations(ctx, &p.left)?;
+    let (r, rid, rlims) = load_graph_with_limitations(ctx, &p.right)?;
     let d = js_compare::compare_export_outlines(&l, &r);
     let rows_capped = d["rows_capped"].as_bool().unwrap_or(false);
     let summary = format!("{} module(s) compared; {} changed their exports.", d["modules"].as_array().map_or(0, Vec::len), d["changed"]);
@@ -381,7 +389,9 @@ fn js_exports_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     .result(d)
     .summary(summary)
     .confidence(Confidence::Derived)
-    .limitation(Limitation::new("names_only", "Export names and module.exports kind are compared, not function signatures or types."));
+    .limitation(Limitation::new("names_only", "Export names and module.exports kind are compared, not function signatures or types."))
+    .limitations(side_limitations("left", llims))
+    .limitations(side_limitations("right", rlims));
     if rows_capped {
         b = b
             .limitation(Limitation::new("rows_capped", "A module's export diff stops at 2,000 added or removed rows; the totals beside it are complete."))
@@ -424,7 +434,16 @@ fn default_src_total() -> u64 {
     512 * 1024 * 1024
 }
 
-fn source_graph_from_path(ctx: &Ctx<'_>, p: &ImportSourceParams) -> Result<(SourceGraph, Vec<(String, String)>), ToolError> {
+/// A source folder's graph, with what its walk couldn't see: folders it couldn't list in full
+/// (limitations for the evidence made from the graph), and `.gitignore` files whose rules
+/// weren't applied.
+struct WalkedSource {
+    graph: SourceGraph,
+    skipped_gitignores: Vec<(String, String)>,
+    walk_gaps: Vec<Limitation>,
+}
+
+fn source_graph_from_path(ctx: &Ctx<'_>, p: &ImportSourceParams) -> Result<WalkedSource, ToolError> {
     let root = abs_path(&p.path, "path")?;
     if !root.is_dir() {
         return Err(ToolError::invalid(format!("{} is not a folder", root.display())));
@@ -455,12 +474,12 @@ fn source_graph_from_path(ctx: &Ctx<'_>, p: &ImportSourceParams) -> Result<(Sour
     let cancel = ctx.cancel.clone();
     let graph = build_source_graph(&label, &files, w.ignored, w.truncated || over, &craft_anything_js::Limits::default(), &move || cancel.is_cancelled())
         .map_err(|_| ToolError::cancelled())?;
-    Ok((graph, w.skipped_gitignores))
+    Ok(WalkedSource { graph, skipped_gitignores: w.skipped_gitignores, walk_gaps: unlisted_limitation(&w.unlisted).into_iter().collect() })
 }
 
 fn app_source_import(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: ImportSourceParams = parse_params(params)?;
-    let (g, skipped_gitignores) = source_graph_from_path(ctx, &p)?;
+    let WalkedSource { graph: g, skipped_gitignores, walk_gaps } = source_graph_from_path(ctx, &p)?;
     let scripts = g.files.iter().filter(|f| f.parse_mode.is_some()).count();
     let summary = format!("{}: {} file(s), {} script(s) analysed, {} ignored.", g.label, g.files.len(), scripts, g.ignored);
     let mut b = EvidenceBuilder::new(
@@ -481,7 +500,13 @@ fn app_source_import(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     })
     .location(Location::new("path", p.path.clone()));
     if g.truncated {
-        b = b.limitation(Limitation::new("truncated", "Some files were skipped by the size or count limits."));
+        b = b.limitation(Limitation::new(
+            "truncated",
+            "Some files were skipped by the size or count limits, or were in a folder that couldn't be listed in full.",
+        ));
+    }
+    for gap in walk_gaps {
+        b = b.limitation(gap);
     }
     if let Some(l) = skipped_gitignores_limitation(&skipped_gitignores) {
         b = b.limitation(l);
@@ -512,6 +537,7 @@ fn default_rows() -> usize {
 /// sections and the row cap into the evidence as uncertainty rather than absent sources.
 fn compare_source_to_bundle_tool(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: SourceBundleParams = parse_params(params)?;
+    let mut walk_gaps = Vec::new();
     let (src, sid, skipped_gitignores) = if let Some(path) = is_path_input(&p.source) {
         let ip = ImportSourceParams {
             path: path.into(),
@@ -521,8 +547,9 @@ fn compare_source_to_bundle_tool(ctx: &mut Ctx<'_>, params: Value) -> Result<Too
             max_file_bytes: default_src_file_bytes(),
             max_total_bytes: default_src_total(),
         };
-        let (g, skipped) = source_graph_from_path(ctx, &ip)?;
-        (g, None, skipped)
+        let WalkedSource { graph, skipped_gitignores, walk_gaps: gaps } = source_graph_from_path(ctx, &ip)?;
+        walk_gaps = gaps;
+        (graph, None, skipped_gitignores)
     } else {
         let ev = resolve_evidence_input(ctx, &p.source, &["app_source_import"])?;
         let g: SourceGraph =
@@ -590,6 +617,13 @@ fn compare_source_to_bundle_tool(ctx: &mut Ctx<'_>, params: Value) -> Result<Too
     }
     if let Some(l) = skipped_gitignores_limitation(&skipped_gitignores) {
         b = b.limitation(l);
+    }
+    // A source folder read on the spot: what its walk couldn't list was never compared.
+    if !walk_gaps.is_empty() {
+        b = b.coverage(Coverage { status: CoverageStatus::Partial, ..Default::default() });
+    }
+    for gap in walk_gaps {
+        b = b.limitation(gap);
     }
     Ok(ToolOutput::evidence(with_links(b, [sid, aid]).build()?))
 }
@@ -1032,6 +1066,38 @@ mod tests {
         assert!(summary.contains("1 of 2 source script(s) examined"), "{summary}");
     }
 
+    /// A source folder that couldn't be listed came back as "truncated" only, naming neither the
+    /// folder nor the reason, and a comparison from a path said nothing at all.
+    #[test]
+    fn a_source_folder_that_cant_be_listed_is_named_with_its_reason() {
+        use super::super::artifact_tools::walk_testing::{assert_names_unlisted, close, unlisted_message};
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("reference");
+        fx::write_files(&src, &[("src/kept.js", "exports.kept = 1;".to_string()), ("closed/hidden.js", "exports.hidden = 1;".to_string())]).unwrap();
+        let dist = dir.path().join("dist");
+        fx::write_files(&dist, &[("main.js", "console.log(1);\n".to_string())]).unwrap();
+        let e = Engine::new(crate::testing::session());
+        let paths = |v: &Value| v["result"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let whole = call(&e, "app_source_import", json!({"path": src})).unwrap();
+        assert_eq!(
+            (paths(&whole), whole["coverage"]["status"].clone(), unlisted_message(&whole)),
+            (vec!["closed/hidden.js".into(), "src/kept.js".into()], json!("complete"), None)
+        );
+        let whole_comparison = call(&e, "js_source_bundle_compare", json!({"source": src, "application": dist})).unwrap();
+        assert_eq!(unlisted_message(&whole_comparison), None);
+
+        let Some(closed) = close(&src.join("closed")) else { return };
+        let import = call(&e, "app_source_import", json!({"path": src}));
+        let comparison = call(&e, "js_source_bundle_compare", json!({"source": src, "application": dist}));
+        drop(closed);
+        let (import, comparison) = (import.unwrap(), comparison.unwrap());
+        assert_eq!(paths(&import), ["src/kept.js"]);
+        assert_eq!(import["result"]["truncated"], true);
+        assert_names_unlisted(&import, "closed");
+        assert_names_unlisted(&comparison, "closed");
+        assert_eq!(comparison["result"]["summary"]["source_scripts"], 1, "{comparison}");
+    }
+
     #[test]
     fn source_comparison_discloses_an_unreadable_map() {
         let dir = tempfile::tempdir().unwrap();
@@ -1161,6 +1227,64 @@ mod tests {
         assert_eq!(q["links"][0], inv["id"]);
         let h = call(&e, "harmony_app_graph_build", json!({"path": apk})).unwrap();
         assert_eq!(h["confidence"], "inferred");
+    }
+
+    /// A malformed source map on either side stays visible in both comparisons, for path inputs and
+    /// for saved `js_app_map` evidence.
+    #[test]
+    fn comparisons_keep_each_sides_analysis_limitations() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = r#"{"name":"maps","main":"main.js"}"#;
+        let write = |root: &std::path::Path| {
+            fx::write_files(
+                root,
+                &[
+                    ("package.json", package.to_string()),
+                    ("main.js", "const x = 1;\n//# sourceMappingURL=main.js.map\n".to_string()),
+                    ("main.js.map", "not a source map".to_string()),
+                ],
+            )
+            .unwrap()
+        };
+        let left = write(&dir.path().join("left"));
+        let right = write(&dir.path().join("right"));
+        let e = Engine::new(crate::testing::session());
+        let assert_sides = |tool: &str, d: &Value| {
+            let lims = d["limitations"].as_array().unwrap();
+            for side in ["left:", "right:"] {
+                assert!(
+                    lims.iter().any(|l| l["code"] == "source_map_unreadable" && l["message"].as_str().unwrap().starts_with(side)),
+                    "{tool} keeps the {side} source-map limitation: {d}"
+                );
+            }
+        };
+        for tool in ["app_graphs_compare", "js_exports_compare"] {
+            let d = call(&e, tool, json!({"left": left.clone(), "right": right.clone()})).unwrap();
+            assert_sides(tool, &d);
+        }
+        let l = call(&e, "js_app_map", json!({"input_path": left})).unwrap();
+        let r = call(&e, "js_app_map", json!({"input_path": right})).unwrap();
+        for tool in ["app_graphs_compare", "js_exports_compare"] {
+            let d = call(&e, tool, json!({"left": retained(&l), "right": retained(&r)})).unwrap();
+            assert_sides(tool, &d);
+        }
+    }
+
+    /// A clean path pair gains no source-map limitation.
+    #[test]
+    fn clean_comparisons_have_no_analysis_limitations() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = r#"{"name":"clean","main":"main.js"}"#;
+        let write = |root: &std::path::Path| {
+            fx::write_files(root, &[("package.json", package.to_string()), ("main.js", "module.exports = { x: 1 };\n".to_string())]).unwrap()
+        };
+        let left = write(&dir.path().join("left"));
+        let right = write(&dir.path().join("right"));
+        let e = Engine::new(crate::testing::session());
+        for tool in ["app_graphs_compare", "js_exports_compare"] {
+            let path = call(&e, tool, json!({"left": left.clone(), "right": right.clone()})).unwrap();
+            assert!(!path["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "source_map_unreadable"), "{tool} path inputs: {path}");
+        }
     }
 
     /// A comparison whose channel list is cut reports complete totals and partial coverage.
