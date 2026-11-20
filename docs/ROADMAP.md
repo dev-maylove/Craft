@@ -1531,6 +1531,7 @@ Owner: maintainers · Status: in progress
       yet, instead of deciding from one look; tried with a program that opens its window late
 - [ ] Close a pictured program politely before killing it: a helper it started through launchd
       outlives the process group, and can stay running with the program's data files open
+      — claimed: rmsff, branch bugfix/r2.4-polite-close
 - [x] `apple_calls_observe`: the breakpoint callback is one valid line (it had a literal backslash
       and `n` between statements, so lldb stopped before launching, #251), covers every breakpoint
       instead of only the first, a failed lldb run is an error and not "0 calls", and names or
