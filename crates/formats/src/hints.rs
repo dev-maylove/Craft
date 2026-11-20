@@ -36,17 +36,17 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
     let imp = |n: &str| b.imports.iter().any(|i| i.name == n || i.name.strip_prefix('_') == Some(n));
     let bytes = |n: &[u8]| find_bytes(data, n, SCAN_LIMIT).is_some();
     // Packers and installers put their marker in the header or in data appended after the
-    // program; inside a section it's one of the program's own strings, such as a detector's (#2226).
-    let outside_sections = |n: &[u8]| {
-        let mut from = 0usize;
-        while let Some(at) = data.get(from..).and_then(|d| find_bytes(d, n, SCAN_LIMIT.saturating_sub(from))).map(|p| p + from) {
-            let inside = b.sections.iter().any(|s| s.file_offset.is_some_and(|o| u64::try_from(at).is_ok_and(|at| at >= o && at - o < s.file_size)));
-            if !inside {
-                return true;
-            }
-            from = at + 1;
+    // program; inside its sections it's one of the program's own strings, such as a detector's
+    // (#2226). A file with no sections is searched whole.
+    let placed = b.sections.iter().filter_map(|s| Some((usize::try_from(s.file_offset?).ok()?, usize::try_from(s.file_size).ok()?)));
+    let first = placed.clone().map(|(o, _)| o).min();
+    let last_end = placed.map(|(o, n)| o.saturating_add(n)).max();
+    let outside_sections = |n: &[u8]| match (first, last_end) {
+        (Some(first), Some(last_end)) => {
+            let found = |part: Option<&[u8]>| part.is_some_and(|d| find_bytes(d, n, SCAN_LIMIT).is_some());
+            found(data.get(..first.min(data.len()))) || found(data.get(last_end..))
         }
-        false
+        _ => bytes(n),
     };
     let push = |out: &mut Vec<Hint>, h: Hint| {
         if !out.iter().any(|x| x.id == h.id) {
