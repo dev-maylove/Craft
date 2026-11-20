@@ -1063,7 +1063,7 @@ fn a_website_is_signed_in_to_from_make() {
     h.state_mut().state.make.url.clear();
     h.run_steps(2);
     h.get_by_label("Stop waiting");
-    h.get_by_label("Nothing — start fresh").click();
+    h.get_by_label("Start fresh").click();
     h.run_steps(2);
     h.get_by_label("Stop waiting");
     assert!(h.query_by_label("Sign in to this site").is_none());

@@ -212,6 +212,8 @@ pub struct Tile<'a> {
 const TILE_TEXT_INSET: f32 = 84.0;
 /// The space between tiles, across and down.
 const TILE_GAP: f32 = 10.0;
+/// The narrowest a tile may be to let its title wrap to a second line rather than drop a column.
+const WRAP_MIN_TILE: f32 = 170.0;
 
 /// Sibling choice tiles as one grid: as many columns as fit (at most `max_cols`, and only counts
 /// that fill every row) with every title on one line in the current language, and every tile as
@@ -252,7 +254,20 @@ pub fn choice_tiles(ui: &mut Ui, tiles: &[Tile], max_cols: usize, min_h: f32) ->
 pub fn tile_columns(ui: &Ui, tiles: &[Tile], max_cols: usize, width: f32) -> usize {
     let t = Tokens::get(ui.ctx());
     let widest = tiles.iter().map(|x| ui.painter().layout_no_wrap(tr(x.label), theme::medium(theme::BODY), t.text).size().x).fold(0.0_f32, f32::max);
-    (2..=max_cols.min(tiles.len())).rev().find(|&c| tiles.len().is_multiple_of(c) && widest <= tile_width(width, c) - TILE_TEXT_INSET).unwrap_or(1)
+    // The longest single word: a title may wrap onto a second line in a roomy tile (the tiles
+    // grow to the tallest), so a long translation doesn't push the row to two by two.
+    let longest_word = tiles
+        .iter()
+        .flat_map(|x| tr(x.label).split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+        .map(|w| ui.painter().layout_no_wrap(w, theme::medium(theme::BODY), t.text).size().x)
+        .fold(0.0_f32, f32::max);
+    (2..=max_cols.min(tiles.len()))
+        .rev()
+        .find(|&c| {
+            let (w, room) = (tile_width(width, c), tile_width(width, c) - TILE_TEXT_INSET);
+            tiles.len().is_multiple_of(c) && (widest <= room || (w >= WRAP_MIN_TILE && longest_word <= room))
+        })
+        .unwrap_or(1)
 }
 
 fn tile_width(width: f32, cols: usize) -> f32 {
@@ -465,8 +480,10 @@ pub fn primary_icon(ui: &mut Ui, icon: Option<&str>, label: &str, enabled: bool)
 
 /// How tall [`primary`] draws `label`, so a field beside it can match.
 pub fn primary_height(ui: &Ui, label: &str) -> f32 {
-    let galley = label_galley(ui, &tr(label), 12.5, Color32::PLACEHOLDER);
-    (galley.size().y + ui.spacing().button_padding.y * 2.0 + 8.0).max(32.0)
+    // The same height `Button` gives a medium control (its label's line and a little air, at least
+    // the control's height), not one built from the style's padding, which follows the text size.
+    let galley = label_galley(ui, &tr(label), ControlSize::Medium.text(), Color32::PLACEHOLDER);
+    (galley.size().y + theme::space::SM).max(ControlSize::Medium.height())
 }
 
 /// Secondary button: a card-coloured box with a soft edge and an optional icon.
