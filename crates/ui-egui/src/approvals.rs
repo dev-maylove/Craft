@@ -2,7 +2,7 @@
 //! (`project_approvals_set`): a menu under the prompt box, and `/approvals <kind> <choice>` typed in
 //! it. A kind left on Default follows Auto mode.
 
-use crate::i18n::{tr, trf};
+use crate::i18n::{tr, tr_logical, trf};
 use crate::slash::{self, Command, Typed};
 use crate::theme::{self, Tokens};
 use crate::{CraftApp, widgets};
@@ -106,11 +106,11 @@ impl CraftApp {
                 let chosen: Option<Approval> = serde_json::from_value(set["chosen"].clone()).ok();
                 let gets: Option<Approval> = serde_json::from_value(set["gets"].clone()).ok();
                 let choice = match chosen {
-                    Some(c) => tr(choice_label(Some(c))),
+                    Some(c) => tr_logical(choice_label(Some(c))),
                     // Default: say what that is now.
-                    None => format!("{} ({})", tr(choice_label(None)), gets.map(|g| tr(choice_label(Some(g)))).unwrap_or_default()),
+                    None => format!("{} ({})", tr_logical(choice_label(None)), gets.map(|g| tr_logical(choice_label(Some(g)))).unwrap_or_default()),
                 };
-                self.toast(trf("In this project, {kind}: {choice}.", &[("kind", &tr(label(kind))), ("choice", &choice)]), false);
+                self.toast(trf("In this project, {kind}: {choice}.", &[("kind", &tr_logical(label(kind))), ("choice", &choice)]), false);
             }
             Err(e) => {
                 // The menu showed the choice before it was saved: show what's really kept again.
