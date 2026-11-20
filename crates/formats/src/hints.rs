@@ -3,6 +3,7 @@
 
 use crate::binary::{Binary, Format};
 use crate::find_bytes;
+use crate::packed::PackedFormat;
 use serde::Serialize;
 
 /// How far into the file byte searches look.
@@ -34,6 +35,19 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
     let lib = |n: &str| b.libraries.iter().find(|l| l.to_ascii_lowercase().contains(&n.to_ascii_lowercase())).cloned();
     let imp = |n: &str| b.imports.iter().any(|i| i.name == n || i.name.strip_prefix('_') == Some(n));
     let bytes = |n: &[u8]| find_bytes(data, n, SCAN_LIMIT).is_some();
+    // Packers and installers put their marker in the header or in data appended after the
+    // program; inside a section it's one of the program's own strings, such as a detector's (#2226).
+    let outside_sections = |n: &[u8]| {
+        let mut from = 0usize;
+        while let Some(at) = data.get(from..).and_then(|d| find_bytes(d, n, SCAN_LIMIT.saturating_sub(from))).map(|p| p + from) {
+            let inside = b.sections.iter().any(|s| s.file_offset.is_some_and(|o| u64::try_from(at).is_ok_and(|at| at >= o && at - o < s.file_size)));
+            if !inside {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    };
     let push = |out: &mut Vec<Hint>, h: Hint| {
         if !out.iter().any(|x| x.id == h.id) {
             out.push(h);
@@ -150,7 +164,7 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
         push(&mut out, hint("delphi", "language", "Delphi or C++Builder", if sec(".itext") { "strong" } else { "weak" }, ev));
     }
     // Python bundlers
-    if bytes(b"MEI\x0c\x0b\x0a\x0b\x0e") || bytes(b"_MEIPASS") {
+    if crate::pyinstaller::PyInstaller.detect(data) {
         push(&mut out, hint("pyinstaller", "packer", "PyInstaller (a bundled Python program)", "strong", "PyInstaller archive cookie"));
     } else if imp("Py_Initialize") || lib("python3").is_some() {
         push(&mut out, hint("python", "runtime", "Embedded Python", "weak", "Python runtime import"));
@@ -214,14 +228,14 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
             push(&mut out, hint(id, cat, label, "strong", format!("section {}", s.name)));
         }
     }
-    if !out.iter().any(|h| h.id == "upx") && bytes(b"UPX!") && b.format != Format::Raw {
+    if !out.iter().any(|h| h.id == "upx") && outside_sections(b"UPX!") && b.format != Format::Raw {
         push(&mut out, hint("upx", "packer", "UPX", "weak", "UPX! marker in the data"));
     }
     // Installers
-    if bytes(b"Nullsoft") {
+    if outside_sections(b"Nullsoft") {
         push(&mut out, hint("nsis", "installer", "NSIS installer", "weak", "Nullsoft marker"));
     }
-    if bytes(b"Inno Setup") {
+    if outside_sections(b"Inno Setup") {
         push(&mut out, hint("inno", "installer", "Inno Setup installer", "weak", "Inno Setup marker"));
     }
     if bytes(b"AU3!") {
@@ -294,5 +308,33 @@ mod tests {
         let pe = craft_anything_testkit::pe64();
         let b = crate::parse_binary(&pe).unwrap();
         let _ = detect(&b, &pe);
+    }
+
+    #[test]
+    fn markers_in_a_programs_own_strings_are_not_a_packer() {
+        // #2226: a program that mentions packers in its own data (a detector's vocabulary) isn't
+        // packed; the same markers in the header or appended data are where those tools put them.
+        let pe = craft_anything_testkit::pe64();
+        let b = crate::parse_binary(&pe).unwrap();
+        let s = b.sections.iter().find(|s| s.file_offset.is_some() && s.file_size >= 64).expect("a section with data");
+        let at = usize::try_from(s.file_offset.unwrap()).unwrap();
+        let markers: [&[u8]; 5] = [b"UPX!", b"Nullsoft", b"Inno Setup", b"_MEIPASS", b"MEI\x0c\x0b\x0a\x0b\x0e"];
+        let mut strings = pe.clone();
+        let mut pos = at;
+        for m in markers {
+            strings[pos..pos + m.len()].copy_from_slice(m);
+            pos += m.len() + 1;
+        }
+        let packed = |data: &[u8]| -> Vec<&'static str> {
+            let b = crate::parse_binary(data).unwrap();
+            detect(&b, data).into_iter().filter(|h| matches!(h.category, "packer" | "installer")).map(|h| h.id).collect()
+        };
+        assert!(packed(&strings).is_empty(), "{:?}", packed(&strings));
+        let mut appended = pe.clone();
+        appended.extend_from_slice(b"\xef\xbe\xad\xdeNullsoftInst\0Inno Setup Setup Data (6.4.0)\0UPX!");
+        let found = packed(&appended);
+        for id in ["nsis", "inno", "upx"] {
+            assert!(found.contains(&id), "{id} in appended data: {found:?}");
+        }
     }
 }
