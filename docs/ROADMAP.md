@@ -1952,6 +1952,7 @@ Gaps found while using the app for real projects.
 - [ ] A note the builder's hook took during a turn that ends with a lost or too-long conversation
       isn't in the new conversation's first message, though the feed shows it as delivered
       (review of #2043). Hand such a note on with the fresh start, for a missing session as well
+      — claimed: justinjohn0306, branch bugfix/r2.9-note-across-fresh-start
 - [x] `build_file_edit` read the whole project file into memory before replacing text; it now
       uses the same 16 MiB cap as a read, refusing a larger file before it is loaded and leaving
       it unchanged. A file at the cap still edits when the result fits the 8 MB write cap. Engine
