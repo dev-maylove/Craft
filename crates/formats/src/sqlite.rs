@@ -2255,8 +2255,11 @@ mod tests {
         assert_eq!(varint(&[0x00], 0), Some((0, 1)));
         assert_eq!(varint(&[0x7f], 0), Some((127, 1)));
         assert_eq!(varint(&[0x81, 0x00], 0), Some((128, 2)));
-        assert_eq!(varint(&[0xff; 9], 0).map(|(_, n)| n), Some(9));
+        assert_eq!(varint(&[0xff; 9], 0), Some((u64::MAX, 9)));
+        assert_eq!(varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01], 0), Some((1, 9)));
+        assert_eq!(varint(&[0x80; 8], 0), None);
         assert_eq!(varint(&[0x80], 0), None); // never terminates within range
+        assert_eq!(varint(&[], 1), None);
     }
 
     #[test]
@@ -2650,6 +2653,14 @@ mod tests {
             CellValue::Blob { len, .. } => assert_eq!(len, 3),
             other => panic!("expected blob, got {other:?}"),
         }
+        // 6-byte signed integer, 8-byte signed integer, 8-byte float, and reserved serial types 10/11.
+        assert_eq!(decode_serial(5, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xfe], 0, "utf-8", MAX_TEXT), (CellValue::Int(-2), 6));
+        assert_eq!(decode_serial(6, &(-42_i64).to_be_bytes(), 0, "utf-8", MAX_TEXT), (CellValue::Int(-42), 8));
+        assert_eq!(decode_serial(7, &3.5_f64.to_be_bytes(), 0, "utf-8", MAX_TEXT), (CellValue::Real(3.5), 8));
+        assert_eq!(decode_serial(10, &[], 0, "utf-8", MAX_TEXT), (CellValue::Null, 0));
+        assert_eq!(decode_serial(11, &[], 0, "utf-8", MAX_TEXT), (CellValue::Null, 0));
+        assert_eq!(craft_sqlite::serial_type_len(10), Err(craft_sqlite::Error::ReservedSerialType(10)));
+        assert_eq!(craft_sqlite::serial_type_len(11), Err(craft_sqlite::Error::ReservedSerialType(11)));
     }
 
     fn text(value: &str) -> CellValue {
