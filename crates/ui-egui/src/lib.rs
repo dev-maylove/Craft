@@ -47,10 +47,11 @@ pub mod workbench;
 
 use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, Conversation, Detected};
 use craft_anything_engine::evidence::{ErrorCode, Evidence, ToolError, Unknown};
+use craft_anything_engine::tools::site_sign_in::SIGN_IN_TOOL;
 use craft_anything_engine::{CallOptions, Caller, Consent, Engine, Mode, Settings, TargetKind, ToolOutput, clean_room};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use state::{CenterTab, ChatItem, ConsentAnswer, Fill, RailKind, Screen, UiState};
+use state::{CenterTab, ChatItem, ConsentAnswer, Fill, GameJob, RailKind, Screen, UiState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -159,8 +160,9 @@ pub enum Done {
     Detected(Vec<Detected>, Vec<craft_anything_ai::detect::DetectHint>),
     AgentConnection(String, Result<String, String>),
     /// The configured backends, the ones chosen to build with and to extract with, and each one's
-    /// options.
+    /// options. The first field is when the snapshot was read (see [`backends`]).
     Backends(
+        u64,
         Vec<BackendConfig>,
         Option<String>,
         Option<String>,
@@ -230,6 +232,7 @@ pub enum Done {
     /// A tool started by a button finished (see `CraftApp::act`).
     Acted {
         tool: &'static str,
+        params: Value,
         result: Result<Value, ToolError>,
     },
     /// Which asset providers have a key set up (provider id → stored).
@@ -259,6 +262,10 @@ pub enum Done {
         result: Result<(), ToolError>,
         /// `CraftApp::backend_choices` when the add started: a choice made since then stands.
         choices: u64,
+        /// The address that was asked, as sent (trimmed); empty when the AI wasn't added by
+        /// address. A list of models to choose from belongs to this address, not to whatever the
+        /// form shows when the answer arrives.
+        address: String,
     },
     /// The projects folder was listed.
     Projects(Vec<craft_anything_engine::workspace::Workspace>),
@@ -269,6 +276,8 @@ pub enum Done {
         backend: String,
         /// Why the pictures couldn't be copied, if they couldn't.
         pictures: Option<String>,
+        /// The folder already held a project: the request is its follow-up, not a new project's.
+        attached: bool,
     },
     /// A message's pictures were copied into its project (see `CraftApp::deliver`).
     Attached {
@@ -300,12 +309,18 @@ pub enum Done {
 pub struct ServerForm {
     pub name: String,
     pub address: String,
-    /// Empty: the first model it lists that can chat.
+    /// Empty: the one it has loaded, or its only chat model; with several, the person chooses.
     pub model: String,
     pub key: String,
     /// The server being asked for its models (the job, its name, when it started); the form says
     /// it's connecting and for how long (#1429).
     pub connecting: Option<(u64, String, Instant)>,
+    /// The chat models the server at `address` listed when it couldn't be told which one is in use
+    /// (#1434): the form offers them to choose from while the address stays the same.
+    pub choices: Option<(String, Vec<String>)>,
+    /// The address and model last picked from `choices`: that model belongs to that server, so it
+    /// goes from `model` once the address is another. A model typed by hand isn't tracked.
+    pub picked: Option<(String, String)>,
 }
 
 /// What a file dialog was for.
@@ -442,6 +457,8 @@ struct FirstFrames {
 }
 
 pub struct CraftApp {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) updates: updates::Updates,
     pub engine: Arc<Engine>,
     pub hub: Arc<AiHub>,
     pub state: UiState,
@@ -542,6 +559,9 @@ pub struct CraftApp {
     /// a save or a newer check.
     pub backend_keys: Option<std::collections::BTreeMap<String, bool>>,
     backend_keys_request: u64,
+    /// The newest backends snapshot shown (`Done::Backends`): one read before it, from a job that
+    /// finished later, is dropped, so a slow refresh can't put back what a save just changed.
+    backends_read: u64,
     /// What has been typed in each API backend's key field, kept across frames and after a failed
     /// save.
     pub backend_key_inputs: std::collections::BTreeMap<String, String>,
@@ -566,6 +586,8 @@ pub struct CraftApp {
     saving: Option<u64>,
     /// A new project being made (Start waits for it).
     pub creating: Option<u64>,
+    /// A website sign-in window open from Make (one at a time; Start waits for it).
+    pub signing_in: Option<u64>,
     /// Tools the UI started that wait for the person's consent, by the id on their card.
     pending_consent: std::collections::HashMap<u64, (String, Value, Route)>,
     next_consent: u64,
@@ -580,18 +602,28 @@ pub struct CraftApp {
     chat_jobs: Vec<u64>,
     view_dirty: bool,
     last_view: Option<Instant>,
-    applied_theme: Option<(ThemeKind, bool)>,
+    applied_theme: Option<ThemeKind>,
+    /// The system's light or dark appearance, read each frame: the System theme follows it.
+    system_theme: Option<egui::Theme>,
     started: bool,
 }
 
 impl CraftApp {
+    /// Show the last update's result once the native window begins drawing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn show_update_outcome_on_start(&mut self) {
+        self.updates.startup();
+    }
+
     /// Initialize UI state from the shared engine's saved settings, waiting rather than substituting defaults.
     pub fn new(engine: Arc<Engine>, hub: Arc<AiHub>) -> Self {
         // Wait for the engine if it's busy: defaults here would show Clean room and no AI, and the
         // next settings change would save them over the person's own.
         let settings = engine.session().settings.clone();
         i18n::set_language(&settings.language);
-        CraftApp {
+        let mut app = CraftApp {
+            #[cfg(not(target_arch = "wasm32"))]
+            updates: Default::default(),
             engine,
             hub,
             state: UiState::default(),
@@ -648,6 +680,7 @@ impl CraftApp {
             asset_keys: None,
             backend_keys: None,
             backend_keys_request: 0,
+            backends_read: 0,
             backend_key_inputs: Default::default(),
             backend_key_pending: Default::default(),
             facts: Default::default(),
@@ -659,6 +692,7 @@ impl CraftApp {
             save_due: None,
             saving: None,
             creating: None,
+            signing_in: None,
             chat_jobs: Vec::new(),
             asking: Default::default(),
             pausing: Default::default(),
@@ -668,8 +702,15 @@ impl CraftApp {
             view_dirty: true,
             last_view: None,
             applied_theme: None,
+            system_theme: None,
             started: false,
+        };
+        // A config.toml that couldn't be read or set aside is said here, where the person is
+        // looking, and not only in the log: every save is refused until it's fixed.
+        if let Some(said) = settings_ui::not_loaded_warning(&app.settings) {
+            app.toast(said, true);
         }
+        app
     }
 
     /// Fonts and image loaders; call once with the egui context.
@@ -677,7 +718,10 @@ impl CraftApp {
         theme::install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
         // The zoom keys are ours (`shortcuts`), so zoom stays inside ZOOM_RANGE.
-        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        ctx.options_mut(|o| {
+            o.zoom_with_keyboard = false;
+            o.input_options.line_scroll_speed = theme::WHEEL_STEP;
+        });
     }
 
     /// Gives the macOS app its menu bar (nothing elsewhere). Call once the window is open.
@@ -761,8 +805,9 @@ impl CraftApp {
         self.settings.mode == Mode::Beginner
     }
 
+    /// The theme drawn with: the one chosen, or with System, the system's appearance.
     pub fn theme_kind(&self) -> ThemeKind {
-        ThemeKind::from_id(&self.settings.theme)
+        theme::resolve(&self.settings.theme, self.system_theme)
     }
 
     pub fn log(&mut self, error: bool, text: impl Into<String>) {
@@ -786,6 +831,16 @@ impl CraftApp {
             self.state.toasts.remove(i);
             if i < self.toast_at.len() {
                 self.toast_at.remove(i);
+            }
+        }
+        // A confirmation takes the place of the one before it: two in a row (a switch flipped
+        // and flipped back) would only pile up over the screen.
+        if !error {
+            while let Some(i) = self.state.toasts.iter().position(|(_, e)| !e) {
+                self.state.toasts.remove(i);
+                if i < self.toast_at.len() {
+                    self.toast_at.remove(i);
+                }
             }
         }
         self.state.toasts.push((text, error));
@@ -824,7 +879,7 @@ impl CraftApp {
         {
             // The Ghidra folder changed: look for it again.
             if s.settings.engines.ghidra.install_dir != self.settings.engines.ghidra.install_dir {
-                self.ghidra.ready = None;
+                self.ghidra.found = None;
             }
             // The `ai` table belongs to the ai crate (it edits it in the session); keep its copy.
             self.settings.ai = s.settings.ai.clone();
@@ -850,7 +905,7 @@ impl CraftApp {
             // by an older settings snapshot. This runs on the worker, never the UI thread.
             let session = engine.session();
             session.label("Save settings");
-            session.settings.save().map_err(|e| e.message)?;
+            session.settings.save().map_err(|e| settings_ui::settings_not_saved(&e))?;
             Ok(Done::Nothing)
         }));
     }
@@ -995,18 +1050,29 @@ impl CraftApp {
     }
 
     /// Run a tool for a button on a worker (play, preview, open a folder…); the result comes back
-    /// as `Done::Acted` and is shown by `acted`. A click is the person's consent.
-    pub fn act(&mut self, tool: &'static str, params: Value, title: String) {
+    /// as `Done::Acted` and is shown by `acted`. A click is the person's consent. The job's id lets
+    /// a screen ignore an answer that a newer request has replaced.
+    pub fn act(&mut self, tool: &'static str, params: Value, title: String) -> u64 {
         let engine = self.engine.clone();
+        let scope = params.clone();
         self.jobs.spawn(title, false, move |j| {
             let progress = j.reporter();
             let opts = CallOptions::new(Caller::Ui).with_consent(Consent::Granted).with_cancel(j.cancel.clone()).with_progress(&progress);
             let result = engine.call(tool, params, opts).map(|o| o.to_json().get("result").cloned().unwrap_or(Value::Null));
-            Ok(Done::Acted { tool, result })
-        });
+            Ok(Done::Acted { tool, params: scope, result })
+        })
     }
 
-    fn acted(&mut self, tool: &str, result: Result<Value, ToolError>) {
+    /// Open a browser window on a website for the person to sign in to it themselves, so studies
+    /// of that site see it signed in (`web_site_sign_in`). One window at a time, and not while a
+    /// new project is being made: its build would start and study the site before the sign-in ends.
+    pub fn sign_in_to_site(&mut self, url: &str) {
+        if self.signing_in.is_none() && self.creating.is_none() {
+            self.signing_in = Some(self.act(SIGN_IN_TOOL, json!({ "url": url }), tr("Sign in to a website")));
+        }
+    }
+
+    fn acted(&mut self, job: u64, tool: &str, params: &Value, result: Result<Value, ToolError>) {
         match (tool, result) {
             ("project_preview", Ok(v)) => {
                 let url = v.get("url").and_then(Value::as_str).map(str::to_string);
@@ -1064,6 +1130,20 @@ impl CraftApp {
                     self.toast(format!("{} {}", tr("Some plugins couldn't be read:"), failed.join("; ")), true);
                 }
             }
+            // Each message names the site it was for: the address on Make may have changed since.
+            (SIGN_IN_TOOL, Ok(v)) => {
+                let (words, warn) = make::sign_in_words(&v);
+                self.toast(format!("{}: {words}", make::site_name(params)), warn);
+            }
+            // "Stop waiting" before the window was up (or while another tool held the session).
+            (SIGN_IN_TOOL, Err(e)) if e.code == ErrorCode::Cancelled => {
+                let stopped = tr("Stopped the sign-in.");
+                self.toast(format!("{}: {stopped}", make::site_name(params)), false)
+            }
+            (SIGN_IN_TOOL, Err(e)) if !clean_room::is_refusal(&e) => {
+                let failed = tr("Couldn't sign in to the site.");
+                self.toast(format!("{}: {failed} {}", make::site_name(params), e.for_people()), true);
+            }
             ("project_open_folder", Err(e)) => self.toast(format!("{} {}", tr("Couldn't open the folder."), e.message), true),
             (
                 "game_archives_list"
@@ -1074,9 +1154,9 @@ impl CraftApp {
                 | "game_unreal_texture_export"
                 | "game_unity_asset_export",
                 r,
-            ) => game_files::tool_done(self, tool, r),
+            ) => game_files::tool_done(self, job, tool, params, r),
             // The Game files screen's look at a picked game.
-            ("core_target_triage", r) => game_files::tool_done(self, tool, r),
+            ("core_target_triage", r) => game_files::tool_done(self, job, tool, params, r),
             (_, Ok(_)) => {}
             (_, Err(e)) if clean_room::is_refusal(&e) => self.state.modal = Some(state::Modal::DeepMode),
             (_, Err(e)) => self.toast(e.for_people(), true),
@@ -1092,9 +1172,9 @@ impl CraftApp {
             ProblemKind::Broken => "Part of the app got stuck, so it was stopped and the rest carried on. Your work is kept.",
             _ => "Part of the app is stuck. Restarting clears it, and your work is kept.",
         };
-        egui::Panel::top("stuck-banner").frame(egui::Frame::new().fill(t.card).inner_margin(egui::Margin::symmetric(14, 8))).show(ui, |ui| {
+        egui::Panel::top("stuck-banner").frame(egui::Frame::new().fill(t.card).inner_margin(theme::pad::BAR)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                icons::show(ui, "triangle-alert", 16.0, t.danger);
+                icons::show(ui, "triangle-alert", crate::theme::icon::MD, t.danger);
                 ui.label(egui::RichText::new(i18n::tr(text)).color(t.text)).on_hover_text(problem.summary.clone());
                 if let Some(path) = &problem.log
                     && widgets::secondary(ui, None, "Open log").on_hover_text(path.display().to_string()).clicked()
@@ -1320,7 +1400,7 @@ impl CraftApp {
         let choices = self.backend_choices;
         self.jobs.spawn(i18n::trf("Connect {name}", &[("name", &name)]), true, move |_| {
             let result = hub.add_backend(config, key);
-            Ok(Done::BackendAdded { name, result, choices })
+            Ok(Done::BackendAdded { name, result, choices, address: String::new() })
         });
     }
 
@@ -1412,11 +1492,13 @@ impl CraftApp {
             chat::apply_event(&mut self.state.chat, e.clone());
             match e {
                 AgentEvent::ToolFinished { .. } => self.view_dirty = true,
-                AgentEvent::TurnDone { backend, input_tokens, output_tokens, cost_usd, cost_is_estimate } => {
+                AgentEvent::TurnDone { backend, input_tokens, output_tokens, tokens_unknown, cost_usd, cost_is_estimate } => {
                     self.view_dirty = true;
+                    self.session_usage.tokens_incomplete |= tokens_unknown;
                     self.session_usage.add_turn(input_tokens, output_tokens, cost_usd, cost_is_estimate);
                     let cost = cost_usd.map(|c| format!(", ${c:.4}")).unwrap_or_default();
-                    self.log(false, format!("{backend}: {input_tokens} in / {output_tokens} out{cost}"));
+                    let usage = if tokens_unknown { "token count unknown".into() } else { format!("{input_tokens} in / {output_tokens} out") };
+                    self.log(false, format!("{backend}: {usage}{cost}"));
                 }
                 AgentEvent::Error { message, .. } => self.log(true, message),
                 _ => {}
@@ -1501,13 +1583,33 @@ impl CraftApp {
         if self.creating == Some(job) {
             self.creating = None;
         }
-        if self.server_form.connecting.as_ref().is_some_and(|(id, ..)| *id == job) {
+        if self.signing_in == Some(job) {
+            self.signing_in = None;
+        }
+        // The form's own request: a newer Add replaces it, and an older answer is then stale.
+        let form_request = self.server_form.connecting.as_ref().is_some_and(|(id, ..)| *id == job);
+        if form_request {
             self.server_form.connecting = None;
         }
         self.chat_jobs.retain(|id| *id != job);
         let done = match done.result {
             Ok(d) => d,
             Err(e) => {
+                self.log(true, e.clone());
+                // A Game files job that failed in the worker settles only its own request; one a
+                // newer pick replaced is logged above and says nothing.
+                if let Some(pending) = self.state.game.finish(job) {
+                    if pending.current {
+                        match pending.kind {
+                            GameJob::FolderScan => self.state.game.looking = false,
+                            GameJob::Listing => self.state.game.loading = false,
+                            // What the game is made of holds neither spinner.
+                            GameJob::Triage => {}
+                        }
+                        self.toast(e, true);
+                    }
+                    return;
+                }
                 if let Some(agent) = checked_agent {
                     self.agent_connections.insert(agent, Some(Err(e.clone())));
                 }
@@ -1520,7 +1622,6 @@ impl CraftApp {
                 if self.ghidra.job == Some(job) {
                     self.ghidra.job = None;
                 }
-                self.log(true, e.clone());
                 self.toast(e, true);
                 return;
             }
@@ -1538,11 +1639,11 @@ impl CraftApp {
             }
             Done::Facts(f) => self.facts_read(job, Some(f)),
             Done::PicturesAdded(added) => self.pictures_added(added),
-            Done::Created { ws, request, backend, pictures } => self.created(*ws, request, backend, pictures),
+            Done::Created { ws, request, backend, pictures, attached } => self.created(*ws, request, backend, pictures, attached),
             Done::Thumb { path, image } => self.thumb_ready(path, image),
             Done::Preview { path, image } => self.preview_ready(path, image),
             Done::Tool { tool, params, route, result } => self.tool_done(tool, params, route, result),
-            Done::Acted { tool, result } => self.acted(tool, result),
+            Done::Acted { tool, params, result } => self.acted(job, tool, &params, result),
             Done::Opened { path, result } => match result {
                 Ok(v) => {
                     // Another target: a new conversation, so answers about two things don't mix.
@@ -1588,7 +1689,11 @@ impl CraftApp {
             Done::AgentConnection(name, result) => {
                 self.agent_connections.insert(name, Some(result));
             }
-            Done::Backends(b, builder, extractor, options, replaced) => {
+            Done::Backends(read, b, builder, extractor, options, replaced) => {
+                if read < self.backends_read {
+                    return;
+                }
+                self.backends_read = read;
                 if self.state.backend.as_ref().is_some_and(|n| !b.iter().any(|c| &c.name == n)) {
                     self.state.backend = None;
                 }
@@ -1705,7 +1810,7 @@ impl CraftApp {
                     self.toast(error.for_people(), true);
                 }
             }
-            Done::BackendAdded { name, result, choices } => match result {
+            Done::BackendAdded { name, result, choices, address } => match result {
                 Ok(()) => {
                     if self.server_form.name.trim() == name {
                         self.server_form = ServerForm::default();
@@ -1717,8 +1822,19 @@ impl CraftApp {
                     }
                     self.refresh_backends();
                 }
+                // Stopping an add says nothing new about the server: a list it offered stays.
                 Err(e) if e.code == ErrorCode::Cancelled => self.toast(i18n::trf("Stopped adding {name}.", &[("name", &name)]), false),
-                Err(e) => self.toast(e.for_people(), true),
+                Err(e) => {
+                    // The form's own request answered: several chat models and none known to be
+                    // loaded are offered in the form, for the address that was asked, and only
+                    // while the form still shows that server. Any other failure leaves no list.
+                    if form_request {
+                        let models = craft_anything_ai::models_to_choose(&e);
+                        let same = self.server_form.name.trim() == name && self.server_form.address.trim() == address;
+                        self.server_form.choices = (!models.is_empty() && same).then_some((address, models));
+                    }
+                    self.toast(e.for_people(), true);
+                }
             },
             Done::Picked { pick, path } => {
                 if let Some(path) = path {
@@ -1855,9 +1971,11 @@ impl CraftApp {
                 }
             }
         }
-        let want = (self.theme_kind(), self.beginner());
+        // eframe reports the system's appearance in each frame's input, and again when it changes.
+        self.system_theme = ctx.system_theme();
+        let want = self.theme_kind();
         if self.applied_theme != Some(want) {
-            theme::apply(ctx, want.0, want.1);
+            theme::apply(ctx, want);
             self.applied_theme = Some(want);
         }
         self.take_finished_jobs();
@@ -1906,9 +2024,30 @@ impl CraftApp {
         }
     }
 
+    /// Whether an update may install now: it closes the app, so not while work is running or
+    /// unsaved, nor while a sign-in window is open (its job is invisible, and closing would lose
+    /// the sign-in before the browser profile is saved).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn safe_to_install(&self) -> bool {
+        !self.jobs.busy()
+            && !self.runs.any_busy()
+            && !self.conversation.as_ref().is_some_and(|c| c.is_busy())
+            && !self.settings_dirty
+            && self.save_due.is_none()
+            && self.saving.is_none()
+            && self.signing_in.is_none()
+    }
+
     /// Draw the whole interface.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let safe = self.safe_to_install();
+            if self.updates.show(&ctx, safe) {
+                return;
+            }
+        }
         self.tick(&ctx);
         self.shortcuts(&ctx);
         #[cfg(target_os = "macos")]
@@ -1930,7 +2069,7 @@ impl CraftApp {
             egui::Panel::left("app-sidebar")
                 .exact_size(sidebar::width(self, &ctx))
                 .resizable(false)
-                .frame(egui::Frame::new().fill(t.chrome).inner_margin(egui::Margin::symmetric(8, 0)))
+                .frame(egui::Frame::new().fill(t.chrome).inner_margin(theme::pad::GUTTER))
                 .show(ui, |ui| guard_ui(ui, "sidebar", |ui| sidebar::show(self, ui)));
             egui::CentralPanel::default().frame(egui::Frame::new().fill(t.canvas)).show(ui, |ui| {
                 guard_ui(ui, "simple", |ui| match self.state.screen {
@@ -1947,6 +2086,7 @@ impl CraftApp {
         settings_ui::show(self, &ctx);
         home::modals(self, &ctx);
         self.toasts(&ctx);
+        widgets::text_focus_ring(&ctx);
         self.drop_overlay(&ctx);
         titlebar::window_edge(&ctx);
         titlebar::resize_edges(&ctx);
@@ -1975,33 +2115,62 @@ impl CraftApp {
             return;
         }
         let t = theme::Tokens::get(ctx);
-        let width = (ctx.content_rect().width() - 32.0).clamp(200.0, 640.0);
+        // Under the title bar, in the middle. Anywhere a message sits it is over something (at
+        // the bottom, the prompt box's switches just pressed; in a corner, a side panel; here, a
+        // screen's tabs), so the card lets clicks through to what is under it. Only its close
+        // button, drawn in a layer of its own, takes a click.
+        let width = (ctx.content_rect().width() - 2.0 * theme::space::LG).clamp(200.0, 420.0);
         let mut dismiss = None;
-        egui::Area::new(egui::Id::new("toasts")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0)).show(ctx, |ui| {
-            ui.set_width(width);
-            for (i, (text, error)) in self.state.toasts.iter().enumerate() {
-                egui::Frame::new()
-                    .fill(t.raised)
-                    .stroke(egui::Stroke::new(1.0, if *error { t.danger.gamma_multiply(0.6) } else { t.card_border }))
-                    .corner_radius(t.r_lg())
-                    .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: t.shadow })
-                    .inner_margin(egui::Margin::symmetric(14, 8))
-                    .show(ui, |ui| {
-                        ui.set_width(width - 28.0);
-                        ui.horizontal(|ui| {
-                            let (icon, col) = if *error { ("triangle-alert", t.danger) } else { ("check", t.success) };
-                            icons::show(ui, icon, 15.0, col);
-                            ui.add(egui::Label::new(egui::RichText::new(text).color(if *error { t.text } else { t.text_dim })).wrap());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if icons::button(ui, "x", 28.0, false, "Dismiss").clicked() {
-                                    dismiss = Some(i);
-                                }
+        // Where each card keeps room for its close button.
+        let mut close_at = Vec::with_capacity(self.state.toasts.len());
+        egui::Area::new(egui::Id::new("toasts"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, titlebar::HEIGHT + theme::space::SM))
+            .interactable(false)
+            .fade_in(true)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                ui.spacing_mut().item_spacing = egui::vec2(theme::space::SM, theme::space::XS);
+                // The mark and the close button are boxes of one size, and the words between
+                // them sit on that box's middle line: the same room on every side, however many
+                // lines the message takes.
+                let side = theme::ControlSize::Small.height();
+                let line = theme::leading(theme::SMALL);
+                let nudge = ((side - line) / 2.0).max(0.0);
+                let inner = width - 2.0 * theme::space::MD - 2.0;
+                for (i, (text, error)) in self.state.toasts.iter().enumerate() {
+                    egui::Frame::new()
+                        .fill(t.field)
+                        .stroke(egui::Stroke::new(1.0, t.card_border))
+                        .corner_radius(t.r_lg())
+                        .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: t.shadow })
+                        .inner_margin(theme::pad::PANEL)
+                        .show(ui, |ui| {
+                            ui.set_width(inner);
+                            ui.horizontal_top(|ui| {
+                                let (icon, col) = if *error { ("triangle-alert", t.danger) } else { ("check", t.success) };
+                                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+                                icons::paint(ui, mark, icon, theme::icon::MD, col);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.set_width(inner - 2.0 * (side + theme::space::SM));
+                                    ui.add_space(nudge);
+                                    ui.add(egui::Label::new(egui::RichText::new(text).size(theme::SMALL).line_height(Some(line)).color(t.text)).wrap());
+                                    ui.add_space(nudge);
+                                });
+                                let (slot, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+                                close_at.push((i, slot));
                             });
                         });
-                    });
-                ui.add_space(6.0);
-            }
-        });
+                }
+            });
+        for (i, slot) in close_at {
+            egui::Area::new(egui::Id::new(("toast-close", i))).order(egui::Order::Tooltip).fixed_pos(slot.min).show(ctx, |ui| {
+                if icons::button(ui, "x", theme::ControlSize::Small, false, "Dismiss").clicked() {
+                    dismiss = Some(i);
+                }
+            });
+        }
         if let Some(i) = dismiss {
             self.state.toasts.remove(i);
             if i < self.toast_at.len() {
@@ -2092,7 +2261,10 @@ pub fn app_icon(size: f32) -> egui::Image<'static> {
 /// Run an action; a panic is logged and swallowed so one bad action never takes the app down.
 /// The configured backends and the ones chosen to build and to extract (read off the UI thread).
 pub(crate) fn backends(hub: &AiHub) -> Done {
+    // Numbered before reading: a snapshot read after a save always outnumbers one read before it.
+    static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     Done::Backends(
+        READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
         hub.backends(),
         hub.chosen(craft_anything_ai::Role::Builder),
         hub.chosen(craft_anything_ai::Role::Extractor),
@@ -2227,5 +2399,43 @@ pub fn kind_icon(k: TargetKind) -> &'static str {
         TargetKind::Evm => "zap",
         TargetKind::Sqlite => "database",
         TargetKind::Unknown => "file",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod updates;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CraftApp {
+    fn drop(&mut self) {
+        self.updates.finish();
+    }
+}
+
+#[cfg(test)]
+mod backend_snapshot_tests {
+    use super::*;
+
+    /// A backends snapshot read before the one already shown (a slow refresh finishing after a
+    /// save's) is dropped, so it can't put back what the save changed.
+    #[test]
+    fn an_older_backends_snapshot_does_not_replace_a_newer_one() {
+        let mut app = demo::app(demo::engine(Mode::Experienced, true));
+        let snapshot = |read: u64, name: &str| {
+            let backend = BackendConfig {
+                name: name.into(),
+                kind: craft_anything_ai::BackendKind::AgentCli,
+                model: "claude-code".into(),
+                base_url: None,
+                ssh_host: None,
+                enabled: true,
+            };
+            Done::Backends(read, vec![backend], None, None, Default::default(), Default::default())
+        };
+        app.handle_done(jobs::Finished { job: 1, result: Ok(snapshot(10, "New")) });
+        app.handle_done(jobs::Finished { job: 2, result: Ok(snapshot(5, "Old")) });
+        assert_eq!(app.backends.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["New"]);
+        app.handle_done(jobs::Finished { job: 3, result: Ok(snapshot(11, "Newer")) });
+        assert_eq!(app.backends.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["Newer"]);
     }
 }

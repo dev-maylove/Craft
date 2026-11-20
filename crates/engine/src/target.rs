@@ -154,39 +154,61 @@ pub fn looks_like_text(bytes: &[u8]) -> bool {
 }
 
 /// Sniff the kind from the first bytes (and the name, only to break ties).
+///
+/// Signatures come from the shared `craft_sniff` table; the tie-breaks that need our own parsers
+/// (managed PE, Java class or universal Mach-O, APK by its manifest) and the kinds with no
+/// signature (ASAR, XML plists, captures, scripts, text) stay here.
 pub fn sniff(bytes: &[u8], name: &str) -> TargetKind {
+    use craft_sniff::Kind;
     let lower = name.to_ascii_lowercase();
-    let starts = |m: &[u8]| bytes.starts_with(m);
-    if starts(b"SQLite format 3\0") {
-        TargetKind::Sqlite
-    } else if starts(b"\x7fELF") {
-        TargetKind::Elf
-    } else if starts(b"MZ") {
-        if craft_anything_formats::pe_is_managed(bytes) { TargetKind::Managed } else { TargetKind::Pe }
-    } else if starts(&[0xfe, 0xed, 0xfa, 0xce]) || starts(&[0xfe, 0xed, 0xfa, 0xcf]) || starts(&[0xce, 0xfa, 0xed, 0xfe]) || starts(&[0xcf, 0xfa, 0xed, 0xfe]) {
-        TargetKind::MachO
-    } else if starts(&[0xca, 0xfe, 0xba, 0xbe]) {
-        // Both a Java class and a big-endian fat Mach-O start 0xCAFEBABE. A class has a plausible
+    match craft_sniff::identify(bytes) {
+        Some(Kind::Sqlite) => TargetKind::Sqlite,
+        Some(Kind::Elf) => TargetKind::Elf,
+        Some(Kind::Pe | Kind::DosExecutable) => {
+            if craft_anything_formats::pe_is_managed(bytes) {
+                TargetKind::Managed
+            } else {
+                TargetKind::Pe
+            }
+        }
+        Some(Kind::MachO) => TargetKind::MachO,
+        // Both a Java class and a universal Mach-O start 0xCAFEBABE. A class has a plausible
         // major version where a fat binary has a small big-endian architecture count, so prefer
         // the .class extension, then the version check.
-        if lower.ends_with(".class") || craft_anything_formats::java_class::is_class(bytes) { TargetKind::JavaClass } else { TargetKind::MachOFat }
-    } else if starts(b"\0asm") {
-        TargetKind::Wasm
-    } else if starts(b"dex\n") {
-        TargetKind::Dex
-    } else if starts(b"PK\x03\x04") || starts(b"PK\x05\x06") {
-        if lower.ends_with(".apk") || lower.ends_with(".aab") || lower.ends_with(".xapk") {
-            TargetKind::Apk
-        } else if lower.ends_with(".jar") || lower.ends_with(".war") {
-            TargetKind::Jar
-        } else if craft_anything_formats::zip_has_entry(bytes, "AndroidManifest.xml") {
-            TargetKind::Apk
-        } else {
-            TargetKind::Zip
+        Some(Kind::MachOFat | Kind::JavaClass) => {
+            if lower.ends_with(".class") || craft_anything_formats::java_class::is_class(bytes) {
+                TargetKind::JavaClass
+            } else {
+                TargetKind::MachOFat
+            }
         }
-    } else if lower.ends_with(".asar") || craft_anything_formats::looks_like_asar(bytes) {
+        Some(Kind::Wasm) => TargetKind::Wasm,
+        Some(Kind::Dex) => TargetKind::Dex,
+        Some(Kind::Zip) => sniff_zip(bytes, &lower),
+        Some(Kind::BinaryPlist) => TargetKind::Plist,
+        Some(_) => TargetKind::Unknown,
+        None => sniff_unsigned(bytes, &lower),
+    }
+}
+
+/// A ZIP is an APK or a JAR by its name, then an APK by its manifest.
+fn sniff_zip(bytes: &[u8], lower: &str) -> TargetKind {
+    if lower.ends_with(".apk") || lower.ends_with(".aab") || lower.ends_with(".xapk") {
+        TargetKind::Apk
+    } else if lower.ends_with(".jar") || lower.ends_with(".war") {
+        TargetKind::Jar
+    } else if craft_anything_formats::zip_has_entry(bytes, "AndroidManifest.xml") {
+        TargetKind::Apk
+    } else {
+        TargetKind::Zip
+    }
+}
+
+/// The kinds the shared table has no signature for, told apart by name and content.
+fn sniff_unsigned(bytes: &[u8], lower: &str) -> TargetKind {
+    if lower.ends_with(".asar") || craft_anything_formats::looks_like_asar(bytes) {
         TargetKind::Asar
-    } else if starts(b"bplist00") || (lower.ends_with(".plist") && bytes.windows(6).take(512).any(|w| w == b"<plist")) {
+    } else if lower.ends_with(".plist") && bytes.windows(6).take(512).any(|w| w == b"<plist") {
         TargetKind::Plist
     } else if lower.ends_with(".har") {
         TargetKind::NetworkCapture
@@ -241,10 +263,7 @@ impl Target {
                 raw: None,
             });
         }
-        if meta.len() > MAX_TARGET_BYTES {
-            return Err(ToolError::new(ErrorCode::OverLimit, format!("{} is {} bytes; the limit is {MAX_TARGET_BYTES}", path.display(), meta.len())));
-        }
-        let bytes = std::fs::read(path).map_err(|e| ToolError::io(path.display(), e))?;
+        let bytes = craft_anything_platform::fs::read_file_capped(path, MAX_TARGET_BYTES)?;
         Ok(Target::from_bytes(path.to_path_buf(), name, bytes))
     }
 
@@ -263,11 +282,11 @@ impl Target {
         if self.kind == TargetKind::Directory {
             return Ok(());
         }
-        match std::fs::read(&self.path) {
+        match craft_anything_platform::fs::read_file_capped(&self.path, MAX_TARGET_BYTES) {
             Ok(b) if sha256_hex(&b) == self.sha256 => Ok(()),
             Ok(_) => Err(ToolError::new(ErrorCode::FileChanged, format!("{} changed on disk since it was opened", self.path.display()))
                 .with_remediation("Open it again to analyse the new version.")),
-            Err(e) => Err(ToolError::io(self.path.display(), e)),
+            Err(e) => Err(e),
         }
     }
 }
@@ -284,6 +303,18 @@ mod tests {
         assert_eq!(sniff(b"PK\x03\x04", "app.apk"), TargetKind::Apk);
         assert_eq!(sniff(b"bplist00", "Info.plist"), TargetKind::Plist);
         assert_eq!(sniff(b"SQLite format 3\0\x10\x00", "app.db"), TargetKind::Sqlite);
+        assert_eq!(sniff(b"\xcf\xfa\xed\xfe\x07\0\0\x01", "tool"), TargetKind::MachO);
+        assert_eq!(sniff(b"\xca\xfe\xba\xbe\0\0\0\x02", "tool"), TargetKind::MachOFat);
+        assert_eq!(sniff(b"\xca\xfe\xba\xbf\0\0\0\x02", "tool"), TargetKind::MachOFat);
+        assert_eq!(sniff(b"\xca\xfe\xba\xbe\0\0\0\x41", "Main"), TargetKind::JavaClass);
+        assert_eq!(sniff(b"\xca\xfe\xba\xbe\0\0\0\x02", "Main.class"), TargetKind::JavaClass);
+        assert_eq!(sniff(b"MZ\x90\0", "setup.exe"), TargetKind::Pe);
+        assert_eq!(sniff(b"PK\x03\x04", "lib.jar"), TargetKind::Jar);
+        assert_eq!(sniff(b"PK\x05\x06\0\0\0\0", "empty.zip"), TargetKind::Zip);
+        assert_eq!(sniff(b"<?xml?><plist version=\"1.0\"/>", "Info.plist"), TargetKind::Plist);
+        // Media and archives the shared table names are not targets we inspect by kind.
+        assert_eq!(sniff(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", "icon.png"), TargetKind::Unknown);
+        assert_eq!(sniff(b"070701", "archive.cpio"), TargetKind::Unknown);
         assert_eq!(sniff(b"", "x"), TargetKind::Unknown);
         assert_eq!(sniff(b"console.log(1)", "main.js"), TargetKind::Script);
         assert_eq!(sniff(b"# Notes\n", "notes.md"), TargetKind::Text);
@@ -291,6 +322,9 @@ mod tests {
         assert_eq!(sniff(b"\xEF\xBB\xBFhello", "notes.txt"), TargetKind::Text);
         assert_eq!(sniff(b"\xFF\xFEh\0i\0", "notes.txt"), TargetKind::Text);
         assert_eq!(sniff(b"\0\xFF\x02", "notes.md"), TargetKind::Unknown);
+        // The bytes decide, not the name: a gzip stream called `.txt` is not text.
+        assert_eq!(sniff(b"\x1f\x8b\x08\x00\x00\x00", "notes.txt"), TargetKind::Unknown);
+        assert_eq!(sniff(b"", "empty.txt"), TargetKind::Unknown);
         assert_eq!(TargetKind::Text.id(), "text");
         assert!(TargetKind::Text.plain().contains("text file"));
     }
