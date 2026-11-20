@@ -289,12 +289,26 @@ pub struct LoopConfig {
     /// The project folder the build tools' paths are relative to: a picture a tool opens there
     /// (`build_file_read`'s `picture`) is shown to a model that sees, after that step's results.
     pub project: Option<std::path::PathBuf>,
+    /// A build's notes folder ([`crate::rebuild::notes`]): after each tool step the notes waiting
+    /// there are claimed and added after the results, so the builder reads them at its next step,
+    /// as a coding agent's hook hands them over. `None`: notes wait for the turn to end.
+    pub notes: Option<std::path::PathBuf>,
 }
 
 impl Default for LoopConfig {
     /// Deep, so a conversation started without an explicit mode keeps the old, safe behavior.
     fn default() -> Self {
-        Self { beginner: false, prices: BTreeMap::new(), transcript: None, deep: true, context_tokens: 0, lean_for_local: false, logs: None, project: None }
+        Self {
+            beginner: false,
+            prices: BTreeMap::new(),
+            transcript: None,
+            deep: true,
+            context_tokens: 0,
+            lean_for_local: false,
+            logs: None,
+            project: None,
+            notes: None,
+        }
     }
 }
 
@@ -632,7 +646,12 @@ impl AgentLoop {
                 }
                 StopReason::ToolUse if !uses.is_empty() => {
                     self.history.push(result.message);
-                    let results = self.run_tools(&uses);
+                    let mut results = self.run_tools(&uses);
+                    // Notes the person added meanwhile go with the results, after them (every call
+                    // keeps its result first); the build relays them to the feed as read.
+                    if let Some(text) = self.cfg.notes.as_deref().and_then(|dir| crate::rebuild::notes::context(&crate::rebuild::notes::claim(dir))) {
+                        results.push(Block::Text { text });
+                    }
                     self.history.push(Msg { role: Speaker::User, blocks: results });
                     self.save_transcript();
                     if self.failed_builds >= MAX_FAILED_BUILDS {
@@ -1602,6 +1621,50 @@ pub(crate) mod tests {
             self.asked.fetch_add(1, Ordering::SeqCst);
             self.says.map(|sees| crate::sight::Sight { sees, source: "test" })
         }
+    }
+
+    /// A note the person adds while an API-backend builder works reaches it at its next step,
+    /// after that step's tool results, and is claimed so the build doesn't send it again after
+    /// the turn. Without a notes folder the note waits.
+    #[test]
+    fn a_note_reaches_an_api_builder_between_tool_calls() {
+        use crate::rebuild::notes;
+        let run = |dir: Option<std::path::PathBuf>| {
+            let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+            let seen: Arc<Mutex<Vec<Vec<Msg>>>> = Arc::default();
+            let turns = VecDeque::from([
+                turn(vec![Block::ToolUse { id: "b1".into(), name: BUILD_COMMAND_TOOL.into(), input: json!({"ok": true}) }], StopReason::ToolUse),
+                turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn),
+            ]);
+            let slot = ModelSlot {
+                name: "Fake".into(),
+                model: Box::new(Scripted { turns, seen: seen.clone() }),
+                local: false,
+                effort: None,
+                max_turns: 10,
+                context_tokens: 0,
+                tools: Default::default(),
+                vision: Default::default(),
+            };
+            let mut c = ApiConversation::start(host, vec![slot], LoopConfig { notes: dir, ..LoopConfig::default() }).unwrap();
+            c.send("build it");
+            drain_until_done(&mut c, |_, _| {});
+            let last = seen.lock().unwrap().get(1).and_then(|m| m.last().cloned()).expect("a second request");
+            last.blocks
+        };
+        let d = tempfile::tempdir().unwrap();
+        let dir = notes::notes_dir(d.path());
+        notes::hand_over(&dir, 7, "make it blue", None).unwrap();
+        let blocks = run(Some(dir.clone()));
+        assert!(matches!(&blocks[0], Block::ToolResult { tool_use_id, .. } if tool_use_id == "b1"), "the result comes first: {blocks:?}");
+        assert!(matches!(&blocks[1], Block::Text { text } if text.contains("- make it blue") && text.contains("while you were working")), "{blocks:?}");
+        assert!(notes::was_read(&dir, 7), "claimed, so it goes to the feed and not into the next message");
+        // Nothing waiting: the results alone.
+        assert_eq!(run(Some(dir.clone())).len(), 1);
+        // No folder (a chat, the extractor): a waiting note stays for after the turn.
+        notes::hand_over(&dir, 8, "add a footer", None).unwrap();
+        assert_eq!(run(None).len(), 1);
+        assert!(!notes::was_read(&dir, 8));
     }
 
     #[test]
