@@ -80,13 +80,13 @@ pub fn read_admitted(path: &Path, limit: u64) -> Result<Vec<u8>, ToolError> {
 }
 
 pub(crate) fn read_admitted_with(path: &Path, limit: u64, available: Option<u64>) -> Result<Vec<u8>, ToolError> {
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.is_file()
-    {
-        // An uncapped limit (`u64::MAX`) is not admission: the file still has to fit in memory.
-        admit(path, meta.len(), limit, available)?;
-    }
-    craft_anything_platform::fs::read_file_capped(path, limit)
+    let (mut file, metadata) = craft_anything_platform::fs::open_regular_file(path)?;
+    // An uncapped limit (`u64::MAX`) is not admission: the file still has to fit in memory.
+    admit(path, metadata.len(), limit, available)?;
+    // A reported size of zero can still be a readable virtual file, so the read keeps `limit`.
+    // Any other file is read only up to the length just admitted on this descriptor.
+    let cap = if metadata.len() == 0 { limit } else { metadata.len() };
+    craft_anything_platform::fs::read_opened_capped(path, &mut file, metadata.len(), cap)
 }
 
 /// `MemAvailable` from `/proc/meminfo`, in bytes.
