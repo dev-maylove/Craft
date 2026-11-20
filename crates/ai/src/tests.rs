@@ -2040,6 +2040,12 @@ fn an_ssh_openai_backend_is_not_probed_on_this_computer() {
     let plain = super::openai_remote(None).unwrap();
     assert_eq!((plain.host.as_str(), plain.port, plain.path.as_str()), ("127.0.0.1", 11434, "/v1"));
     assert_eq!(super::openai_remote(Some("http://127.0.0.1:11434")).unwrap().path, "");
+    assert_eq!(super::local_openai_url(None), "http://127.0.0.1:11434/v1");
+    assert_eq!(super::local_openai_url(Some("")), "http://127.0.0.1:11434/v1");
+    assert_eq!(super::local_openai_url(Some("  ")), "http://127.0.0.1:11434/v1");
+    assert_eq!(super::local_openai_url(Some(" http://127.0.0.1:9/v1 ")), "http://127.0.0.1:9/v1");
+    assert_eq!(super::openai_remote(Some("")).unwrap().port, 11434);
+    assert_eq!(super::openai_remote(Some("   ")).unwrap().port, 11434);
 
     let mut saw = None;
     let open = super::openai_reachable(Some("box"), Some("http://127.0.0.1:1/v1"), |host, remote_host, port| {

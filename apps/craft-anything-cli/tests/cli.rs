@@ -515,8 +515,13 @@ fn use_local_checks_grok_before_saving_it() {
     use std::os::unix::fs::PermissionsExt;
     let cfg = tempfile::tempdir().unwrap();
     let saved = || std::fs::read_to_string(cfg.path().join("config.toml")).unwrap_or_default();
+    // Not the default Lemonade or LM Studio ports: a server running there must not satisfy this test.
+    let nowhere = ["--lemonade", "http://127.0.0.1:9/v1", "--lmstudio", "http://127.0.0.1:9/v1"];
     let missing = cfg.path().join("no-such-grok");
-    let out = cli(&["ai", "use-local", "--grok", missing.to_str().unwrap(), "--format", "json"], cfg.path());
+    let mut args = vec!["ai", "use-local"];
+    args.extend(nowhere);
+    args.extend(["--grok", missing.to_str().unwrap(), "--format", "json"]);
+    let out = cli(&args, cfg.path());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!out.success, "{text}");
     assert!(text.contains("isn't on this computer"), "{text}");
@@ -525,7 +530,10 @@ fn use_local_checks_grok_before_saving_it() {
     let cursor = cfg.path().join("agent");
     std::fs::write(&cursor, "#!/bin/sh\necho 'Cursor Agent 2026.1.1'\n").unwrap();
     std::fs::set_permissions(&cursor, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let out = cli(&["ai", "use-local", "--grok", cursor.to_str().unwrap(), "--format", "json"], cfg.path());
+    let mut args = vec!["ai", "use-local"];
+    args.extend(nowhere);
+    args.extend(["--grok", cursor.to_str().unwrap(), "--format", "json"]);
+    let out = cli(&args, cfg.path());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!out.success, "{text}");
     assert!(text.contains("Cursor"), "{text}");
@@ -534,7 +542,10 @@ fn use_local_checks_grok_before_saving_it() {
     let grok = cfg.path().join("grok-agent");
     std::fs::write(&grok, "#!/bin/sh\necho 'grok version 1.2.3'\n").unwrap();
     std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let out = cli(&["ai", "use-local", "--grok", grok.to_str().unwrap(), "--format", "json"], cfg.path());
+    let mut args = vec!["ai", "use-local"];
+    args.extend(nowhere);
+    args.extend(["--grok", grok.to_str().unwrap(), "--format", "json"]);
+    let out = cli(&args, cfg.path());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!out.success, "{text}");
     assert!(text.contains("No local AI server answered"), "{text}");

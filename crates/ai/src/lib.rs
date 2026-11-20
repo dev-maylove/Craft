@@ -32,6 +32,7 @@ pub mod ssh;
 pub mod window;
 
 pub use agent::FULL_TOOLS_BUDGET;
+pub use cli_agents::adapters::require_grok_program;
 pub use cli_agents::models::{AgentModel, ModelContext};
 pub use config::{AiConfig, BackendEntry, BackendOptions, Price, ToolList};
 pub use failure::{FailureKind, TurnFailure};
@@ -297,8 +298,16 @@ struct OpenAiRemote {
     path: String,
 }
 
+/// A blank address is the local default, the same one [`openai_remote`] and [`AiHub::build_model`] use.
+fn local_openai_url(base_url: Option<&str>) -> &str {
+    match base_url.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => url,
+        None => "http://127.0.0.1:11434/v1",
+    }
+}
+
 fn openai_remote(base_url: Option<&str>) -> Result<OpenAiRemote, ToolError> {
-    let b = base_url.filter(|s| !s.trim().is_empty()).unwrap_or("http://127.0.0.1:11434/v1");
+    let b = local_openai_url(base_url);
     let after = b.split("://").nth(1).unwrap_or(b);
     let hostport = after.split('/').next().unwrap_or_default();
     let path = after.get(hostport.len()..).unwrap_or("/v1");
@@ -313,7 +322,7 @@ fn openai_reachable(ssh_host: Option<&str>, base_url: Option<&str>, mut probe_tu
     if let Some(host) = ssh_host.map(str::trim).filter(|h| !h.is_empty()) {
         return openai_remote(base_url).is_ok_and(|remote| probe_tunnel(host, &remote.host, remote.port));
     }
-    detect::port_open(base_url.unwrap_or("http://127.0.0.1:11434/v1"), Duration::from_millis(500))
+    detect::port_open(local_openai_url(base_url), Duration::from_millis(500))
 }
 
 fn probe_tunneled_openai(ssh_host: &str, remote_host: &str, remote_port: u16) -> bool {
