@@ -1,3 +1,5 @@
+// Modifications (c) 2026 SuperSfera LLC, MIT OR Apache-2.0.
+
 //! Artifacts: content-addressed inventories of archives and app bundles, safe extraction, and
 //! comparison. Also hosts the filesystem and evidence-input helpers the JavaScript, web and
 //! application tool modules share.
@@ -775,7 +777,7 @@ fn inventory_path_unlisted(path: &Path, limits: InvLimits, cancel: &CancelToken)
         let subject = Subject { kind: "directory".into(), sha256: Some(id.trim_start_matches("inv_").to_string()), name: Some(name) };
         return Ok((out, subject, walked.unlisted));
     }
-    let bytes = read_capped(path, limits.max_total_bytes.min(crate::target::MAX_TARGET_BYTES))?;
+    let bytes = read_capped(path, limits.max_total_bytes.min(crate::target::max_target_bytes()))?;
     let kind = craft_anything_analysis::js_inventory::sniff_kind(&bytes, &name);
     let mut inv = Inventorier::new(&name, kind, limits, &check);
     let mut unlisted = Vec::new();
@@ -956,7 +958,7 @@ fn core_archive_extract(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
             ToolError::unsupported(format!("{} is already a folder", path.display())).with_remediation("Folders don't need extracting; analyse them directly.")
         );
     }
-    let bytes = read_capped(&path, crate::target::MAX_TARGET_BYTES)?;
+    let bytes = read_capped(&path, crate::target::max_target_bytes())?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let kind = craft_anything_analysis::js_inventory::sniff_kind(&bytes, &name);
     // Collect (name, bytes-or-error) without touching the disk first.

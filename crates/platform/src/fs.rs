@@ -1,3 +1,5 @@
+// Modifications (c) 2026 SuperSfera LLC, MIT OR Apache-2.0.
+
 //! File safety: bounded regular-file reads and atomic writes (temp file, fsync, rename),
 //! optionally private (0600 on Unix).
 
@@ -39,7 +41,13 @@ pub fn read_file_capped(path: &Path, max: u64) -> Result<Vec<u8>, ToolError> {
         return Err(ToolError::new(ErrorCode::OverLimit, format!("{} is {} bytes; the limit is {max}", path.display(), metadata.len()))
             .with_remediation("Raise the size limit parameter if you really want to read it."));
     }
+    // Reserve the whole file up front: growing by doubling could ask for twice its size, and a
+    // failed reservation is an error here instead of the allocator aborting the program.
     let mut bytes = Vec::new();
+    let want = usize::try_from(metadata.len().min(max)).unwrap_or(usize::MAX);
+    bytes.try_reserve_exact(want).map_err(|_| {
+        ToolError::new(ErrorCode::OverLimit, format!("{} is {} bytes, more than this computer can hold in memory", path.display(), metadata.len()))
+    })?;
     (&mut file).take(max).read_to_end(&mut bytes).map_err(|e| ToolError::io(path.display(), e))?;
     let mut extra = [0u8; 1];
     match file.read_exact(&mut extra) {
