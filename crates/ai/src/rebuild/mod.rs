@@ -1288,7 +1288,7 @@ impl Worker {
             let lost = result.is_err() && agent.session_lost();
             if lost {
                 // The id is for a session this computer doesn't have: never ask for it again.
-                Self::remember_session(ws, None, deep).map_err(|e| self.give_back_taken(e))?;
+                Self::remember_session(ws, None, deep).map_err(|e| self.give_back_taken(ws, e))?;
             } else if let Some(id) = agent.session_id() {
                 Self::remember_session(ws, Some(id), deep)?;
             }
@@ -1300,12 +1300,12 @@ impl Worker {
                         Status::Building,
                         "The builder's earlier conversation isn't on this computer, or has grown too long to continue. Starting a new one from what the project already has…",
                     )
-                    .map_err(|e| self.give_back_taken(e))?;
+                    .map_err(|e| self.give_back_taken(ws, e))?;
                     prompt = f + &taken_prompt(&self.taken_in_turn);
                     retry = false;
                 }
                 // Nothing to start a new conversation from: the run ends, and the next one sends them.
-                Err(e) if lost => return Err(self.give_back_taken(e)),
+                Err(e) if lost => return Err(self.give_back_taken(ws, e)),
                 // A missing session can only start fresh above, never resume. Only backend
                 // Error events become ProgramFailed here; a simultaneous backend failure must
                 // not make an inbox or workspace write failure retryable.
@@ -1427,10 +1427,16 @@ impl Worker {
 
     /// Notes the builder took at a step of this turn (its hook claimed them): they join the feed
     /// now and aren't sent again after the turn.
-    /// A turn whose conversation was lost ends with `e`: the notes it took wait for the next run,
-    /// which sends them after its turn with the Just-ask answers they carry.
-    fn give_back_taken(&mut self, e: ToolError) -> ToolError {
+    /// A turn whose conversation was lost ends with `e`: the notes it took wait for the next run.
+    /// That run is sent their text alone, so the Just-ask answers they carried are untold again.
+    fn give_back_taken(&mut self, ws: &Workspace, e: ToolError) -> ToolError {
         let taken = std::mem::take(&mut self.taken_in_turn);
+        let questions: Vec<AskedQuestion> = taken.iter().flat_map(|n| n.questions.iter().cloned()).collect();
+        if !questions.is_empty()
+            && let Err(e) = craft_anything_engine::questions::mark_untold(ws, &questions)
+        {
+            log::warn!("couldn't record that the builder's lost conversation was told questions: {}", e.message);
+        }
         self.notes.lock().unwrap_or_else(PoisonError::into_inner).splice(0..0, taken);
         e
     }
