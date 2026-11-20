@@ -612,7 +612,7 @@ func TestAnswer(t *testing.T) {
         std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let stop = CheckStop::default();
-        assert!(build_check(app, "app/", "Unity", Some(&editor), &stop).0);
+        assert!(build_check(app, "app/", "Unity", Some(&editor), None, &stop).0);
         let args = std::fs::read_to_string(app.join("args.txt")).unwrap();
         let project = args.lines().skip_while(|l| *l != "-projectPath").nth(1).unwrap();
         assert!(Path::new(project).is_absolute(), "{project}");
