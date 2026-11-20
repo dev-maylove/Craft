@@ -1,3 +1,5 @@
+// Modifications (c) 2026 SuperSfera LLC, MIT OR Apache-2.0.
+
 //! User settings (`config.toml`). No environment variables are required for anything.
 
 use crate::versioned::{Step, upgrade};
@@ -140,6 +142,20 @@ pub struct Settings {
     /// saved, so code that rebuilds settings from their saved form carries it over.
     #[serde(skip)]
     pub not_loaded: Option<String>,
+    /// Size limits on what is opened (`[limits]`, slava/local).
+    pub limits: LimitSettings,
+}
+
+/// Size limits on what is opened. Older config.toml files have no `[limits]` and get the defaults,
+/// so the format version stays the same.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitSettings {
+    /// Biggest file opened as a target, in bytes. Unset or 0: no fixed limit; a file is still
+    /// refused when this computer hasn't the free memory to hold it ([`crate::target::check_memory_for`]).
+    /// Upstream's fixed limit was 2 GiB. `CRAFT_ANYTHING_MAX_TARGET_BYTES` overrides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_target_bytes: Option<u64>,
 }
 
 /// How builds are checked and when refining stops.
@@ -223,6 +239,7 @@ impl Default for Settings {
             plugins: crate::plugins::PluginSettings::default(),
             build: BuildSettings::default(),
             not_loaded: None,
+            limits: LimitSettings::default(),
         }
     }
 }
@@ -413,6 +430,7 @@ impl Settings {
         };
         let e = match read {
             Ok(s) => {
+                crate::target::set_max_target_bytes(s.limits.max_target_bytes);
                 if s.version > SETTINGS_VERSION {
                     log::warn!("{} is from a newer Craft Anything (version {}); changes won't be saved over it", path.display(), s.version);
                 }

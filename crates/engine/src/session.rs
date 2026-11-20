@@ -1,3 +1,5 @@
+// Modifications (c) 2026 SuperSfera LLC, MIT OR Apache-2.0.
+
 //! The session: open targets, the evidence ledger, unknowns, annotations and caches.
 
 use crate::project::Project;
@@ -92,6 +94,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(settings: Settings) -> Self {
+        crate::target::set_max_target_bytes(settings.limits.max_target_bytes);
         Session { settings, ..Default::default() }
     }
 
