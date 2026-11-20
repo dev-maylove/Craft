@@ -985,7 +985,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
             // different key can be used without restarting the app.
             let pastable = d.needs_key || d.suggestion.base_url.as_deref().is_some_and(craft_anything_ai::openai::is_opencode_go);
             if pastable && !configured {
-                key_controls(app, ui, &d, KeyCard { hint: "API key (stored in your system keychain)", width: 260.0, compact: true, connect: "Add" });
+                key_controls(app, ui, &d, KeyCard { hint: "API key (stored in your system keychain)", width: 260.0, connect: "Add" });
             }
         });
         ui.add_space(theme::space::SM);
@@ -1006,7 +1006,6 @@ fn kind_label(b: &BackendConfig) -> String {
 pub(crate) struct KeyCard {
     pub hint: &'static str,
     pub width: f32,
-    pub compact: bool,
     pub connect: &'static str,
 }
 

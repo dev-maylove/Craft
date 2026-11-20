@@ -240,7 +240,6 @@ fn brain_card(app: &mut CraftApp, ui: &mut Ui, d: &Detected) {
                     let card = crate::settings_ui::KeyCard {
                         hint: "Paste your API key (kept in your system keychain)",
                         width: ui.available_width(),
-                        compact: false,
                         connect: "Connect",
                     };
                     crate::settings_ui::key_controls(app, ui, d, card);
