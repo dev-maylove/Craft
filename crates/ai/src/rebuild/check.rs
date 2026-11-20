@@ -25,7 +25,10 @@ fn run_in(app: &Path, prog: &Path, args: &[String], minutes: u64, stop: &CheckSt
         // above, which says the step took longer than allowed.
         .cancel_when(move || s.paused())
         .run()
-        .map(|o| (o.success, format!("{}{}", o.stdout_text(), o.stderr_text())))
+        .map(|o| {
+            let (stdout, stderr) = if o.success { (o.stdout_text(), o.stderr_text()) } else { (o.stdout_end_text(), o.stderr_end_text()) };
+            (o.success, format!("{stdout}{stderr}"))
+        })
         .map_err(|e| e.message)
 }
 
@@ -56,6 +59,7 @@ pub(super) fn own_build_check(app: &Path, place: &str, stack: &str, editor: Opti
 /// How a Unity project we didn't make is opened: in batch mode, which compiles its scripts. There's
 /// no `CraftBuild.Build` to call, as there is in one we made ([`build_check`]).
 fn own_unity_args(app: &Path) -> Vec<String> {
+    let app = craft_anything_engine::workspace::absolute(app);
     ["-batchmode", "-quit", "-nographics", "-projectPath", &app.display().to_string(), "-logFile", "-"].map(String::from).to_vec()
 }
 
@@ -181,8 +185,9 @@ pub fn debug_apk(app: &Path) -> Option<PathBuf> {
 
 pub(super) fn build_check(app: &Path, place: &str, stack: &str, editor: Option<&Path>, android: Option<&AndroidHomes>, stop: &CheckStop) -> (bool, String) {
     let run = |prog: &Path, args: &[String], minutes: u64| run_in(app, prog, args, minutes, stop).map_err(|e| format!("Couldn't run the build: {e}"));
-    let app_s = app.display().to_string();
-    let built = || packaged_program(&app.join("Build")).is_some();
+    let app_abs = craft_anything_engine::workspace::absolute(app);
+    let app_s = app_abs.display().to_string();
+    let built = || packaged_program(&app_abs.join("Build")).is_some();
     let result: Result<(bool, String), String> = match (engine_for(stack, app), editor) {
         (Some(game::Builder::Unity), Some(ed)) => {
             if !app.join("Assets").is_dir() {
@@ -215,7 +220,7 @@ pub(super) fn build_check(app: &Path, place: &str, stack: &str, editor: Option<&
                 "-stage".into(),
                 "-pak".into(),
                 "-archive".into(),
-                format!("-archivedirectory={}", app.join("Build").display()),
+                format!("-archivedirectory={}", app_abs.join("Build").display()),
                 "-unattended".into(),
                 "-utf8output".into(),
                 "-nop4".into(),
@@ -343,7 +348,8 @@ fn nested_project(app: &Path) -> Option<(String, &'static str)> {
 
 /// The Unreal project file in `app`, if there is one.
 fn uproject(app: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(app).into_iter().flatten().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "uproject"))
+    let project = std::fs::read_dir(app).into_iter().flatten().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "uproject"))?;
+    Some(craft_anything_engine::workspace::absolute(&project))
 }
 
 /// Whether `app` holds a project of the engine `b` builds with (Rust's is an ordinary cargo one).
@@ -372,6 +378,43 @@ mod tests {
     fn stand_in(line: &str, no_tests: &[&str]) -> stacks::Toolchain {
         let command = ["sh", "-c", line].map(String::from).to_vec();
         stacks::Toolchain { build: command.clone(), test: command, no_tests: no_tests.iter().map(|s| s.to_string()).collect(), ..Default::default() }
+    }
+
+    /// Exercise the actual Go catalogue commands through the existing-project check path.
+    #[test]
+    #[ignore = "requires Go on PATH; runs an owned project without dependencies"]
+    fn real_go_project_build_and_tests() {
+        let project = tempfile::tempdir().unwrap();
+        let app = project.path();
+        let stop = CheckStop::default();
+        std::fs::write(app.join("go.mod"), "module example.invalid/probe\n\ngo 1.18\n").unwrap();
+        std::fs::write(app.join("main.go"), "package main\nfunc answer() int { return 42 }\nfunc main() {}\n").unwrap();
+        let tests = app.join("main_test.go");
+        let passing_test = r#"package main
+import "testing"
+func TestAnswer(t *testing.T) {
+    if answer() != 42 {
+        t.Fatal("unexpected answer")
+    }
+}
+"#;
+        std::fs::write(&tests, passing_test).unwrap();
+        let tool = stacks::toolchain_in(app).expect("go.mod identifies the Go toolchain");
+        assert_eq!(tool.name, "Go");
+
+        let build = || own_build_check(app, "the project folder", stacks::BUILDERS_CHOICE, None, &stop);
+        let test = || own_tests_check(app, Some(tool), &stop);
+        assert_eq!(build(), (true, "`go build ./...` passed.".into()));
+        assert_eq!(test(), (true, "`go test ./...` passed.".into()));
+
+        std::fs::write(&tests, passing_test.replace("!= 42", "!= 43")).unwrap();
+        assert!(build().0, "a test assertion must not fail the build");
+        let (passed, note) = test();
+        assert!(!passed && note.contains("unexpected answer"), "{note}");
+
+        std::fs::write(app.join("main.go"), "package main\nfunc main(\n").unwrap();
+        let (passed, note) = build();
+        assert!(!passed && note.starts_with("Build failed:"), "{note}");
     }
 
     #[cfg(unix)]
@@ -446,10 +489,14 @@ mod tests {
         assert!(!passed && note.starts_with("Couldn't run the tests"), "it's started: {note}");
     }
 
+    /// A person's own Unity project is opened in batch mode, not built through our execute
+    /// method, and its project path is native and absolute.
     #[test]
     fn a_persons_own_unity_project_is_opened_not_built_with_our_script() {
-        let args = own_unity_args(Path::new("/x/game"));
-        assert!(args.iter().any(|a| a == "-batchmode") && args.iter().any(|a| a == "/x/game"), "{args:?}");
+        let project = std::env::current_dir().unwrap().join("game");
+        let expected = project.display().to_string();
+        let args = own_unity_args(&project);
+        assert!(args.iter().any(|a| a == "-batchmode") && args.iter().any(|a| a == &expected), "{args:?}");
         assert!(!args.iter().any(|a| a == "-executeMethod" || a.contains("CraftBuild")), "{args:?}");
     }
 
@@ -565,6 +612,40 @@ mod tests {
         let unity = Path::new("C:/Engines/Unity/Editor/Unity.exe");
         let note = build_check(app, "app/", "Unity", Some(unity), None, &stop).1;
         assert!(note.starts_with("No Unity project found in app/ yet. There's a Cargo.toml one folder down, in app/app/"), "{note}");
+    }
+
+    /// A relative project must give an engine build absolute project paths: the child already
+    /// runs with app/ as its working folder, so a relative `-projectPath` would point inside app/
+    /// again.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_project_gives_engine_builds_absolute_project_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = std::env::current_dir().unwrap();
+        let d = tempfile::tempdir_in(&cwd).unwrap();
+        let app = d.path().strip_prefix(&cwd).unwrap();
+        std::fs::create_dir_all(app.join("Assets")).unwrap();
+        std::fs::create_dir_all(app.join("Build")).unwrap();
+        let game = app.join("Build/game");
+        std::fs::write(&game, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&game, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let editor = d.path().join("editor");
+        std::fs::write(&editor, "#!/bin/sh\nprintf '%s\\n' \"$@\" > args.txt\nexit 0\n").unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let stop = CheckStop::default();
+        assert!(build_check(app, "app/", "Unity", Some(&editor), &stop).0);
+        let args = std::fs::read_to_string(app.join("args.txt")).unwrap();
+        let project = args.lines().skip_while(|l| *l != "-projectPath").nth(1).unwrap();
+        assert!(Path::new(project).is_absolute(), "{project}");
+
+        let own = own_unity_args(app);
+        let project = own.iter().skip_while(|l| *l != "-projectPath").nth(1).unwrap();
+        assert!(Path::new(project).is_absolute(), "{project}");
+
+        std::fs::write(app.join("Game.uproject"), "{}").unwrap();
+        assert!(uproject(app).is_some_and(|p| p.is_absolute()));
     }
 
     #[test]
