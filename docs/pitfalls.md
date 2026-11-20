@@ -87,10 +87,26 @@ names (`git merge-base --is-ancestor <fix> <release tag>`), and check the messag
 
 ## Tests
 
+**Invalid-byte filename fixtures gated only on Unix.** `cfg(unix)` includes Apple targets,
+where APFS rejects the fixture names before their assertions run. Keep filesystem tests that
+require invalid UTF-8 names off Apple targets, while retaining iterator-only coverage on Unix.
+
 **A TLS fixture closed before the handshake.** Accepted sockets inherited the listener's
 nonblocking mode on Windows, so the fixture read `WouldBlock` and closed a valid connection.
 Set the accepted socket to blocking mode before applying bounded I/O timeouts; consume the
 complete request header before replying.
+
+**A test module hid later production code from a policy gate.** The source scan stopped at the
+first `cfg(test)`, and unreadable files looked empty. Inspect syntax for the actual test item,
+keep checking its production siblings and source directories (even one named `tests`), and report source failures. `cfg(not(test))` and
+`cfg(any(test, feature = "app"))` may contain production code; a cfg string containing "test"
+isn't enough to exempt it. The source-policy checks follow explicit imports and module files,
+not macro expansion, globs, re-exports or all Rust name resolution; compiler checks still matter.
+Hidden module directories are source too. Symlinked source directories fail visibly rather than
+being omitted or followed into cycles; ordinary Rust file links are read and checked. Git metadata
+stays out of the directory walk. Module-level declarations explicitly referencing a file
+include it even under an otherwise-exempt directory; discovery is cycle-safe and bounded to the
+workspace. Missing cfg-dependent files still require compiler validation.
 
 **A heartbeat sampled before shutdown raced a successful stop.** A child could write between
 the baseline read and `stop()`, failing the descendant cleanup test even when cleanup worked.
@@ -126,6 +142,12 @@ with `AiHub::new`, which saves to the real `config.toml` and the system keychain
 added or removed an AI yet, so nothing noticed. Everything a test app can save goes to a temp
 folder (`AiHub::with_stores`), not only the engine's session.
 
+**A test that finds a program by Cargo's folder layout.** The CLI was looked for one folder up
+from the test binary (`target/debug/deps`). CI follows stable Rust, and Rust 1.100's Cargo moved
+test binaries to `target/debug/build/<package>/<hash>/out`, so `main` failed overnight with no
+code change. When CI breaks on a commit that passed, compare the runs' toolchain lines first, and
+don't rely on where Cargo keeps its intermediate files.
+
 **A test that passes only where a program is installed.** A tool's `Requires::Engine` is checked
 before it runs, so a test of its input checks passed on a machine with ilspycmd and failed on one
 without. Point the test session's `engines.tools` path at a stand-in file when the tool refuses
@@ -150,6 +172,19 @@ must release that resource and empty its registry. Do not reserve and release a 
 **A test that changes the whole process.** A UI test raised the process-wide stuck-lock banner; in
 CI the banner moved the layout under another test running beside it, and its click missed. It passed
 25 runs on a Mac. Anything a test sets for the whole process goes in a test program of its own.
+
+**A released file lock that still looked held.** Saved sign-in reservations use `flock`; a
+program another thread was starting held a copy of the lock file until its exec closed it, so a
+sign-out right after the reservation was dropped was refused as busy in about one full engine
+run in four, never alone. A non-blocking lock tries again for a moment (`lock_site`'s
+`LOCK_GRACE`) before calling something busy, and a lock test is run inside the full suite.
+
+**A test that passed only without the developer's `CARGO_TARGET_DIR`.** Since the program
+lookup reads `CARGO_TARGET_DIR`, four pin tests failed on a machine that exported it: a live check
+had left a real `snake` program in that shared folder, and the tests' project is also called snake.
+The product had the same fault: any same-named program there was taken for the project's. Run the
+engine tests with `CARGO_TARGET_DIR` set to a folder holding other builds, and a lookup in a
+shared folder needs proof that a file is this project's, not just its name.
 
 **A free port handed to another test.** For a negative TCP probe, a bound port stopped being
 ours as soon as its listener was dropped. Another fixture could acquire it before the probe.
@@ -203,6 +238,13 @@ you couldn't.
 off the UI thread; a UI test that added pictures, ran three frames and then looked kept passing on
 fast machines and failed in CI on unrelated PRs. When work moves to a worker, grep the tests that
 call it and make them `wait` for the result, not `run_steps(n)`.
+
+**An interrupted call read as "nothing answered".** A Cutter test failed once on Linux CI with "No
+Cutter session answered … Interrupted system call": a signal reached the thread (likely another
+test's child ending) during a loopback call, and every error that wasn't a timeout meant "no
+session". An interrupted system call is not an answer: decide on the error's typed kind
+(`ErrorKind::Interrupted`), call again within the same time limit when the request is safe to
+repeat (`platform::retry::when_interrupted`), and otherwise say it was interrupted.
 
 **A stand-in server that answers every request in order.** The AI tests' `mock` answered each
 request with the next scripted reply, so when the agent began asking the server for its context
@@ -289,6 +331,15 @@ the whole group, so websites never opened ("closed after 0.3 s"). Where it didn'
 browser outlived the CLI (the job isn't killed when closed) and held the shell's output pipe, so
 the command hung and old browsers piled up. Start programs that hand off with `.hands_off()`, and
 after a live run check that the command returned and nothing it started is still running.
+
+**A live browser test that died on a line about crashpad.** On Ubuntu with
+`kernel.apparmor_restrict_unprivileged_userns=1`, a Chromium that has no AppArmor profile (Playwright's
+copy, Chrome for Testing) can't build its sandbox and exits at once; the only stderr line we kept was a
+harmless crashpad warning (`cpufreq/scaling_max_freq`), so all five live sign-in tests failed in 1.5 s with
+"closed before it was ready". Don't turn the sandbox off in the product for it: point
+`CRAFT_ANYTHING_TEST_CHROMIUM` at a throwaway wrapper in `/tmp` that adds `--no-sandbox`, only for a browser
+that visits a server on 127.0.0.1. A helper that connects the moment the debugging port file appears must
+also wait for the first page target (`first_page`): it raced the browser's own start.
 
 **A separate config folder hides the agent's own settings.** To keep a live run from touching the
 real `config.toml`, `XDG_CONFIG_HOME` was pointed at a scratch folder; the agent CLI we start reads
@@ -518,6 +569,11 @@ keep the decision in a function a test can call (`plan` in `crates/ui-egui/build
 **Unformatted code reached `main`.** A test was edited by script after `cargo fmt --all` had run,
 so #53 merged with a long line rustfmt rewraps. Run `cargo fmt --all --check` last, after every
 edit, right before committing.
+Then `cargo fmt --all` itself stopped working on Windows: it hands rustfmt every target's root file
+in one command, and with the tests added since then that was about 31,000 characters of `\\?\`
+paths, past the 32,767 limit ("The filename or extension is too long", os error 206), so `cargo
+xtask ci` failed before checking anything. A command that takes one argument per file grows with
+the repository: format through `cargo xtask fmt [--check]`, which sends the same files in batches.
 
 **Clippy passed on an older Rust.** #1480 ran clippy on Rust 1.97 (the workspace's
 `rust-version`), clean; CI's 1.99 has `clippy::chunks_exact_to_as_chunks` and stopped the PR on
@@ -529,6 +585,11 @@ toolchain's component rather than running another copy.
 but POSIX makes everything after `=` the header, so FreeBSD's `ps` printed one `pid` column headed
 ",ppid=" and every parent lookup came back empty. Give each column its own `-o` (`-o pid= -o ppid=`)
 when a header is renamed or blanked.
+
+**`cfg(unix)` tests assumed every Unix could capture a console program.** Two console-run tests
+from #1679 and #1702 failed every night on FreeBSD, whose capture was a stub that refused to run
+anything. A test gated on `unix` must only need what every Unix build has; FreeBSD now captures
+through pipes, as Windows does.
 
 ## Design
 
@@ -558,6 +619,15 @@ beside an external one, a nested index map, and the sources-only read used for b
 `formats::sourcemap`, but `js::find_map_url` kept requiring a literal space, so a bundle with the
 standard no-space annotation was analysed without its map. Have one implementation and call it
 from both places; a regression at the consumer's public entry point catches a copy that drifts.
+The same happened with the PE optional header: `pe::headers` was bounded by `SizeOfOptionalHeader`,
+but `dotnet::pe::parse_pe` still read data directory 14 at a fixed offset, so a short declared
+header could borrow the CLI directory from section-table bytes. When a structure's declared size
+is enforced, search every reader of its fixed offsets and test each one with a short declared size.
+
+**A carver read optional-header fields the header didn't declare.** The firmware scanner read the
+PE certificate table and `SizeOfHeaders` at fixed offsets even when `SizeOfOptionalHeader` ended
+first, so a short header could over-carve into the next embedded object. Bound every fixed-offset
+field by the declared header, and test a short declared size beside the full-header control.
 
 **A floating-point conversion changed a fingerprint.** Widening a single-precision NaN to a double
 can change its sign, payload or signaling bit. Keep the original encoded bits for identities, and
@@ -624,6 +694,18 @@ only the first 30 distinct limitations in Markdown and HTML with no marker for t
 reader could mistake a capped list for everything the evidence said. Keep the display cap for
 readability but name how many were omitted in both formats; test one more limitation than the cap.
 
+**A comparison forgot what each side couldn't see.** `app_graphs_compare` and `js_exports_compare`
+loaded application graphs but built their evidence with only their own limitations, so a malformed
+source map or a truncated inventory disappeared and the comparison read as complete. Carry each
+loaded side's limitations into the comparison evidence, labelled left/right, and test both path and
+saved-evidence inputs.
+**A reference list was cut and looked complete.** `native_strings_find` kept 32 references per
+string and gave no count or flag, while the tool promised a complete search and the browse tool
+already reported a full count. Keep the row cap for size but return `reference_count` (complete
+within the analysis unless its xref limit was reached), a per-row `references_capped` flag, a
+display-cap limitation and the analysis `xref_limit` limitation; test an engine-boundary program
+whose string exceeds the display cap while the analysis limit is reached, including paging.
+
 **A comparison list was taken for the whole set.** The application comparison cut added, removed,
 bundle-module and vendor rows at 2,000, and its summary counted those cut lists as totals; the
 export comparison cut each module's added/removed diff the same way. Keep a complete total beside
@@ -636,6 +718,22 @@ but the lexer fallback, used for huge, deeply nested or unparsable sources, push
 a limit, so the path chosen for hostile input was the one that could grow. Apply the same cap to
 every push on every path, record the list in `truncated` where the parsed path does, and test the
 fallback with more calls than the cap permits.
+
+**A nesting guard missed the shapes it exists for.** The JavaScript nesting estimate counted
+brackets and some keywords, but an `else if` chain lost its depth at every `;`, `extends` and a run
+of prefix `++` counted nothing, and the tokenizer read `/` after `++`, after a member name or after
+`yield` as a regex, hiding the brackets in the text after it. The `;` that ended each link lost the
+chain depth when a comma expression came before it, a `;` inside a block consequent reset the chain
+the block belonged to, and a regex after `yield` needs its brackets and prefix-operator runs counted
+too, since the same text is division in sloppy code. Sources that estimated one or two levels then
+overflowed the parser thread's stack and aborted the process. Count the `else` links at their own
+scope, read a `yield /…/` as both a regex (for the fallback's facts) and possible code (for the
+guard) with lookahead bounded across the source, ended by every line terminator (an escaped one
+included), failing closed when its budget runs out, when a quote or backtick inside it starts a
+string in sloppy code, when its closing slash would open a comment or a later token would differ
+between the regex and division readings, and keeping the division reading's operator depth in the
+expression so later nesting adds to it; test that a deep source reaches the lexer fallback with a
+nesting reason instead of being parsed.
 
 **An occurrence label was also a binding name.** The second `obj.x` window and the first
 `obj["x[2]"]` window both appeared as `obj.x[2]`. Reserve literal labels and use a separate
@@ -709,6 +807,18 @@ before each turn ran plain `api model.list`, which starts that service, and the 
 session the person had left unfinished days before and went on editing another project for half
 an hour. When a program has a mode that must be avoided, give every call to it the same flag, not
 only the main one: list each command we run (`run`, `api`, `session delete`) and test each.
+
+**"Can it start here?" used for "is it a program?"** The study's search of a picked folder took
+the biggest file `outputs::is_program` accepted, which on Linux and macOS means no extension and an
+executable bit. A 1990s Windows game copied there has neither, so no program was found and
+Deep mode skipped Ghidra; the tests named their programs the local way on each system, so none had
+a Windows game on Linux. When a check answers one question, don't reuse it for a neighbouring one:
+studying a program and starting it are separate (`studies_as_program`), and test the other
+system's files on this one.
+The fix itself first missed one gate that starts it: runtime study's console runs checked the PE
+header but not the system, so a Windows console `.exe` would have been run on Linux (found in
+review). When a value starts reaching code it couldn't before, check every place that acts on it;
+every runtime start now asks `study::may_start`.
 
 **Keywords that only some code paths honour.** "…in Rust" picked Rust for apps but not for games, so
 a headless game rebuild stopped at once for want of Unity. It was found only by a live run. Run the
@@ -806,6 +916,10 @@ result ignored. Only "not found" means there's nothing to lose. Defaults that st
 that is there carry that fact (`Settings::not_loaded`) and refuse to be saved, also through a
 serde round trip that would drop it (`with_setting`); a backup keeps every byte under a name
 nothing else has, and one that fails stops the save.
+And "not found" wasn't that either: reading a link whose target is missing answers "not found"
+too, so such a config.toml was a first start and the next save put a file where the link was. A
+read's error describes the end of the path it followed, not the path: before treating "not
+found" as "nothing to lose", look at the path itself without following it (`symlink_metadata`).
 
 **A save that changed memory first.** Adding an AI in the app put it in the session's settings,
 then the file write failed (on Windows, likely a virus scan holding config.toml), so the app showed
@@ -817,15 +931,42 @@ on Windows (`write_atomic`); show errors where the person is looking.
 `max_files` but went on through the whole tree, read each folder's entries into one list before
 looking at any limit, and kept every folder and link it met: a tree of empty folders or links, or
 one folder with millions of names, had no limit at all. Count what is examined, not only what is
-kept; stop at the first thing over a limit; bound what is held while collecting (the first names in
-order, so a cut result is the same every time); and test the shapes that never reach the limit on
-the thing counted (no files, only links, one huge folder).
+kept; stop at the first thing over a limit; bound what is held while collecting; and test the
+shapes that never reach the limit on the thing counted (no files, only links, one huge folder).
+The order matters as much as the count: the walk listed a folder's files before opening any of its
+subfolders, so a file limit cut the tree in that order, and a later sort by path couldn't bring back
+the file inside an earlier folder that was dropped for later ones. When a result is shown in an
+order and cut by a limit, produce it in that order; don't sort what a different order kept.
+The fix repeated it one level down: to keep a folder's first names in order it held only as many
+names as the limit, but read the folder to its end to find them, 100,000 entries for a limit of 2,
+and its test checked what was held, not what was read. A limit on the work is a count of reads:
+take what the limit allows and one more (which says there is more), and assert how many times the
+source was read with a counting iterator. That costs the stable order: a cut listing holds what
+the system returned first, and the docs must say so rather than promise the same cut every time.
+The same loop skipped entries that failed to read and returned what was left as the whole folder;
+64 failures in a row came back as an empty folder listed in full, and a test expected exactly
+that. Anything skipped while reading is reported with the result (a count, a reason, a typed
+"incomplete" flag), and a test of an error path asserts what the caller is told, not only that
+the loop ended.
+
+**A result with two "what was missed" fields, read as one.** A folder walk says a listing is
+incomplete in `truncated` and names the folders it couldn't list in `unlisted`; five tools read
+only the flag, so an unreadable folder was "a limit" with no name and no reason, and a folder that
+couldn't be listed at all set `unlisted` without the flag. When a result carries what was missed
+in more than one field, check every caller reads all of them, and test each caller with the real
+failure (a folder held without sharing, or without permission), not only the walk.
 
 **An ignore file was read whole.** `walk_dir` read each `.gitignore` with `read_to_string` and
 swallowed every error: a sparse oversized file could size the allocation until the process aborted,
 a FIFO at that path could block the walk, and an unreadable or non-UTF-8 file lost its rules with no
 limitation. Read it through the capped, regular-file-checked helper, keep the cap well above real
 ignore files, and name every skipped file in the evidence; an absent file is the only silent case.
+
+**An inventory's size used as a read limit.** The managed reconstruction check compared a file's
+inventoried size with its 64 MiB budget, then read the file whole; growth in between bypassed the
+budget. Use the capped regular-file reader with the remaining budget, which checks bytes read
+as well as metadata. Test growth after a real inventory, the aggregate limit and exact-limit
+inputs. When nothing can be read, keep the read failures and the walk cut in the error too.
 
 **A graph cap was silent for edges and complete in coverage.** The application graph dropped
 edges past `4 × max_nodes` with no counter, and `js_app_map` reported Complete even when nodes or
@@ -841,6 +982,13 @@ named limitation, and make the map partial; test both the old 2,000 boundary and
 `env` values included, which can hold API keys; a tool's output reaches the journal and MCP
 clients. The journal only redacts by field name. When a setting can hold a secret, hide its value
 in every tool that prints settings, and test that it doesn't appear.
+
+**Network access that became account access.** Restricted MCP hid the sign-in tools, but
+`web_site_open`, allowed by `--allow-web`, picked a saved sign-in by default, so a client that
+couldn't sign in could still browse the person's account. When a tool gains a default that reaches
+stored credentials, check every mode that admits it, and give the narrower mode its own rule.
+The same profile copy also carried the browser's saved-password store: "we never store a
+password" has to cover what the browser itself offers to keep.
 
 **A secret check that matched a word inside a name.** `cargo xtask secrets` took any variable
 with `AUTH` in its name as a secret; git sets `GIT_AUTHOR_NAME` while the hook runs, so a contributor
@@ -887,6 +1035,11 @@ for it locally, and CI's `cargo xtask i18n-coverage` failed: the app shows tool 
 needs a translation in every catalog. Run `cargo xtask i18n-coverage` for any PR that adds a tool
 or changes a title, not only for UI changes.
 
+**An inserted name became another placeholder.** Filling `{saved}` and then `{used}` with repeated
+replacements rewrites a saved builder named `{used}`. Fill every placeholder in one pass over the
+template (`platform::text::fill`, which `i18n::trf` uses), never by chained `replace` calls, so
+inserted names stay literal; test placeholder-looking names as well as ordinary ones.
+
 **A second lock in one statement.** `CliSpec { deep: !engine.session().clean_room(), logs: engine.session().config_dir(), … }`
 looked like two quick reads, but an unbound guard lives to the end of the statement, so the second
 waited on the first forever. Every build froze after studying its target while the card calmly
@@ -900,6 +1053,18 @@ that failed was really ssh, talking to a git alias from `~/.ssh/config` that had
 computer. Say what ran and what it printed, write the rest to a log the person can open (a failed
 agent run does: `crate::failure_log`), and never name a next step you don't spell out. Exit 255
 from ssh is ssh's own failure: don't blame the remote program. Test a message by causing the failure.
+
+**A rule in the brief taken for a guard.** Every brief says everything outside `app/` is read-only,
+and an OpenCode builder still wrote its own progress notes over `inbox/build-progress.json`. The
+run read the record strictly, as it should, and every Try again stopped at "unknown field `step`"
+with no way forward. A coding agent's own tools don't pass through our checks: a file the run
+depends on is read as if anything may have changed it, and the error for one that changed says
+what the file is and how to go on.
+The fence in OpenCode's own rules was first drafted as "deny every edit, allow `app/*`", from the
+brief's words; a project edited in place (`app_in_root`) has its app in the project folder itself,
+and every edit its builder made would have been refused. A rule drawn from one layout's words
+misses the other: build it from the typed list the code already keeps (`OWN_NAMES`), and test
+both layouts.
 
 **A retry that took "no message" for "brand new".** A run with no message and no `continuing`
 flag was read as a first build, and Try again starts exactly that run. A browser that died during
@@ -991,6 +1156,11 @@ normalize at the provider boundary; test serialized requests for known and unkno
 
 **A sender could exceed its MCP receiver's target limit.** Bound the handoff to the receiver's
 accepted count and retain the active target; test the boundary, truncation order and remote mode.
+
+**A present protocol field was not a valid one.** The MCP server echoed `_meta.progressToken`
+whenever it was present, including `null` and objects, so it sent progress for values the protocol
+doesn't allow. Check a protocol field's type, not only its presence, before acting on it; test
+missing, null, wrong-type and valid values.
 
 **A finding correction reset omitted confidence to inferred.** Edit defaults must preserve existing
 values unless explicitly changed; test omitted fields and every supplied confidence level.
@@ -1154,6 +1324,14 @@ partial inventory for inspection, expose the stop as typed data, and make extrac
 writing any member. Missing end markers need their own compatibility control; `complete: false`
 alone does not identify a refused metadata record.
 
+**A roadmap read from the checked-out branch, not from `main`.** `docs/ROADMAP.md` was read while
+an old feature branch was checked out, so a dozen pending lines that `main` had already ticked
+looked open: the SSH builder's environment, the 304 stand-in, prompt pictures, pins' size, the
+OpenCode sweep. Time went into checking each against the code, and a branch was even started for
+work `main` already had. Read the roadmap (and any file you plan to change) from `origin/main`,
+with `git show origin/main:docs/ROADMAP.md` or after checking out the base branch; a pending line
+can also carry "— in PR #245", so check that PR's state, since a closed PR leaves the work open.
+
 **Safe recovery paths erased distinct source identities.** Source-map names such as `src//main.js`
 and `src/main.js` became the same safe path, so exclusive creation kept the first file and dropped
 the second. A file can also occupy a later source's parent directory, or arrive after its own
@@ -1161,3 +1339,8 @@ child. Preserve ordinary output paths and put collisions in an independent input
 directory; keep complete source identities in the manifest. Check both prefix orders and
 same-named input scripts through the real recovery tool, and retain the writer's symlink and
 exclusive-creation checks after selecting a name.
+
+**A settings smoke test clicked before scrolling settled.** An asynchronous refusal added a row,
+then a fixed number of frames left the next action outside the settled layout. Wait for the
+background operation to finish and run immediate repaints after scrolling before clicking;
+otherwise a missed click looks like a backend mutation that never completed.
