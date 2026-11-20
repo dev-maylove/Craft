@@ -430,7 +430,6 @@ impl Settings {
         };
         let e = match read {
             Ok(s) => {
-                crate::target::set_max_target_bytes(s.limits.max_target_bytes);
                 if s.version > SETTINGS_VERSION {
                     log::warn!("{} is from a newer Craft Anything (version {}); changes won't be saved over it", path.display(), s.version);
                 }
@@ -1272,5 +1271,43 @@ default = "Claude Code"
         std::fs::write(&target, "language = \"fr\"\n").unwrap();
         let s = Settings::load_from(&path);
         assert_eq!((s.language.as_str(), s.not_loaded), ("fr", None));
+    }
+
+    /// A missing file, an unreadable file and a file this build can't read all return settings.
+    /// A session applies the limit on those settings. Nothing is remembered beside them, so a
+    /// later default load cannot keep a cap from an earlier file.
+    #[test]
+    fn every_completed_load_returns_the_limit_a_session_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let capped_path = dir.path().join("capped.toml");
+        std::fs::write(&capped_path, "[limits]\nmax_target_bytes = 1024\n").unwrap();
+        let capped = Settings::load_from(&capped_path);
+        assert_eq!(capped.limits.max_target_bytes, Some(1024));
+
+        let missing = Settings::load_from(&dir.path().join("absent.toml"));
+        assert_eq!((missing.limits.max_target_bytes, missing.not_loaded.is_none()), (None, true));
+
+        let unreadable = Settings::load_from(dir.path());
+        assert!(unreadable.not_loaded.is_some());
+        assert_eq!(unreadable.limits.max_target_bytes, None);
+
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "this is not toml {{{").unwrap();
+        let set_aside = Settings::load_from(&bad);
+        assert_eq!(set_aside.limits.max_target_bytes, None);
+        assert!(set_aside.not_loaded.is_none(), "a file that was set aside is replaced with defaults");
+
+        std::fs::write(&bad, "version = 99\nmode = { kind = \"nope\" }\n").unwrap();
+        let newer = Settings::load_from(&bad);
+        assert_eq!(newer.limits.max_target_bytes, None);
+
+        let tight = crate::session::Session::new(capped);
+        let open = crate::session::Session::new(missing);
+        assert_eq!(tight.max_target_bytes(), crate::target::effective_max_target_bytes(Some(1024)));
+        assert_eq!(open.max_target_bytes(), crate::target::effective_max_target_bytes(None));
+        assert_eq!(crate::session::Session::new(unreadable).max_target_bytes(), crate::target::effective_max_target_bytes(None));
+        assert_eq!(crate::session::Session::new(set_aside).max_target_bytes(), crate::target::effective_max_target_bytes(None));
+        assert_eq!(crate::session::Session::new(newer).max_target_bytes(), crate::target::effective_max_target_bytes(None));
+        assert_eq!(tight.max_target_bytes(), crate::target::effective_max_target_bytes(Some(1024)));
     }
 }
