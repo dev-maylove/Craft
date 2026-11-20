@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 pub const ACP_AGENTS: &[(&str, &[&str])] = &[
     ("gemini-cli", &["--experimental-acp"]),
     ("qwen-code", &["--experimental-acp"]),
+    ("qwen", &["--experimental-acp"]),
     ("opencode", &["acp"]),
     ("goose", &["acp"]),
     ("hermes", &["acp"]),
@@ -38,7 +39,7 @@ pub const ACP_AGENTS: &[(&str, &[&str])] = &[
 
 /// Agents whose ACP mode takes the backend's model (`cli_model`), and the flag after the ACP
 /// arguments that picks it. Others keep the model they're set to.
-pub const ACP_MODEL_FLAGS: &[(&str, &str)] = &[("maki", "-m"), ("grok", "--model"), ("devin", "--model"), ("qwen-code", "-m")];
+pub const ACP_MODEL_FLAGS: &[(&str, &str)] = &[("maki", "-m"), ("grok", "--model"), ("devin", "--model"), ("qwen-code", "-m"), ("qwen", "-m")];
 
 /// Agents that ask the host to `authenticate` before a session opens, and the `authMethods` id
 /// the backend's stored key is sent under (`meta.api_key`). Other agents go straight to

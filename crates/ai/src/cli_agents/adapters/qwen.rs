@@ -46,6 +46,18 @@ impl AgentAdapter for Qwen {
         }
     }
 
+    /// Qwen's `--approval-mode default` still allows read-only shell commands and persisted allow
+    /// rules without asking the host, so Clean room, deep chat, and questions cannot be held back.
+    fn validate_access(&self, access: Access) -> Result<(), ToolError> {
+        match access {
+            Access::Build => Ok(()),
+            Access::Analyse | Access::CleanRoomAnalyse | Access::CleanRoomBuild | Access::CleanRoomQuestion | Access::Question => {
+                Err(ToolError::invalid("Qwen Code can run read-only tools without asking, so a Clean room run, a deep chat, or a question can't hold it back.")
+                    .with_remediation("Use a deep build for Qwen Code, or pick Claude Code for Clean room or questions."))
+            }
+        }
+    }
+
     /// Qwen asks before each tool call only in its default approval mode. Saying so here
     /// overrides an `approvalMode` the person's own `~/.qwen/settings.json` sets, so every
     /// request comes back to the Approvals menu.
@@ -96,5 +108,20 @@ mod tests {
     #[test]
     fn a_chosen_qwen_model_is_passed_over_acp() {
         assert_eq!(super::super::acp::model_args("qwen-code", Some("qwen3-coder-plus")), vec!["-m", "qwen3-coder-plus"]);
+        assert_eq!(super::super::acp::model_args("qwen", Some("qwen3-coder-plus")), vec!["-m", "qwen3-coder-plus"]);
+    }
+
+    #[test]
+    fn qwen_alias_runs_over_acp_and_refuses_clean_room_and_questions() {
+        let config =
+            BackendConfig { name: "Qwen".into(), kind: crate::BackendKind::AgentCli, model: "qwen".into(), base_url: None, ssh_host: None, enabled: true };
+        let spec = super::super::CliSpec::new(config, BackendOptions::default(), false, None);
+        let c = super::super::acp_for(&spec).expect("qwen alias must resolve to ACP, not native fallback");
+        assert!(c.args().iter().any(|a| a == "--experimental-acp"), "{:?}", c.args());
+
+        for access in [Access::Analyse, Access::CleanRoomAnalyse, Access::CleanRoomBuild, Access::CleanRoomQuestion, Access::Question] {
+            assert!(Qwen.validate_access(access).is_err(), "{access:?} must be refused");
+        }
+        assert!(Qwen.validate_access(Access::Build).is_ok());
     }
 }
