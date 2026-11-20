@@ -37,20 +37,20 @@ pub fn text_field_frame_compact(t: &Tokens) -> Frame {
 pub const CONTROL_TEXT: f32 = theme::ControlSize::Medium.text();
 
 /// How tall the standard control is drawn: buttons, switches, drop-downs and the chips beside them.
-pub fn control_height(_ui: &Ui) -> f32 {
+pub fn control_height() -> f32 {
     theme::ControlSize::Medium.height()
 }
 
 /// A wrapping row of labels and controls that is a control tall from its first item, so a label
 /// placed before a drop-down or button is centred on it rather than on egui's shorter default row.
 pub fn control_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
-    let h = control_height(ui);
+    let h = control_height();
     row_from(ui, h, true, add)
 }
 
 /// [`control_row`] on one line, for a row that never wraps.
 pub fn control_line<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
-    let h = control_height(ui);
+    let h = control_height();
     row_from(ui, h, false, add)
 }
 
@@ -80,7 +80,7 @@ pub fn field<'t>(ui: &Ui, text: &'t mut dyn egui::TextBuffer, hint: &str) -> egu
         .font(font.clone())
         .hint_text(RichText::new(tr(hint)).font(font))
         .vertical_align(egui::Align::Center)
-        .min_size(Vec2::new(0.0, control_height(ui) - 2.0))
+        .min_size(Vec2::new(0.0, control_height() - 2.0))
         .frame(text_field_frame_compact(&Tokens::get(ui.ctx())))
 }
 
@@ -122,7 +122,7 @@ pub fn dropdown(id_salt: impl egui::AsIdSalt) -> egui::ComboBox {
 /// A drop-down drawn like the buttons beside it: [`control_height`] tall, its text in the control
 /// font, centred, with the chevron. Every combo box goes through here.
 pub fn combo<R>(ui: &mut Ui, combo: egui::ComboBox, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<Option<R>> {
-    let h = control_height(ui);
+    let h = control_height();
     let line = label_galley(ui, "Ag", CONTROL_TEXT, Color32::PLACEHOLDER).size().y;
     // egui's combo box measures from the top of its slot, and in a centred layout it then lands a
     // padding lower. So it gets a slot of exactly its height, centred in a row that is taller.
@@ -252,7 +252,7 @@ pub fn suggestion(ui: &mut Ui, text: &str) -> Response {
     let max_w = ui.available_width().max(60.0);
     let g = ui.painter().layout(tr(text), egui::FontId::proportional(theme::SMALL), t.text, max_w - 26.0);
     let w = if ui.layout().horizontal_justify() { max_w } else { (g.size().x + 26.0).min(max_w) };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, (g.size().y + 14.0).max(control_height(ui))), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, (g.size().y + 14.0).max(control_height())), Sense::click());
     let h = hover_t(ui, &resp);
     ui.painter().rect(
         rect,
@@ -291,6 +291,8 @@ pub struct Tile<'a> {
 const TILE_TEXT_INSET: f32 = 84.0;
 /// The space between tiles, across and down.
 const TILE_GAP: f32 = 10.0;
+/// The narrowest a tile may be to let its title wrap to a second line rather than drop a column.
+const WRAP_MIN_TILE: f32 = 170.0;
 
 /// Sibling choice tiles as one grid: as many columns as fit (at most `max_cols`, and only counts
 /// that fill every row) with every title on one line in the current language, and every tile as
@@ -331,7 +333,20 @@ pub fn choice_tiles(ui: &mut Ui, tiles: &[Tile], max_cols: usize, min_h: f32) ->
 pub fn tile_columns(ui: &Ui, tiles: &[Tile], max_cols: usize, width: f32) -> usize {
     let t = Tokens::get(ui.ctx());
     let widest = tiles.iter().map(|x| ui.painter().layout_no_wrap(tr(x.label), theme::medium(theme::BODY), t.text).size().x).fold(0.0_f32, f32::max);
-    (2..=max_cols.min(tiles.len())).rev().find(|&c| tiles.len().is_multiple_of(c) && widest <= tile_width(width, c) - TILE_TEXT_INSET).unwrap_or(1)
+    // The longest single word: a title may wrap onto a second line in a roomy tile (the tiles
+    // grow to the tallest), so a long translation doesn't push the row to two by two.
+    let longest_word = tiles
+        .iter()
+        .flat_map(|x| tr(x.label).split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+        .map(|w| ui.painter().layout_no_wrap(w, theme::medium(theme::BODY), t.text).size().x)
+        .fold(0.0_f32, f32::max);
+    (2..=max_cols.min(tiles.len()))
+        .rev()
+        .find(|&c| {
+            let (w, room) = (tile_width(width, c), tile_width(width, c) - TILE_TEXT_INSET);
+            tiles.len().is_multiple_of(c) && (widest <= room || (w >= WRAP_MIN_TILE && longest_word <= room))
+        })
+        .unwrap_or(1)
 }
 
 fn tile_width(width: f32, cols: usize) -> f32 {
@@ -682,7 +697,7 @@ pub fn status_chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> Respons
     let label = tr(text);
     let g = label_galley(ui, &label, CONTROL_TEXT, fg);
     let pad = ui.spacing().button_padding;
-    let size = Vec2::new(g.size().x + pad.x * 2.0 + 6.0, control_height(ui));
+    let size = Vec2::new(g.size().x + pad.x * 2.0 + 6.0, control_height());
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter().rect_filled(rect, t.radius, bg);
     ui.painter().galley_with_override_text_color(rect.center() - g.size() / 2.0, g, fg);
