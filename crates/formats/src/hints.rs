@@ -41,10 +41,19 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
     };
 
     // Go
+    // The build-info marker is a plain 14-byte string that any program can hold as data (our own
+    // detector's constant does), so finding it proves nothing by itself (#2249): it counts only
+    // when the header after it is one the build-info reader decodes into a Go version.
+    let mut go_report = find_bytes(data, crate::go::MAGIC, SCAN_LIMIT).and_then(|_| crate::go::inspect(data, None).ok());
+    let marker_block = go_report.as_ref().and_then(|r| r.buildinfo.as_ref().filter(|bi| is_go_buildinfo_header(bi)).map(|bi| (bi.offset, r.slice.clone())));
     if sec(".go.buildinfo") || sec("__go_buildinfo") {
         push(&mut out, hint("go", "language", "Go", "strong", "Go build-info section"));
-    } else if let Some(at) = find_bytes(data, b"\xff Go buildinf:", SCAN_LIMIT) {
-        push(&mut out, hint("go", "language", "Go", "strong", format!("Go build-info marker at file offset {at:#x}")));
+    } else if let Some((at, slice)) = marker_block {
+        let place = match slice {
+            Some(s) => format!("offset {at:#x} of the {s} slice"),
+            None => format!("file offset {at:#x}"),
+        };
+        push(&mut out, hint("go", "language", "Go", "strong", format!("Go build-info block at {place}")));
     } else if sec(".gopclntab") || sec("__gopclntab") || sym("runtime.main") {
         push(&mut out, hint("go", "language", "Go", "strong", "Go runtime symbols or pclntab section"));
     }
@@ -52,12 +61,12 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
         // Prefer the version the build-info reader extracts (#1397): it reads the build-info
         // section, so an unrelated `go1.` that happens to come earlier in the file (a constant,
         // a path, a debug string) can't be mistaken for the toolchain version.
-        let (version, from_build_info) = match crate::go::inspect(data, None) {
-            Ok(report) => match report.buildinfo.and_then(|b| b.go_version) {
-                Some(v) if !v.is_empty() => (Some(v), true),
-                _ => (None, false),
-            },
-            Err(_) => (None, false),
+        if go_report.is_none() {
+            go_report = crate::go::inspect(data, None).ok();
+        }
+        let (version, from_build_info) = match go_report.and_then(|r| r.buildinfo).and_then(|b| b.go_version) {
+            Some(v) if !v.is_empty() => (Some(v), true),
+            _ => (None, false),
         };
         let version = version.or_else(|| {
             // Fall back to scanning bytes only when there is no build info to read. Start after
@@ -243,6 +252,12 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
     out
 }
 
+/// Whether a decoded build-info block has the header Go writes: a pointer size of 4 or 8, a flags
+/// byte with only the big-endian and inline bits, and a version that reads as a Go toolchain.
+fn is_go_buildinfo_header(bi: &crate::go::GoBuildInfo) -> bool {
+    matches!(bi.pointer_size, 4 | 8) && bi.flags & !0b11 == 0 && bi.go_version.as_deref().is_some_and(|v| v.starts_with("go") || v.starts_with("devel"))
+}
+
 /// A version token the byte scan may accept: `go1.<digits>(.<digits>)*`.
 fn is_go_version(v: &str) -> bool {
     let Some(rest) = v.strip_prefix("go1.") else {
@@ -255,6 +270,70 @@ fn is_go_version(v: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A well-formed Go 1.18+ build-info block (inline strings, 8-byte pointers).
+    fn go_block(version: &str) -> Vec<u8> {
+        craft_anything_testkit::formats::go_buildinfo_inline(version, "path\texample.com/hello\nmod\texample.com/hello\t(devel)\t\n")
+    }
+
+    /// `data` padded to a 16-byte boundary (where Go places the block), then `tail`.
+    fn with_block(mut data: Vec<u8>, tail: &[u8]) -> Vec<u8> {
+        data.resize(data.len().next_multiple_of(16), 0);
+        data.extend_from_slice(tail);
+        data
+    }
+
+    fn go_hint(data: &[u8]) -> Option<Hint> {
+        let b = crate::parse_binary(data).unwrap();
+        detect(&b, data).into_iter().find(|h| h.id == "go")
+    }
+
+    #[test]
+    fn a_bare_marker_is_not_go() {
+        // A program that only holds the marker string as data (as our own detector's constant
+        // does, #2249) is not called Go, on an aligned or unaligned offset, in ELF or PE.
+        let (elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+        let aligned = with_block(elf.clone(), crate::go::MAGIC);
+        assert_eq!(go_hint(&aligned), None);
+        let mut unaligned = with_block(elf.clone(), b"x");
+        unaligned.extend_from_slice(crate::go::MAGIC);
+        unaligned.extend_from_slice(b"rest of the read-only data, not a header....");
+        assert_eq!(go_hint(&unaligned), None);
+        let mut constant = with_block(elf, crate::go::MAGIC);
+        constant.extend_from_slice(&[0u8; 64]);
+        assert_eq!(go_hint(&constant), None);
+        let pe = with_block(craft_anything_testkit::pe64(), crate::go::MAGIC);
+        assert_eq!(go_hint(&pe), None);
+    }
+
+    #[test]
+    fn a_truncated_block_is_not_go() {
+        // The file ends right after the marker, or partway through the header or its strings.
+        let (elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+        let block = go_block("go1.22.3");
+        for end in [15, 16, 20, 32, 33, 36] {
+            let data = with_block(elf.clone(), block.get(..end).unwrap());
+            assert_eq!(go_hint(&data), None, "cut at {end}");
+        }
+        // The old test shape: a version right after the flags, with no inline strings.
+        let data = with_block(elf, b"\xff Go buildinf:\x08\x02go1.22.3\0");
+        assert_eq!(go_hint(&data), None);
+    }
+
+    #[test]
+    fn a_block_with_a_bad_header_is_not_go() {
+        let (elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+        let good = go_block("go1.22.3");
+        let mut bad_ptr = good.clone();
+        bad_ptr[14] = 3;
+        assert_eq!(go_hint(&with_block(elf.clone(), &bad_ptr)), None, "pointer size 3");
+        let mut bad_flags = good.clone();
+        bad_flags[15] = 0x82;
+        assert_eq!(go_hint(&with_block(elf.clone(), &bad_flags)), None, "unknown flag bits");
+        assert_eq!(go_hint(&with_block(elf.clone(), &go_block("not a version"))), None, "not a Go version");
+        let g = go_hint(&with_block(elf, &good)).unwrap();
+        assert_eq!((g.label.as_str(), g.strength), ("Go (go1.22.3)", "strong"), "{g:?}");
+    }
+
     #[test]
     fn a_version_before_the_build_info_is_not_used() {
         // An unrelated `go1.` that appears before the build-info marker must not win over the
@@ -262,7 +341,7 @@ mod tests {
         let (elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
         let mut go = elf.clone();
         go.extend_from_slice(b"go1.190119941996 ");
-        go.extend_from_slice(b"\xff Go buildinf:\x08\x02go1.22.3\0");
+        let go = with_block(go, &go_block("go1.22.3"));
         let b = crate::parse_binary(&go).unwrap();
         let hints = detect(&b, &go);
         let g = hints.iter().find(|h| h.id == "go").unwrap();
@@ -286,11 +365,12 @@ mod tests {
         let (elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
         let b = crate::parse_binary(&elf).unwrap();
         assert!(detect(&b, &elf).iter().all(|h| h.id != "go"));
-        let mut go = elf.clone();
-        go.extend_from_slice(b"\xff Go buildinf:\x08\x02go1.22.3\0");
+        let go = with_block(elf.clone(), &go_block("go1.22.3"));
         let hints = detect(&b, &go);
         let g = hints.iter().find(|h| h.id == "go").unwrap();
         assert_eq!(g.label, "Go (go1.22.3)");
+        assert_eq!(g.strength, "strong", "{g:?}");
+        assert!(g.evidence.contains("build-info block"), "{g:?}");
         let pe = craft_anything_testkit::pe64();
         let b = crate::parse_binary(&pe).unwrap();
         let _ = detect(&b, &pe);

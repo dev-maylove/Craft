@@ -633,6 +633,12 @@ field by the declared header, and test a short declared size beside the full-hea
 can change its sign, payload or signaling bit. Keep the original encoded bits for identities, and
 test signaling/quiet pairs as well as different payloads; retain numeric conversion for display.
 
+**A magic string taken for the structure it opens.** Triage called any file holding
+`\xff Go buildinf:` a Go program, and our own CLI holds that string as its detector's constant, so
+Craft Anything's Windows build was "made with Go" (#2249). A detector's own constants are in the
+detector's binary: count a marker only when the structure after it decodes, and test the bare
+marker alone.
+
 **A canonical-length check hid readable signature facts.** Rejecting a redundant ASN.1 length
 made its certificate or signature disappear from the report. Keep a bounded, readable element,
 mark its non-minimal encoding, and carry that limitation into every signature view. Test retained
