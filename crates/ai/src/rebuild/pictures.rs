@@ -110,7 +110,7 @@ fn take_in_turn(pages: &[Vec<Vec<PathBuf>>], max: usize, picked: &mut Vec<PathBu
 /// as written (elsewhere, or climbing out of it with `..`) is left out, so it's never named to a
 /// model. This reads only the paths: a link in the project that leads out is refused when the
 /// picture is read ([`load`]).
-pub(super) fn in_project(root: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn in_project(root: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
     use std::path::Component;
     let mut kept: Vec<PathBuf> = Vec::new();
     for rel in files.iter().filter_map(|f| f.strip_prefix(root).ok()) {

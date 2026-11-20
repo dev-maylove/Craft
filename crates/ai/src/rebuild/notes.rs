@@ -115,29 +115,47 @@ pub fn clear(dir: &Path) {
 /// For the agent's hook: claim every waiting note, oldest first, and return their texts. A note
 /// another claimer (or "take back") got first is skipped.
 pub fn claim(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    claim_with_pictures(dir).0
+}
+
+/// The API builder receives a claimed note's attachments along with its words. Claiming only
+/// the words would mark its pictures read before the end-of-turn handoff can deliver them.
+pub(crate) fn claim_with_pictures(dir: &Path) -> (Vec<String>, Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return (Vec::new(), Vec::new()) };
     let mut ids: Vec<u64> =
         entries.flatten().filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".json")).and_then(|n| n.parse::<u64>().ok())).collect();
     ids.sort_unstable();
-    ids.into_iter()
-        .filter_map(|id| {
-            let text = std::fs::read(pending(dir, id)).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())?;
-            std::fs::rename(pending(dir, id), read(dir, id)).ok()?;
-            text.get("text").and_then(serde_json::Value::as_str).map(String::from)
-        })
-        .collect()
+    let (mut texts, mut pictures) = (Vec::new(), Vec::new());
+    for id in ids {
+        let Some(file) = std::fs::read(pending(dir, id)).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { continue };
+        if std::fs::rename(pending(dir, id), read(dir, id)).is_err() {
+            continue;
+        }
+        let Some(text) = file.get("text").and_then(serde_json::Value::as_str) else { continue };
+        texts.push(text.to_string());
+        if let Some(left) = file.get("left").cloned().and_then(|v| serde_json::from_value::<Left>(v).ok()) {
+            pictures.extend(left.pictures);
+        }
+    }
+    (texts, pictures)
 }
 
-/// What the hook prints for the agent: the notes as context for its next step, or nothing.
-pub fn hook_output(texts: &[String]) -> Option<String> {
+/// The notes as context for the builder's next step, or nothing: what a coding agent's hook
+/// prints, and what the API-backend loop adds after a step's tool results.
+pub fn context(texts: &[String]) -> Option<String> {
     if texts.is_empty() {
         return None;
     }
     let list = texts.iter().map(|t| format!("- {t}")).collect::<Vec<_>>().join("\n");
     // Stated as facts: the agent reads it as context, not as an order from the tool.
-    let context = format!(
+    Some(format!(
         "The person added this while you were working:\n{list}\nIt applies to the work from here on, and your reply can say how you took it into account."
-    );
+    ))
+}
+
+/// What the hook prints for the agent: the notes as context for its next step, or nothing.
+pub fn hook_output(texts: &[String]) -> Option<String> {
+    let context = context(texts)?;
     Some(serde_json::json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}).to_string())
 }
 

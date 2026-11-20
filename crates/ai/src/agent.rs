@@ -289,12 +289,26 @@ pub struct LoopConfig {
     /// The project folder the build tools' paths are relative to: a picture a tool opens there
     /// (`build_file_read`'s `picture`) is shown to a model that sees, after that step's results.
     pub project: Option<std::path::PathBuf>,
+    /// A build's notes folder ([`crate::rebuild::notes`]): after each tool step the notes waiting
+    /// there are claimed and added after the results, so the builder reads them at its next step,
+    /// as a coding agent's hook hands them over. `None`: notes wait for the turn to end.
+    pub notes: Option<std::path::PathBuf>,
 }
 
 impl Default for LoopConfig {
     /// Deep, so a conversation started without an explicit mode keeps the old, safe behavior.
     fn default() -> Self {
-        Self { beginner: false, prices: BTreeMap::new(), transcript: None, deep: true, context_tokens: 0, lean_for_local: false, logs: None, project: None }
+        Self {
+            beginner: false,
+            prices: BTreeMap::new(),
+            transcript: None,
+            deep: true,
+            context_tokens: 0,
+            lean_for_local: false,
+            logs: None,
+            project: None,
+            notes: None,
+        }
     }
 }
 
@@ -632,7 +646,22 @@ impl AgentLoop {
                 }
                 StopReason::ToolUse if !uses.is_empty() => {
                     self.history.push(result.message);
-                    let results = self.run_tools(&uses);
+                    let mut results = self.run_tools(&uses);
+                    // Notes the person added meanwhile go with the results, after them (every call
+                    // keeps its result first); the build relays them to the feed as read.
+                    if let Some(dir) = self.cfg.notes.as_deref() {
+                        let (texts, pictures) = crate::rebuild::notes::claim_with_pictures(dir);
+                        if let Some(text) = crate::rebuild::notes::context(&texts) {
+                            results.push(Block::Text { text });
+                        }
+                        if !pictures.is_empty()
+                            && let Some(root) = self.cfg.project.as_deref()
+                        {
+                            let opened =
+                                crate::rebuild::pictures::in_project(root, &pictures).into_iter().map(|path| path.display().to_string()).collect::<Vec<_>>();
+                            self.show_opened(&mut results, &opened);
+                        }
+                    }
                     self.history.push(Msg { role: Speaker::User, blocks: results });
                     self.save_transcript();
                     if self.failed_builds >= MAX_FAILED_BUILDS {
@@ -943,6 +972,7 @@ impl AgentLoop {
     /// After a step's tool results, the pictures its tools opened: each after a line naming it to
     /// a model that sees (shrunk to fit, at most [`MAX_PICTURES`]), or a line saying it isn't shown.
     fn show_opened(&mut self, out: &mut Vec<Block>, opened: &[String]) {
+        let limit = MAX_PICTURES.saturating_sub(out.iter().filter(|b| matches!(b, Block::Image { .. })).count());
         let sees = self.sees_pictures();
         let note = |text: String| Block::Text { text: format!("{text}\n") };
         let Some(root) = self.cfg.project.clone().filter(|_| sees) else {
@@ -951,7 +981,7 @@ impl AgentLoop {
             return;
         };
         let paths: Vec<std::path::PathBuf> = opened.iter().map(std::path::PathBuf::from).collect();
-        let (shown, skipped) = crate::rebuild::pictures::load(&root, paths.get(..MAX_PICTURES).unwrap_or(&paths));
+        let (shown, skipped) = crate::rebuild::pictures::load(&root, paths.get(..limit).unwrap_or(&paths));
         for picture in shown {
             if let Block::Image { name, .. } = &picture {
                 out.push(Block::Text { text: format!("Picture: {name}") });
@@ -959,7 +989,7 @@ impl AgentLoop {
             out.push(picture);
         }
         out.extend(skipped.into_iter().map(|s| note(format!("[Couldn't show {s}.]"))));
-        if let Some(rest) = opened.get(MAX_PICTURES..).filter(|r| !r.is_empty()) {
+        if let Some(rest) = opened.get(limit..).filter(|r| !r.is_empty()) {
             out.push(note(format!("[Not shown: {} (at most {MAX_PICTURES} pictures a step); open them in the next.]", rest.join(", "))));
         }
     }
@@ -1602,6 +1632,71 @@ pub(crate) mod tests {
             self.asked.fetch_add(1, Ordering::SeqCst);
             self.says.map(|sees| crate::sight::Sight { sees, source: "test" })
         }
+    }
+
+    /// A note the person adds while an API-backend builder works reaches it at its next step,
+    /// after that step's tool results, and is claimed so the build doesn't send it again after
+    /// the turn. Without a notes folder the note waits.
+    #[test]
+    fn a_note_reaches_an_api_builder_between_tool_calls() {
+        use crate::rebuild::notes;
+        let run = |dir: Option<std::path::PathBuf>, project: Option<std::path::PathBuf>| {
+            let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+            let seen: Arc<Mutex<Vec<Vec<Msg>>>> = Arc::default();
+            let turns = VecDeque::from([
+                turn(vec![Block::ToolUse { id: "b1".into(), name: BUILD_COMMAND_TOOL.into(), input: json!({"ok": true}) }], StopReason::ToolUse),
+                turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn),
+            ]);
+            let slot = ModelSlot {
+                name: "Fake".into(),
+                model: Box::new(Scripted { turns, seen: seen.clone() }),
+                local: false,
+                effort: None,
+                max_turns: 10,
+                context_tokens: 0,
+                tools: Default::default(),
+                vision: if project.is_some() { Vision::Yes } else { Vision::No },
+            };
+            let mut c = ApiConversation::start(host, vec![slot], LoopConfig { notes: dir, project, ..LoopConfig::default() }).unwrap();
+            c.send("build it");
+            drain_until_done(&mut c, |_, _| {});
+            let last = seen.lock().unwrap().get(1).and_then(|m| m.last().cloned()).expect("a second request");
+            last.blocks
+        };
+        let d = tempfile::tempdir().unwrap();
+        let dir = notes::notes_dir(d.path());
+        notes::hand_over(&dir, 7, "make it blue", None).unwrap();
+        let blocks = run(Some(dir.clone()), None);
+        assert!(matches!(&blocks[0], Block::ToolResult { tool_use_id, .. } if tool_use_id == "b1"), "the result comes first: {blocks:?}");
+        assert!(matches!(&blocks[1], Block::Text { text } if text.contains("- make it blue") && text.contains("while you were working")), "{blocks:?}");
+        assert!(notes::was_read(&dir, 7), "claimed, so it goes to the feed and not into the next message");
+        // Nothing waiting: the results alone.
+        assert_eq!(run(Some(dir.clone()), None).len(), 1);
+        // No folder (a chat, the extractor): a waiting note stays for after the turn.
+        notes::hand_over(&dir, 8, "add a footer", None).unwrap();
+        assert_eq!(run(None, None).len(), 1);
+        assert!(!notes::was_read(&dir, 8));
+        // Main claims notes between tools: their pictures must arrive before the read marker
+        // prevents the existing end-of-turn handoff, including an image-only note.
+        use base64::Engine as _;
+        notes::forget(&dir, 8);
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1kAAAAASUVORK5CYII=")
+            .unwrap();
+        let mut pictures = Vec::new();
+        for i in 0..8 {
+            let path = d.path().join(format!("note-{i}.png"));
+            std::fs::write(&path, &png).unwrap();
+            pictures.push(path);
+        }
+        pictures.push(pictures[0].clone());
+        notes::hand_over(&dir, 9, "", Some(&notes::Left { pictures, ..Default::default() })).unwrap();
+        let blocks = run(Some(dir.clone()), Some(d.path().to_path_buf()));
+        assert!(matches!(&blocks[0], Block::ToolResult { .. }));
+        assert_eq!(blocks.iter().filter(|b| matches!(b, Block::Image { .. })).count(), MAX_PICTURES);
+        assert!(blocks.iter().any(|b| matches!(b, Block::Text { text } if text.contains("Not shown") && text.contains("note-6.png"))));
+        assert!(notes::was_read(&dir, 9));
+        assert_eq!(run(Some(dir.clone()), Some(d.path().to_path_buf())).len(), 1, "claimed once");
     }
 
     #[test]

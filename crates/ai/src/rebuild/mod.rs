@@ -309,7 +309,14 @@ impl RebuildRun {
                 if !continuing && !ws.capture_dir().exists() {
                     let _ = std::fs::remove_file(ws.transcript_path());
                 }
-                Some(hub.start_builder(&entry, opts.beginner, Some(ws.transcript_path()), run_deep, Some(ws.root.clone()))?)
+                Some(hub.start_builder(
+                    &entry,
+                    opts.beginner,
+                    Some(ws.transcript_path()),
+                    run_deep,
+                    Some(ws.root.clone()),
+                    Some(notes::notes_dir(&ws.inbox_dir())),
+                )?)
             }
         };
         // A chosen extractor (an API backend, e.g. Kimi K3) takes a game's files out after a fresh
@@ -1352,7 +1359,7 @@ impl Worker {
                         ws,
                         Step::Build,
                         Status::Building,
-                        "The builder's earlier conversation isn't on this computer. Starting a new one from what the project already has…",
+                        "The builder's earlier conversation isn't on this computer, or has grown too long to continue. Starting a new one from what the project already has…",
                     )?;
                     prompt = f;
                     retry = false;
