@@ -712,43 +712,38 @@ fn stdio_batch_rejection_transcript() {
 fn stdio_cancel_inflight_tool_call_transcript() {
     use craft_anything_engine::inbox::{Inbox, InboxDir};
     use craft_anything_engine::workspace::{TargetRef, Workspace};
-    use std::io::BufRead;
+    use std::io::BufReader;
 
-    struct CancelAfterPendingReader {
+    struct CancelAfterPendingRead {
         inbox: Inbox,
         step: u8,
+        current: &'static [u8],
+        pos: usize,
     }
 
-    impl std::io::Read for CancelAfterPendingReader {
-        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Ok(0)
-        }
-    }
-
-    impl BufRead for CancelAfterPendingReader {
-        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-            Ok(&[])
-        }
-        fn consume(&mut self, _amt: usize) {}
-        fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
-            let line = match self.step {
-                0 => {
-                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"build_command_run\",\"arguments\":{\"command\":\"echo hi\"}}}\n"
-                }
-                1 => {
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    while self.inbox.pending().is_empty() {
-                        assert!(Instant::now() < deadline, "timed out waiting for inflight consent request");
-                        std::thread::sleep(Duration::from_millis(5));
+    impl std::io::Read for CancelAfterPendingRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.current.len() {
+                self.current = match self.step {
+                    0 => b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"build_command_run\",\"arguments\":{\"command\":\"echo hi\"}}}\n",
+                    1 => {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while self.inbox.pending().is_empty() {
+                            assert!(Instant::now() < deadline, "timed out waiting for inflight consent request");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n"
                     }
-                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n"
-                }
-                2 => "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"params\":{}}\n",
-                _ => return Ok(0),
-            };
-            self.step += 1;
-            buf.push_str(line);
-            Ok(line.len())
+                    2 => b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"params\":{}}\n",
+                    _ => return Ok(0),
+                };
+                self.pos = 0;
+                self.step += 1;
+            }
+            let n = buf.len().min(self.current.len() - self.pos);
+            buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
         }
     }
 
@@ -759,7 +754,8 @@ fn stdio_cancel_inflight_tool_call_transcript() {
     let inbox = Inbox::new(ws.inbox_dir());
 
     let buf = Buf::default();
-    serve(engine, ServerOptions::default(), CancelAfterPendingReader { inbox, step: 0 }, Box::new(buf.clone())).unwrap();
+    let reader = BufReader::new(CancelAfterPendingRead { inbox, step: 0, current: &[], pos: 0 });
+    serve(engine, ServerOptions::default(), reader, Box::new(buf.clone())).unwrap();
     let out: Vec<Value> = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
 
     assert!(out.iter().all(|m| m["id"] != json!(1)), "cancelled inflight call must not emit a response: {out:?}");
