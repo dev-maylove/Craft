@@ -397,3 +397,78 @@ fn what_a_tool_says_reaches_the_feed_while_it_holds_the_session() {
     assert!(result.is_ok(), "{result:?}");
     assert!(agent.seen && in_time, "the waiting line reached the feed while the tool held the session");
 }
+
+/// A builder whose hook takes a note during its first turn, which then ends with its conversation
+/// lost; any later turn answers at once.
+struct LostAfterTakingANote {
+    notes: Arc<Mutex<Vec<Note>>>,
+    notes_dir: PathBuf,
+    sent: Vec<String>,
+    polls: usize,
+}
+
+impl Conversation for LostAfterTakingANote {
+    fn send(&mut self, text: &str) {
+        self.sent.push(text.into());
+        self.polls = 0;
+    }
+
+    fn session_lost(&self) -> bool {
+        self.sent.len() == 1 && self.polls >= 2
+    }
+
+    fn poll(&mut self) -> Vec<AgentEvent> {
+        self.polls += 1;
+        let done = AgentEvent::TurnDone {
+            backend: "scripted".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            tokens_unknown: false,
+            cost_usd: None,
+            cost_is_estimate: false,
+        };
+        match (self.sent.len(), self.polls) {
+            (1, 1) => {
+                let text = "Make the header red";
+                self.notes.lock().unwrap().push(Note { id: 81, text: text.into(), shown: text.into(), pictures: Vec::new(), questions: Vec::new() });
+                notes::hand_over(&self.notes_dir, 81, text, None).unwrap();
+                assert_eq!(notes::claim(&self.notes_dir).len(), 1);
+                Vec::new()
+            }
+            (1, _) => vec![AgentEvent::Error { message: "No conversation found".into(), remediation: None, log: None }, done],
+            _ => vec![AgentEvent::TextDelta { text: "Started again".into() }, done],
+        }
+    }
+
+    fn answer_consent(&mut self, _: &str, _: bool) {}
+    fn stop(&mut self) {}
+    fn is_busy(&self) -> bool {
+        false
+    }
+}
+
+/// Review of #2043: a note the builder's hook took in a turn whose conversation was then lost (not
+/// on this computer, or too long) reaches the new conversation, not only the feed. With nothing to
+/// start a new one from, it waits for the next run instead of being dropped.
+#[test]
+fn a_note_taken_by_a_lost_conversation_goes_to_the_new_one() {
+    for fresh in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "Lost notes", "Build an app", TargetRef::None).unwrap();
+        let mut worker = check_worker(&ws, false);
+        let mut agent = LostAfterTakingANote { notes: worker.notes.clone(), notes_dir: notes::notes_dir(&ws.inbox_dir()), sent: Vec::new(), polls: 0 };
+        let start = fresh.then(|| "THE FRESH START".to_string());
+        let result = worker.turn_with_wait(&mut ws, &mut agent, "Carry on", true, start, |_, _| panic!("a lost conversation isn't retried"));
+        if fresh {
+            assert_eq!(result.unwrap(), "Started again");
+            let second = agent.sent.get(1).expect("a new conversation was started");
+            assert!(second.starts_with("THE FRESH START") && second.contains("- Make the header red"), "{second}");
+            assert!(worker.notes.lock().unwrap().is_empty(), "sent, so not waiting");
+        } else {
+            assert!(result.is_err());
+            assert_eq!(agent.sent.len(), 1);
+            let waiting: Vec<String> = worker.notes.lock().unwrap().iter().map(|n| n.text.clone()).collect();
+            assert_eq!(waiting, ["Make the header red"], "kept for the next run");
+        }
+    }
+}

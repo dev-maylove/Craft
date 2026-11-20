@@ -345,6 +345,7 @@ impl RebuildRun {
             usage: Some(UsageClock { root: root.clone(), since: Instant::now() }),
             self_check: None,
             reset_progress_after_notes: false,
+            taken_in_turn: Vec::new(),
             keys: hub.keys.clone(),
             kept_checks: Mutex::default(),
         };
@@ -553,6 +554,9 @@ struct Worker {
     self_check: Option<(Arc<dyn kinds::TargetKind>, f64)>,
     /// A hook consumed a new request; persist its reset only after the builder finishes.
     reset_progress_after_notes: bool,
+    /// Notes the builder's hook took during the turn under way. If that turn ends with its
+    /// conversation lost or too long, they go to the new one (review of #2043).
+    taken_in_turn: Vec<Note>,
     /// The backends' stored keys, for an agent CLI that asks the host to authenticate (Devin).
     keys: crate::keys::KeyStore,
     /// The last check round in which everything worked, kept while nothing it looks at changes.
@@ -1277,8 +1281,11 @@ impl Worker {
         let mut tries = 0u64;
         let mut retry = false;
         loop {
+            self.taken_in_turn.clear();
             let result = self.converse_turn(ws, agent, &prompt, retry);
             let lost = result.is_err() && agent.session_lost();
+            // Taken by a conversation that's gone: the feed already shows them as delivered.
+            let taken = if lost { std::mem::take(&mut self.taken_in_turn) } else { Vec::new() };
             if lost {
                 // The id is for a session this computer doesn't have: never ask for it again.
                 Self::remember_session(ws, None, deep)?;
@@ -1293,8 +1300,13 @@ impl Worker {
                         Status::Building,
                         "The builder's earlier conversation isn't on this computer, or has grown too long to continue. Starting a new one from what the project already has…",
                     )?;
-                    prompt = f;
+                    prompt = f + &taken_prompt(&taken);
                     retry = false;
+                }
+                // Nothing to start a new conversation from: the run ends, and the next one sends them.
+                Err(e) if lost => {
+                    self.notes.lock().unwrap_or_else(PoisonError::into_inner).splice(0..0, taken);
+                    return Err(e);
                 }
                 // A missing session can only start fresh above, never resume. Only backend
                 // Error events become ProgramFailed here; a simultaneous backend failure must
@@ -1426,6 +1438,7 @@ impl Worker {
             read
         };
         let new_request = read.iter().any(|n| !n.text.trim().is_empty());
+        self.taken_in_turn.extend(read.iter().cloned());
         for n in read {
             // The agent's hook took the note, so the Just-ask answers in its text were told.
             if !n.questions.is_empty()
@@ -1446,6 +1459,17 @@ impl Worker {
             }
         }
     }
+}
+
+/// What a new conversation is sent, after its start, for the notes the lost one took; nothing
+/// when they asked for nothing.
+fn taken_prompt(taken: &[Note]) -> String {
+    let texts: Vec<String> = taken.iter().map(|n| n.text.clone()).filter(|t| !t.trim().is_empty()).collect();
+    if texts.is_empty() {
+        return String::new();
+    }
+    let questions: Vec<AskedQuestion> = taken.iter().flat_map(|n| n.questions.iter().cloned()).collect();
+    format!("\n\n{}{}", just_asked(&questions), added_prompt(&texts))
 }
 
 /// Notes an earlier run left are a request the person made, as a message is: they start the counts
