@@ -197,7 +197,7 @@ impl Check for StandinBuildCheck {
     }
     fn run(&self, cx: &mut CheckCx) -> Result<CheckResult, ToolError> {
         self.check_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (passed, note) = super::super::check::build_check(&cx.ws.app_dir(), cx.ws.app_place(), "Godot", None, Some(&self.editor), &cx.stop())?;
+        let (passed, note) = super::super::check::build_check(&cx.ws.app_dir(), cx.ws.app_place(), "Godot", None, Some(&self.editor), &cx.stop(), &[])?;
         Ok(CheckResult::new(self.id(), cx.round, passed, note))
     }
 }
