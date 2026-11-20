@@ -755,7 +755,7 @@ fn stdio_cancel_inflight_tool_call_transcript() {
 
     let buf = Buf::default();
     let reader = BufReader::new(CancelAfterPendingRead { inbox, step: 0, current: &[], pos: 0 });
-    serve(engine, ServerOptions::default(), reader, Box::new(buf.clone())).unwrap();
+    serve(engine, ServerOptions { all_tools: true, ..Default::default() }, reader, Box::new(buf.clone())).unwrap();
     let out: Vec<Value> = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
 
     assert!(out.iter().all(|m| m["id"] != json!(1)), "cancelled inflight call must not emit a response: {out:?}");
