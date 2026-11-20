@@ -100,6 +100,24 @@ fn pause_ends_a_turn_the_builder_never_ends() {
     assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled, "it ends as paused");
 }
 
+/// Pause still ends a stuck turn even when another thread holds the engine session lock.
+#[test]
+fn pause_still_ends_a_stuck_turn_while_another_thread_holds_the_engine_session() {
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Arena", "Recreate this game", TargetRef::None).unwrap();
+    let (mut w, _rx) = worker(&ws);
+    let _held = w.engine.session();
+    let stop = w.stop.clone();
+    let (done, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(w.turn(&mut ws, &mut NeverStops, "Build it.", true, None));
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    stop.cancel();
+    let result = ended.recv_timeout(STOP_GRACE + Duration::from_secs(20)).expect("Pause blocked on engine.session()");
+    assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled, "it ends as paused");
+}
+
 /// A builder that ends its turn as it should is still waited for while it works, and its own
 /// `TurnDone` is the only one the feed gets.
 #[test]

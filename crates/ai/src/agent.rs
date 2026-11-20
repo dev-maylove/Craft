@@ -995,7 +995,7 @@ fn wait_answer(rx: &Receiver<Answer>, stop: &Stop) -> Option<Answer> {
 pub struct ApiConversation {
     to_worker: Sender<Option<String>>,
     events: Receiver<AgentEvent>,
-    busy: Arc<AtomicBool>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
     stop: Stop,
     cancel: Arc<Mutex<CancelToken>>,
     waiters: Waiters,
@@ -1016,7 +1016,7 @@ impl ApiConversation {
         }
         let (etx, erx) = std::sync::mpsc::channel();
         let (wtx, wrx) = std::sync::mpsc::channel::<Option<String>>();
-        let busy = Arc::new(AtomicBool::new(false));
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stop = Stop::default();
         let cancel = Arc::new(Mutex::new(CancelToken::default()));
         let waiters: Waiters = Arc::default();
@@ -1045,7 +1045,7 @@ impl ApiConversation {
             server_windows: BTreeMap::new(),
             read_windows: BTreeMap::new(),
         };
-        let busy2 = busy.clone();
+        let in_flight2 = in_flight.clone();
         std::thread::Builder::new()
             .name("ai-agent".into())
             .spawn(move || {
@@ -1063,11 +1063,11 @@ impl ApiConversation {
                         let backend = agent.chain.get(agent.current).map(|s| s.name.clone()).unwrap_or_default();
                         let _ = etx.send(AgentEvent::TurnDone { backend, input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false });
                     }
-                    busy2.store(false, Ordering::SeqCst);
+                    in_flight2.fetch_sub(1, Ordering::SeqCst);
                 }
             })
             .map_err(|e| ToolError::internal(format!("couldn't start the AI worker: {e}")))?;
-        Ok(ApiConversation { to_worker: wtx, events: erx, busy, stop, cancel, waiters, queued: Vec::new(), resumed, failure })
+        Ok(ApiConversation { to_worker: wtx, events: erx, in_flight, stop, cancel, waiters, queued: Vec::new(), resumed, failure })
     }
 
     /// It continues a conversation kept in its transcript file.
@@ -1077,9 +1077,9 @@ impl ApiConversation {
 
     fn submit(&mut self, text: Option<String>) {
         *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        self.busy.store(true, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
         if self.to_worker.send(text).is_err() {
-            self.busy.store(false, Ordering::SeqCst);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             self.queued.push(AgentEvent::Error {
                 message: "The assistant isn't running any more.".into(),
                 remediation: Some("Start a new chat.".into()),
@@ -1128,7 +1128,7 @@ impl Conversation for ApiConversation {
     }
 
     fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::SeqCst)
+        self.in_flight.load(Ordering::SeqCst) > 0
     }
 }
 
@@ -1389,6 +1389,37 @@ pub(crate) mod tests {
         assert!(matches!(last.first(), Some(AgentEvent::Error { .. })), "{last:?}");
         assert!(matches!(last.last(), Some(AgentEvent::TurnDone { .. })), "{last:?}");
         assert!(!c.is_busy());
+    }
+
+    #[test]
+    fn two_back_to_back_turns_stay_busy_across_worker_epilogue() {
+        let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let calls = Mutex::new(0usize);
+        let script = ScriptedModel {
+            reply: Box::new(move |_| {
+                let mut n = calls.lock().unwrap();
+                *n += 1;
+                if *n == 2 {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+                Ok(ModelReply { text: "ok".into(), ..ModelReply::default() })
+            }),
+        };
+        let slot =
+            ModelSlot { name: "Fake".into(), model: Box::new(script), local: false, effort: None, max_turns: 10, context_tokens: 0, tools: Default::default() };
+        let mut c = ApiConversation::start(host, vec![slot], LoopConfig::default()).unwrap();
+        c.send("first");
+        let _ = drain_until_done(&mut c, |_, _| {});
+        c.send("second");
+        assert!(c.is_busy());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(c.is_busy(), "second turn must remain busy while running");
+        let _ = release_tx.send(());
+        let _ = drain_until_done(&mut c, |_, _| {});
     }
 
     #[test]
