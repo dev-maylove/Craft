@@ -44,8 +44,9 @@ const SLICE: Duration = Duration::from_millis(50);
 const FOCUS_WAIT: Duration = Duration::from_secs(10);
 /// How far (in screen points) the pointer may land from where it was aimed and still click.
 const POINTER_SLACK: u32 = 2;
-/// Most bytes of pictures kept inline in the evidence. All are written to `output_dir` when it's
-/// given; without it, pictures past this limit are kept nowhere.
+/// Most bytes of PNG pictures kept inline in the evidence, and so the most a session holds in
+/// memory for them: each picture is made a PNG and written to `output_dir` (when given) as it's
+/// taken, and its pixels let go. Without `output_dir`, pictures past this limit are kept nowhere.
 const MAX_INLINE: usize = 8 * 1024 * 1024;
 
 pub(super) fn spec() -> ToolSpec {
@@ -278,13 +279,77 @@ struct Stop {
     message: String,
 }
 
+/// A picture once it's been put away: its raw pixels are gone, and only the PNG kept inline (if
+/// the budget had room) and the file it was saved to (if any) are left.
 #[derive(Debug)]
 struct Taken {
     label: String,
     /// The last step done before it (0: before the script).
     after_step: usize,
     at_ms: u128,
-    shot: WindowShot,
+    width: u32,
+    height: u32,
+    /// The PNG, kept for the evidence while the inline budget lasted.
+    png: Option<Vec<u8>>,
+    /// Where it was saved.
+    path: Option<PathBuf>,
+}
+
+impl Taken {
+    /// Neither kept inline nor saved: only its label, size and time are left.
+    fn lost(&self) -> bool {
+        self.png.is_none() && self.path.is_none()
+    }
+}
+
+/// Where pictures go as they're taken, so a session never holds more than the picture it's
+/// taking plus `inline_left` bytes of PNGs, however many pictures and however large the window:
+/// each is made a PNG at once, saved to `out` when given, and kept inline only while the budget
+/// lasts.
+#[derive(Debug)]
+struct Album {
+    out: Option<PathBuf>,
+    /// Inline PNG bytes still allowed.
+    inline_left: usize,
+    pictures: Vec<Taken>,
+}
+
+impl Album {
+    fn new(out: Option<PathBuf>, inline_budget: usize) -> Self {
+        Album { out, inline_left: inline_budget, pictures: Vec::new() }
+    }
+
+    /// Put a picture away and let go of its pixels. Returns its size in pixels.
+    fn add(&mut self, label: &str, after_step: usize, at_ms: u128, shot: WindowShot, step: usize) -> Result<(u32, u32), Stop> {
+        let (width, height) = (shot.width, shot.height);
+        let png = encode_png(&Image { width, height, rgba: shot.rgba }).map_err(|e| Stop {
+            step,
+            code: "picture_failed",
+            message: format!("Couldn't make the \"{label}\" picture a PNG: {}", e.message),
+        })?;
+        let path = match &self.out {
+            Some(dir) => {
+                let path = dir.join(format!("{:02}-{label}.png", self.pictures.len()));
+                craft_anything_platform::fs::write_atomic(&path, &png).map_err(|e| Stop {
+                    step,
+                    code: "picture_not_saved",
+                    message: format!("Couldn't save {}: {}", path.display(), e.message),
+                })?;
+                Some(path)
+            }
+            None => None,
+        };
+        // Kept inline only if it fits what's left, so the total never passes the budget.
+        let png = match self.inline_left.checked_sub(png.len()) {
+            Some(left) => {
+                self.inline_left = left;
+                Some(png)
+            }
+            None => None,
+        };
+        self.pictures.push(Taken { label: label.to_string(), after_step, at_ms, width, height, png, path });
+        Ok((width, height))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -390,28 +455,30 @@ fn aim(input: &mut dyn InputSink, at: (i32, i32), step: usize) -> Result<(), Sto
     Ok(())
 }
 
-fn take(screen: &mut dyn Screen, label: &str, after_step: usize, started: Instant, step: usize) -> Result<Taken, Stop> {
+/// Picture the window and put the picture away at once. Returns its size in pixels.
+fn take(screen: &mut dyn Screen, album: &mut Album, label: &str, after_step: usize, started: Instant, step: usize) -> Result<(u32, u32), Stop> {
     let shot =
         screen.picture().map_err(|e| Stop { step, code: if e.code == ErrorCode::NotFound { "window_gone" } else { "picture_failed" }, message: e.message })?;
-    Ok(Taken { label: label.to_string(), after_step, at_ms: started.elapsed().as_millis(), shot })
+    album.add(label, after_step, started.elapsed().as_millis(), shot, step)
 }
 
 /// Bring the window to the front once (the person can click it), then play every step.
-fn play(actions: &[Action], screen: &mut dyn Screen, input: &mut dyn InputSink) -> Played {
+fn play(actions: &[Action], screen: &mut dyn Screen, input: &mut dyn InputSink, mut album: Album) -> Played {
     let started = Instant::now();
     let mut played = Played::default();
     let mut held = Held::default();
-    let result = play_steps(actions, screen, input, &mut held, &mut played, started);
+    let result = play_steps(actions, screen, input, &mut held, &mut played, &mut album, started);
     held.release(input);
     if let Err(stop) = result {
         played.stop = Some(stop);
     }
     // The end, whatever happened, while the window is still there to picture.
     if screen.running()
-        && let Ok(end) = take(screen, "end", played.done, started, played.done)
+        && let Err(stop) = take(screen, &mut album, "end", played.done, started, played.done)
     {
-        played.pictures.push(end);
+        log::warn!("no end picture: {}", stop.message);
     }
+    played.pictures = album.pictures;
     played
 }
 
@@ -421,11 +488,10 @@ fn play_steps(
     input: &mut dyn InputSink,
     held: &mut Held,
     played: &mut Played,
+    album: &mut Album,
     started: Instant,
 ) -> Result<(), Stop> {
-    let start = take(screen, "start", 0, started, 0)?;
-    let picture = (start.shot.width, start.shot.height);
-    played.pictures.push(start);
+    let picture = take(screen, album, "start", 0, started, 0)?;
     // The first input waits for the window to come to the front: it may still be opening, or
     // need the person's click.
     let mut asked = false;
@@ -481,7 +547,9 @@ fn play_steps(
                 pause(screen, Duration::from_millis(CLICK_MS), step, false)?;
                 held.release(input);
             }
-            Action::Picture(label) => played.pictures.push(take(screen, label, i, started, step)?),
+            Action::Picture(label) => {
+                take(screen, album, label, i, started, step)?;
+            }
         }
         played.done = step;
     }
@@ -577,7 +645,7 @@ fn native_input_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
     ctx.report(None, format!("Playing {} steps in \"{}\"…", actions.len(), first.title));
     let played = {
         let mut screen = LiveScreen { ctx, running: &mut running, pid };
-        play(&actions, &mut screen, input.as_mut())
+        play(&actions, &mut screen, input.as_mut(), Album::new(p.output_dir.clone(), MAX_INLINE))
     };
     drop(input);
     // Always closed again and confirmed before we return (a caller such as the CLI may exit next).
@@ -598,27 +666,7 @@ fn evidence(
     window: &WindowPlace,
     played: Played,
 ) -> Result<ToolOutput, ToolError> {
-    let mut pictures = Vec::with_capacity(played.pictures.len());
-    let mut inline_bytes = 0usize;
-    let mut locations = Vec::new();
-    for (n, taken) in played.pictures.into_iter().enumerate() {
-        let png = encode_png(&Image { width: taken.shot.width, height: taken.shot.height, rgba: taken.shot.rgba })?;
-        let mut entry =
-            json!({"label": taken.label, "after_step": taken.after_step, "at_ms": taken.at_ms, "width": taken.shot.width, "height": taken.shot.height});
-        if let Some(out) = &p.output_dir {
-            let path = out.join(format!("{:02}-{}.png", n, taken.label));
-            craft_anything_platform::fs::write_atomic(&path, &png)?;
-            locations.push(Location::new("path", path.to_string_lossy()));
-            entry["path"] = json!(path.display().to_string());
-        }
-        if inline_bytes.saturating_add(png.len()) <= MAX_INLINE
-            && let Ok(artifact) = png_artifact(&png)
-        {
-            inline_bytes = inline_bytes.saturating_add(png.len());
-            entry["screenshot"] = artifact;
-        }
-        pictures.push(entry);
-    }
+    let (pictures, lost, locations) = pictures_json(played.pictures);
     let steps: Vec<Value> = actions
         .iter()
         .enumerate()
@@ -644,10 +692,16 @@ fn evidence(
     if let Some(stop) = &played.stop {
         result["stopped"] = json!({"step": stop.step, "code": stop.code, "message": stop.message});
     }
-    let summary = match &played.stop {
+    if lost > 0 {
+        result["pictures_not_kept"] = json!(lost);
+    }
+    let mut summary = match &played.stop {
         None => format!("Played all {total} steps in \"{}\" and took {} pictures.", window.title, pictures.len()),
         Some(stop) => format!("Played {} of {total} steps in \"{}\", then stopped at step {}: {}", played.done, window.title, stop.step, stop.message),
     };
+    if lost > 0 {
+        summary.push_str(&format!(" {lost} pictures weren't kept (past the {} MiB inline limit, with no output_dir).", MAX_INLINE >> 20));
+    }
     let coverage = if played.stop.is_none() {
         Coverage::complete(total as u64)
     } else {
@@ -665,11 +719,45 @@ fn evidence(
             "Keys and clicks were sent as the system's own input. A program that reads its devices directly, or runs with more rights than this app, may ignore them: compare the pictures to see whether anything changed.",
         ))
         .limitation(Limitation::new("pictures_only", "The pictures show what the window drew after each step, not why; timing depends on how fast this computer ran the program."));
+    if lost > 0 {
+        b = b.limitation(Limitation::new(
+            "pictures_not_kept",
+            format!(
+                "{lost} pictures went past the {} MiB of pictures kept inline and weren't saved (no output_dir): they're listed without an image. Give output_dir to keep every picture.",
+                MAX_INLINE >> 20
+            ),
+        ));
+    }
     for l in locations {
         b = b.location(l);
     }
     let ev = b.build().map_err(|e| ToolError::new(ErrorCode::Internal, e.message))?;
     Ok(ToolOutput::evidence(ev))
+}
+
+/// The pictures as the evidence lists them, how many were kept nowhere, and the files saved.
+fn pictures_json(taken: Vec<Taken>) -> (Vec<Value>, usize, Vec<Location>) {
+    let mut pictures = Vec::with_capacity(taken.len());
+    let mut lost = 0usize;
+    let mut locations = Vec::new();
+    for t in taken {
+        let mut entry = json!({"label": t.label, "after_step": t.after_step, "at_ms": t.at_ms, "width": t.width, "height": t.height});
+        if t.lost() {
+            lost = lost.saturating_add(1);
+            entry["kept"] = json!(false);
+        }
+        if let Some(path) = &t.path {
+            locations.push(Location::new("path", path.to_string_lossy()));
+            entry["path"] = json!(path.display().to_string());
+        }
+        if let Some(png) = &t.png
+            && let Ok(artifact) = png_artifact(png)
+        {
+            entry["screenshot"] = artifact;
+        }
+        pictures.push(entry);
+    }
+    (pictures, lost, locations)
 }
 
 #[cfg(test)]
@@ -775,11 +863,23 @@ mod tests {
         closes_after: Option<usize>,
         slept: Duration,
         said: Vec<String>,
+        /// Pictures of this many pixels a side filled with noise, which a PNG can't shrink.
+        noisy: Option<u32>,
+        seed: u64,
     }
 
     impl FakeScreen {
         fn focused() -> Self {
-            FakeScreen { focus: vec![true], looks: 0, running: true, closes_after: None, slept: Duration::ZERO, said: Vec::new() }
+            FakeScreen {
+                focus: vec![true],
+                looks: 0,
+                running: true,
+                closes_after: None,
+                slept: Duration::ZERO,
+                said: Vec::new(),
+                noisy: None,
+                seed: 0x9e37_79b9_7f4a_7c15,
+            }
         }
     }
 
@@ -795,6 +895,17 @@ mod tests {
         fn picture(&mut self) -> Result<WindowShot, ToolError> {
             if !self.running {
                 return Err(ToolError::new(ErrorCode::NotFound, "gone"));
+            }
+            if let Some(side) = self.noisy {
+                let mut rgba = vec![0u8; (side * side * 4) as usize];
+                for b in &mut rgba {
+                    // xorshift: a new frame of noise every time
+                    self.seed ^= self.seed << 13;
+                    self.seed ^= self.seed >> 7;
+                    self.seed ^= self.seed << 17;
+                    *b = self.seed as u8;
+                }
+                return Ok(WindowShot { title: "Game".into(), app: "game".into(), width: side, height: side, rgba });
             }
             Ok(WindowShot { title: "Game".into(), app: "game".into(), width: 800, height: 600, rgba: vec![0; 800 * 600 * 4] })
         }
@@ -813,7 +924,77 @@ mod tests {
     }
 
     fn run(script: Value, screen: &mut FakeScreen, input: &mut FakeInput) -> Played {
-        play(&plan(&steps(script)).unwrap(), screen, input)
+        play(&plan(&steps(script)).unwrap(), screen, input, Album::new(None, MAX_INLINE))
+    }
+
+    /// The most pictures a script may take, plus the start and the end.
+    fn every_picture() -> Vec<Action> {
+        plan(&steps(Value::Array((0..MAX_PICTURES).map(|_| json!({"do": "picture"})).collect()))).unwrap()
+    }
+
+    fn inline_bytes(played: &Played) -> usize {
+        played.pictures.iter().filter_map(|t| t.png.as_ref()).map(Vec::len).sum()
+    }
+
+    #[test]
+    fn pictures_past_the_inline_budget_are_let_go_as_they_are_taken() {
+        // 22 frames of noise, 64 KiB of pixels each, with room inline for about three: before,
+        // every frame's pixels were held until the session ended, whatever the limit.
+        let side = 128;
+        let frame = (side * side * 4) as usize;
+        let budget = 3 * frame;
+        let mut screen = FakeScreen { noisy: Some(side), ..FakeScreen::focused() };
+        let mut input = FakeInput::default();
+        let played = play(&every_picture(), &mut screen, &mut input, Album::new(None, budget));
+        assert_eq!(played.stop, None);
+        assert_eq!(played.pictures.len(), MAX_PICTURES + 2, "every picture is still listed");
+        assert!(inline_bytes(&played) <= budget, "{} bytes kept for a budget of {budget}", inline_bytes(&played));
+        let kept = played.pictures.iter().filter(|t| t.png.is_some()).count();
+        assert!((1..=3).contains(&kept), "kept {kept} inline");
+        // The first ones are kept, the rest marked as kept nowhere.
+        assert!(played.pictures.iter().take(kept).all(|t| t.png.is_some()));
+        assert!(played.pictures.iter().skip(kept).all(Taken::lost));
+        let (json, lost, locations) = pictures_json(played.pictures);
+        assert_eq!(lost, MAX_PICTURES + 2 - kept);
+        assert!(locations.is_empty());
+        assert_eq!(json.iter().filter(|p| p["kept"] == json!(false)).count(), lost);
+        assert!(json.iter().filter(|p| p["kept"] == json!(false)).all(|p| p.get("screenshot").is_none() && p.get("path").is_none()));
+        assert_eq!(json[0]["width"], json!(side));
+    }
+
+    #[test]
+    fn with_output_dir_every_picture_is_saved_and_memory_stays_within_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let side = 128;
+        let budget = 2 * (side * side * 4) as usize;
+        let mut screen = FakeScreen { noisy: Some(side), ..FakeScreen::focused() };
+        let mut input = FakeInput::default();
+        let played = play(&every_picture(), &mut screen, &mut input, Album::new(Some(dir.path().to_path_buf()), budget));
+        assert_eq!(played.stop, None);
+        assert!(inline_bytes(&played) <= budget);
+        assert!(played.pictures.iter().all(|t| !t.lost()));
+        for (n, t) in played.pictures.iter().enumerate() {
+            let path = t.path.as_ref().unwrap();
+            assert_eq!(path, &dir.path().join(format!("{n:02}-{}.png", t.label)));
+            assert!(std::fs::metadata(path).unwrap().len() as usize >= side as usize * side as usize * 4, "noise doesn't shrink");
+        }
+        let (_, lost, locations) = pictures_json(played.pictures);
+        assert_eq!((lost, locations.len()), (0, MAX_PICTURES + 2));
+    }
+
+    #[test]
+    fn a_picture_that_cant_be_saved_stops_the_session_there() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the folder should be: nothing can be written into it.
+        let blocked = dir.path().join("pictures");
+        std::fs::write(&blocked, b"").unwrap();
+        let mut screen = FakeScreen::focused();
+        let mut input = FakeInput::default();
+        let actions = plan(&steps(json!([{"do": "keys", "keys": ["a"]}]))).unwrap();
+        let played = play(&actions, &mut screen, &mut input, Album::new(Some(blocked), MAX_INLINE));
+        let stop = played.stop.unwrap();
+        assert_eq!((stop.step, stop.code), (0, "picture_not_saved"));
+        assert!(input.sent.borrow().is_empty(), "nothing sent after the start couldn't be kept");
     }
 
     #[test]
