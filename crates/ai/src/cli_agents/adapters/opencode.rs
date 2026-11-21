@@ -22,8 +22,8 @@ impl AgentAdapter for OpenCode {
     /// `opencode run` takes no MCP flag, and V2 ignores `OPENCODE_CONFIG_CONTENT`: the server
     /// goes in a config file named by `OPENCODE_CONFIG`, which the private (`--standalone`)
     /// server merges over the person's own settings. The background service never sees it.
-    fn mcp_env(&self, mcp: &McpCommand) -> Result<Option<(&'static str, String)>, ToolError> {
-        let content = config_content(mcp);
+    fn mcp_env(&self, mcp: &McpCommand, access: Access) -> Result<Option<(&'static str, String)>, ToolError> {
+        let content = config_content(mcp, access);
         let path = std::env::temp_dir().join(config_name(&content));
         craft_anything_platform::fs::write_atomic_private(&path, content.as_bytes())?;
         Ok(Some(("OPENCODE_CONFIG", path.to_string_lossy().into_owned())))
@@ -38,8 +38,8 @@ impl AgentAdapter for OpenCode {
     /// The config file is written on the remote host itself: one `ssh` invocation checks the
     /// helper, writes the file atomically and keeps it private (piped `printf`, octal-escaped,
     /// no interactive stdin). The private (`--standalone`) server reads it there.
-    fn remote_tool_server(&self, host: &str, mcp: &McpCommand) -> Result<Option<(&'static str, String)>, ToolError> {
-        let content = config_content(mcp);
+    fn remote_tool_server(&self, host: &str, mcp: &McpCommand, access: Access) -> Result<Option<(&'static str, String)>, ToolError> {
+        let content = config_content(mcp, access);
         let name = config_name(&content);
         let line = remote_prepare_line(&name, &content);
         let output = ssh_run(host, &line, Duration::from_secs(30), None)?;
@@ -88,8 +88,17 @@ impl AgentAdapter for OpenCode {
         }
         a.extend(cx.options.args.iter().cloned());
         a.extend(["--format".into(), "json".into()]);
-        a.push(format!("{}{}", cx.preamble, cx.prompt));
         a
+    }
+
+    /// `opencode run` with no message argument reads it from stdin (V1 and V2 alike), so a long
+    /// one can't pass Windows' command-line limit (os error 206, #402).
+    fn prompt_on_stdin(&self) -> bool {
+        true
+    }
+
+    fn stdin_text(&self, preamble: &str, prompt: &str) -> String {
+        format!("{preamble}{prompt}")
     }
 
     fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
@@ -119,7 +128,9 @@ impl AgentAdapter for OpenCode {
             None => self.process(program).args(args),
         };
         let out = proc.timeout(std::time::Duration::from_secs(30)).stdout_cap(64 * 1024).run().map_err(|e| e.with_remediation(by_hand.clone()))?;
-        if out.success {
+        if out.success || session_already_gone(&out) {
+            // A session the person (or an earlier sweep) already deleted is gone: there is nothing
+            // left to pick up, so the sweep has nothing to report (#1707).
             Ok(())
         } else {
             Err(ToolError::new(
@@ -132,6 +143,14 @@ impl AgentAdapter for OpenCode {
 
     fn discards_sessions(&self) -> bool {
         true
+    }
+
+    /// OpenCode 1.x has no `--standalone` and rejects it, so it's refused before it runs (#1111).
+    fn missing_flags_error(&self) -> Option<(&'static str, &'static str)> {
+        Some((
+            "This OpenCode's `run --help` doesn't list --standalone, so it looks like OpenCode 1.x. Craft Anything needs OpenCode 2.",
+            "Install OpenCode 2 (`npm install -g @opencode/cli`) and remove the old `opencode-ai` package, or choose the OpenCode 2 program in Settings → AI.",
+        ))
     }
 
     fn parse(&self, p: &mut StreamParser, v: &Value) -> Vec<AgentEvent> {
@@ -182,8 +201,7 @@ impl AgentAdapter for OpenCode {
             }
             Some("error") => {
                 let error = v.get("error").unwrap_or(&Value::Null);
-                let data = error.get("data").unwrap_or(&Value::Null);
-                let why = data.get("message").and_then(Value::as_str).unwrap_or("the service returned no error details");
+                let why = error_text(error);
                 p.failure = Some(opencode_failure(error));
                 p.saw_result = true;
                 events.push(AgentEvent::Error { message: format!("OpenCode stopped: {why}"), remediation: None, log: None });
@@ -194,11 +212,33 @@ impl AgentAdapter for OpenCode {
     }
 }
 
-/// Our tool server's config for `mcp`: the bytes of the `OPENCODE_CONFIG` file (both local and
-/// remote runs use the same content).
-fn config_content(mcp: &McpCommand) -> String {
+/// OpenCode permission rules that keep a builder's own edit tool off Craft Anything's records
+/// (craft.json, feed.json, inbox/…, [`OWN_NAMES`] but checks/, where it keeps its notes), in
+/// either layout: app/ beside them, or the app in the project folder itself. A `--auto` builder
+/// never asks us, but a configured deny holds under `--auto`. Paths in the project are matched
+/// relative to it (the builder's folder), a whole value at a time, so each record gets its name
+/// and everything under it. Every other edit is left to OpenCode as before. Its shell isn't
+/// covered: a command can still write anywhere.
+///
+/// [`OWN_NAMES`]: craft_anything_engine::workspace::OWN_NAMES
+fn record_rules() -> Vec<Value> {
+    craft_anything_engine::workspace::OWN_NAMES
+        .iter()
+        .filter(|name| **name != "checks")
+        .flat_map(|name| [name.to_string(), format!("{name}/*")])
+        .map(|resource| json!({"action": "edit", "resource": resource, "effect": "deny"}))
+        .collect()
+}
+
+/// The bytes of the `OPENCODE_CONFIG` file (local and remote runs use the same content): our
+/// tool server for `mcp`, and for a builder, [`record_rules`].
+fn config_content(mcp: &McpCommand, access: Access) -> String {
     let command: Vec<&str> = std::iter::once(mcp.command.as_str()).chain(mcp.args.iter().map(String::as_str)).collect();
-    json!({"mcp": {MCP_NAME: {"type": "local", "command": command, "enabled": true}}}).to_string()
+    let mut config = json!({"mcp": {MCP_NAME: {"type": "local", "command": command, "enabled": true}}});
+    if matches!(access, Access::Build | Access::CleanRoomBuild) {
+        config["permissions"] = Value::Array(record_rules());
+    }
+    config.to_string()
 }
 
 /// Named by its content, so runs with the same server share one file and none is left half-written.
@@ -232,6 +272,49 @@ fn remote_prepare_line(name: &str, content: &str) -> String {
 
 /// OpenCode's JSON error carries the provider status and its own retry decision. In particular,
 /// an unclassified exit or an unsupported CLI flag cannot become retryable from display text.
+/// What an OpenCode error event says went wrong, for the person (#1225): its message; else its
+/// name and HTTP status, with the start of the provider's response body; else its own fields. The
+/// words "no error details" are only for an event with nothing in it.
+fn error_text(error: &Value) -> String {
+    /// A non-blank string value, trimmed.
+    fn text(v: Option<&Value>) -> Option<&str> {
+        v.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+    }
+    let data = error.get("data");
+    if let Some(message) = text(data.and_then(|d| d.get("message"))) {
+        return message.to_string();
+    }
+    let name = text(error.get("name"));
+    let status = data.and_then(|d| d.get("statusCode")).and_then(Value::as_u64);
+    match (name, status) {
+        (Some(name), status) => {
+            let head = status.map_or_else(|| name.to_string(), |s| format!("{name} (HTTP {s})"));
+            match text(data.and_then(|d| d.get("responseBody"))) {
+                Some(body) => format!("{head}: {}", shorten(body)),
+                None => head,
+            }
+        }
+        (None, _) if error.is_null() || error.as_object().is_some_and(serde_json::Map::is_empty) => "the service returned no error details".into(),
+        (None, _) => shorten(&error.to_string()),
+    }
+}
+
+/// Whether a failed delete means the session is already gone: `opencode session delete` exits 1
+/// saying "Session not found: ses_…" when it isn't there, which is what a sweep asked for (#1707).
+fn session_already_gone(out: &craft_anything_platform::process::Output) -> bool {
+    let said = format!("{}\n{}", out.stdout_end_text(), out.stderr_end_text()).to_lowercase();
+    said.contains("session not found") || said.contains("session does not exist")
+}
+
+/// The first 300 characters of `text`, with an ellipsis when cut.
+fn shorten(text: &str) -> String {
+    let mut out: String = text.chars().take(300).collect();
+    if text.chars().count() > 300 {
+        out.push('…');
+    }
+    out
+}
+
 fn opencode_failure(error: &Value) -> TurnFailure {
     let data = error.get("data").unwrap_or(&Value::Null);
     match error.get("name").and_then(Value::as_str) {
@@ -269,18 +352,27 @@ mod tests {
 
     fn args(builder: bool, options: &BackendOptions) -> Vec<String> {
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
-        OpenCode.args(&ArgsCx { options, prompt: "make a game", preamble: "PRE ", mcp: &mcp, resume: None, builder, reads_checked: false, question: false })
+        OpenCode.args(&ArgsCx {
+            options,
+            prompt: "make a game",
+            preamble: "PRE ",
+            mcp: &mcp,
+            resume: None,
+            builder,
+            reads_checked: false,
+            question: false,
+            message_file: None,
+        })
     }
 
     #[test]
-    fn the_prompt_goes_to_run_after_the_flags() {
-        assert_eq!(args(false, &BackendOptions::default()), ["run", "--standalone", "--format", "json", "PRE make a game"]);
+    fn the_prompt_goes_to_run_on_stdin() {
+        assert_eq!(args(false, &BackendOptions::default()), ["run", "--standalone", "--format", "json"]);
         let options =
             BackendOptions { cli_model: Some("anthropic/claude-sonnet-4-5".into()), args: vec!["--agent".into(), "build".into()], ..Default::default() };
-        assert_eq!(
-            args(true, &options),
-            ["run", "--standalone", "--auto", "--model", "anthropic/claude-sonnet-4-5", "--agent", "build", "--format", "json", "PRE make a game"]
-        );
+        assert_eq!(args(true, &options), ["run", "--standalone", "--auto", "--model", "anthropic/claude-sonnet-4-5", "--agent", "build", "--format", "json"]);
+        assert!(OpenCode.prompt_on_stdin());
+        assert_eq!(OpenCode.stdin_text("PRE ", "make a game"), "PRE make a game");
         assert!(AgentAdapters::built_in().for_agent("opencode").ids().contains(&"opencode"), "registered, not the plain adapter");
     }
 
@@ -326,6 +418,26 @@ mod tests {
         assert_eq!(p.failure.unwrap().kind, FailureKind::RateLimited);
     }
 
+    /// #1225: an error event without a message says what it does have, and "no error details" only
+    /// when it has nothing.
+    #[test]
+    fn an_error_event_without_a_message_says_what_it_has() {
+        assert_eq!(
+            error_text(&json!({"name":"APIError","data":{"statusCode":400,"responseBody":"Request is missing x-opencode-session"}})),
+            "APIError (HTTP 400): Request is missing x-opencode-session"
+        );
+        assert_eq!(error_text(&json!({"name":"UnknownError"})), "UnknownError");
+        assert_eq!(error_text(&json!({"name":"APIError","data":{"responseBody":"  "}})), "APIError");
+        assert_eq!(error_text(&json!({"data":{"message":"  the model failed  "}})), "the model failed");
+        assert_eq!(error_text(&Value::Null), "the service returned no error details");
+        assert_eq!(error_text(&json!({})), "the service returned no error details");
+        assert_eq!(error_text(&json!("plain")), "\"plain\"", "a plain error is shown, not hidden");
+        let long = "x".repeat(400);
+        let cut = error_text(&json!({"name":"APIError","data":{"responseBody":long}}));
+        assert!(cut.starts_with("APIError: ") && cut.ends_with('…'));
+        assert_eq!(cut.chars().count(), "APIError: ".len() + 300 + 1);
+    }
+
     #[test]
     fn missing_invalid_and_overflowed_costs_stay_unknown_for_the_turn() {
         let step = |cost| json!({"type":"step_finish","part":{"cost":cost,"tokens":{}}}).to_string();
@@ -363,10 +475,11 @@ mod tests {
     #[test]
     fn native_runs_get_the_tool_server_from_a_config_file() {
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
-        let (var, path) = OpenCode.mcp_env(&mcp).unwrap().unwrap();
+        let (var, path) = OpenCode.mcp_env(&mcp, Access::Build).unwrap().unwrap();
         assert_eq!(var, "OPENCODE_CONFIG");
         let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v["mcp"][MCP_NAME]["command"], json!(["craft-anything-cli", "mcp"]));
+        assert!(v["permissions"].is_array(), "the file a builder is handed has the records fenced");
         let options = BackendOptions { cli_model: Some("test/model".into()), ..Default::default() };
         assert!(OpenCode.check_native_options(&options, None).is_ok());
     }
@@ -374,13 +487,55 @@ mod tests {
     #[test]
     fn the_tool_server_config_and_name_are_stable() {
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into(), "--clean-room".into()], notes: None };
-        let content = config_content(&mcp);
-        assert_eq!(content, config_content(&mcp));
+        let content = config_content(&mcp, Access::CleanRoomBuild);
+        assert_eq!(content, config_content(&mcp, Access::CleanRoomBuild));
         assert!(content.contains("craft-anything-cli"));
         assert!(content.contains("--clean-room"));
         assert_eq!(config_name(&content), config_name(&content));
-        let other = config_content(&McpCommand { command: "other".into(), args: vec![], notes: None });
+        let other = config_content(&McpCommand { command: "other".into(), args: vec![], notes: None }, Access::CleanRoomBuild);
         assert_ne!(config_name(&content), config_name(&other));
+    }
+
+    /// OpenCode's rule matching as its permissions docs give it: `*` is any run of characters,
+    /// `/` included, against the whole path; the last matching rule wins; no match leaves the
+    /// edit as it was (`None`).
+    fn edit_effect(rules: &[Value], path: &str) -> Option<String> {
+        fn glob(p: &[u8], s: &[u8]) -> bool {
+            match p.split_first() {
+                None => s.is_empty(),
+                Some((b'*', rest)) => (0..=s.len()).any(|i| glob(rest, &s[i..])),
+                Some((c, rest)) => s.first() == Some(c) && glob(rest, &s[1..]),
+            }
+        }
+        rules
+            .iter()
+            .rev()
+            .find(|r| r["action"] == "edit" && glob(r["resource"].as_str().unwrap().as_bytes(), path.as_bytes()))
+            .map(|r| r["effect"].as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn a_builders_own_edits_cant_reach_our_records() {
+        let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
+        let rules_for = |access| serde_json::from_str::<Value>(&config_content(&mcp, access)).unwrap()["permissions"].as_array().cloned();
+        let rules = rules_for(Access::Build).expect("a builder gets rules");
+        assert_eq!(rules_for(Access::CleanRoomBuild), Some(rules.clone()), "in either mode");
+        // What #1810's builder overwrote, and the other records, in both layouts (the app in app/
+        // or in the project folder itself).
+        for record in ["inbox/build-progress.json", "craft.json", "feed.json", "investigation.cany/journal.jsonl", "reference/1.png"] {
+            assert_eq!(edit_effect(&rules, record).as_deref(), Some("deny"), "{record}");
+        }
+        for name in craft_anything_engine::workspace::OWN_NAMES.iter().filter(|n| **n != "checks") {
+            assert_eq!(edit_effect(&rules, name).as_deref(), Some("deny"), "{name}");
+        }
+        // The app, wherever it is, and the builder's notes in checks/ are left as they were.
+        for app in ["app/src/main.rs", "src/main.rs", "index.html", "checks/round-1/notes.md", "craft.json.bak", "inbox-ideas.md"] {
+            assert_eq!(edit_effect(&rules, app), None, "{app}");
+        }
+        // A chat or a question isn't a build: it gets the server alone, as before.
+        for access in [Access::Analyse, Access::CleanRoomAnalyse, Access::Question, Access::CleanRoomQuestion] {
+            assert_eq!(rules_for(access), None, "{access:?}");
+        }
     }
 
     #[test]
@@ -415,7 +570,7 @@ mod tests {
 
         let home = root.path().join("home");
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into(), "--clean-room".into()], notes: None };
-        let content = config_content(&mcp);
+        let content = config_content(&mcp, Access::Build);
         let name = config_name(&content);
         let line = remote_prepare_line(&name, &content);
 
@@ -450,7 +605,7 @@ mod tests {
     #[test]
     fn the_remote_line_needs_no_input_and_checks_the_helper_first() {
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
-        let content = config_content(&mcp);
+        let content = config_content(&mcp, Access::Build);
         let name = config_name(&content);
         let line = remote_prepare_line(&name, &content);
         assert!(line.starts_with("command -v craft-anything-cli "), "{line}");
@@ -491,6 +646,26 @@ mod tests {
         assert!(e.remediation.as_deref().unwrap_or_default().contains("opencode session delete --standalone ses_1"), "{e:?}");
     }
 
+    /// #1707: the sweep asked for a session that is already gone; a delete that says so has
+    /// done its job, while any other failure still needs reporting.
+    #[test]
+    fn a_delete_that_finds_the_session_gone_has_done_its_job() {
+        let failed = |stdout: &str, stderr: &str| craft_anything_platform::process::Output {
+            code: Some(1),
+            success: false,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration: std::time::Duration::ZERO,
+        };
+        assert!(session_already_gone(&failed("", "Session not found: ses_1")));
+        assert!(session_already_gone(&failed("session not found: ses_1\n", "")));
+        assert!(!session_already_gone(&failed("", "openCode is busy, try again")));
+    }
+
     #[test]
     fn thinking_depth_is_part_of_the_selected_model_reference() {
         for depth in crate::Effort::ALL {
@@ -499,7 +674,7 @@ mod tests {
                 let argv = args(builder, &options);
                 let model = argv.iter().position(|a| a == "--model").unwrap();
                 assert_eq!(argv[model + 1], format!("test/model#{}", depth.as_str()));
-                assert_eq!(argv.last().unwrap(), "PRE make a game");
+                assert!(!argv.iter().any(|a| a.contains("make a game")), "the message goes on stdin");
             }
         }
         let argv = args(false, &BackendOptions::default());

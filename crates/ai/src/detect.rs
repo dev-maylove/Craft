@@ -64,7 +64,7 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
         reason: if found {
             "Kimi K3.1 Pro through OpenRouter, with the OPENROUTER_API_KEY in your environment".into()
         } else {
-            "Kimi K3.1 Pro through OpenRouter: paste your OpenRouter key".into()
+            "Kimi K3.1 Pro through OpenRouter: paste your OpenRouter key (it starts with sk-or-)".into()
         },
         needs_key: !found,
     });
@@ -102,17 +102,24 @@ const NOT_CHAT: &[&str] = &["embed", "embedding", "embeddings", "embeddinggemma"
 
 /// The first model a server lists that can chat. A specialised model isn't a chat fallback.
 pub(crate) fn chat_model(models: &[String]) -> Option<String> {
+    models.iter().find(|m| can_chat(m)).cloned()
+}
+
+/// Every model a server lists that can chat, in its order.
+pub(crate) fn chat_models(models: &[String]) -> Vec<String> {
+    models.iter().filter(|m| can_chat(m)).cloned().collect()
+}
+
+/// Whether a model's name says it can chat: not an embedding, ranking or speech model.
+fn can_chat(model: &str) -> bool {
     let specialised =
         |name: &str| name.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| NOT_CHAT.contains(&token.trim_end_matches(|c: char| c.is_ascii_digit())));
-    let chats = |m: &&String| {
-        let lower = m.to_ascii_lowercase();
-        let (directory, name) = lower.rsplit_once(['/', '\\']).unwrap_or(("", lower.as_str()));
-        // A generic GGUF filename needs its model directory; arbitrary ancestors do not identify it.
-        let generic_gguf = name == "model.gguf" || name == "ggml-model.gguf" || (name.starts_with("ggml-model-") && name.ends_with(".gguf"));
-        let model_directory = directory.rsplit(['/', '\\']).next().unwrap_or_default();
-        !(specialised(name) || generic_gguf && specialised(model_directory))
-    };
-    models.iter().find(chats).cloned()
+    let lower = model.to_ascii_lowercase();
+    let (directory, name) = lower.rsplit_once(['/', '\\']).unwrap_or(("", lower.as_str()));
+    // A generic GGUF filename needs its model directory; arbitrary ancestors do not identify it.
+    let generic_gguf = name == "model.gguf" || name == "ggml-model.gguf" || (name.starts_with("ggml-model-") && name.ends_with(".gguf"));
+    let model_directory = directory.rsplit(['/', '\\']).next().unwrap_or_default();
+    !(specialised(name) || generic_gguf && specialised(model_directory))
 }
 
 /// One local server: connect, then list models.
@@ -128,7 +135,10 @@ pub fn probe_local(label: &str, base: &str) -> Option<Detected> {
         // No answer in time: it may still be loading a model.
         Err(_) => Vec::new(),
     };
-    let model = match chat_model(&models) {
+    // A model the server has loaded comes first: LM Studio's list holds every model downloaded,
+    // FastFlowLM's every model it can download, and asking for another loads or downloads it (#1434).
+    let loaded = if models.is_empty() { None } else { chat_model(&OpenAi::compatible(label, base, None, "").loaded_models(Duration::from_millis(700))) };
+    let model = match loaded.or_else(|| chat_model(&models)) {
         Some(model) => model,
         None if models.is_empty() => String::new(),
         None => return None,
@@ -512,6 +522,33 @@ mod tests {
         assert_eq!(chat_model(&[]), None);
         let url = crate::tests::serve("200 OK", r#"{"object":"list","data":[{"id":"nomic-embed-text:latest"},{"id":"gemma3:4b"}]}"#);
         assert_eq!(probe_local("Ollama", &url).unwrap().suggestion.model, "gemma3:4b");
+    }
+
+    /// #1434: LM Studio lists every model downloaded and FastFlowLM every model it can download;
+    /// Look for AI offers the one loaded (`/api/ps`, or LM Studio's `/api/v0/models`), and the
+    /// first chat model listed only when nothing says what's loaded.
+    #[test]
+    fn look_for_ai_offers_the_loaded_model() {
+        use crate::tests::serve_routes;
+        const LISTED: &str = r#"{"object":"list","data":[{"id":"deepseek-r1:8b"},{"id":"gemma3:1b"},{"id":"qwen3:8b"}]}"#;
+        let flm = serve_routes(&[("/v1/models", LISTED), ("/api/ps", r#"{"models":[{"name":"qwen3:8b","model":"qwen3:8b"}]}"#)]);
+        assert_eq!(probe_local("FastFlowLM", &flm).unwrap().suggestion.model, "qwen3:8b");
+        let studio = serve_routes(&[
+            ("/v1/models", LISTED),
+            (
+                "/api/v0/models",
+                r#"{"object":"list","data":[
+                    {"id":"deepseek-r1:8b","type":"llm","state":"not-loaded"},
+                    {"id":"nomic-embed-text","type":"embeddings","state":"loaded"},
+                    {"id":"gemma3:1b","type":"vlm","state":"loaded"}]}"#,
+            ),
+        ]);
+        assert_eq!(probe_local("LM Studio", &studio).unwrap().suggestion.model, "gemma3:1b", "loaded, and not the embedding model");
+        // Ollama with nothing running, and a server that answers neither: the first chat model.
+        let idle = serve_routes(&[("/v1/models", LISTED), ("/api/ps", r#"{"models":[]}"#)]);
+        assert_eq!(probe_local("Ollama", &idle).unwrap().suggestion.model, "deepseek-r1:8b");
+        let plain = serve_routes(&[("/v1/models", LISTED)]);
+        assert_eq!(probe_local("llama.cpp server", &plain).unwrap().suggestion.model, "deepseek-r1:8b");
     }
 
     #[test]

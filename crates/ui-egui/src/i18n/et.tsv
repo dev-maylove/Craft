@@ -1,5 +1,6 @@
 # et: original Estonian UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Default (its own settings)	Vaikimisi (oma seaded)
 OpenCode default	OpenCode'i vaikimisi
 Model default	Mudeli vaikimisi
 Thinking depth	Mõtlemise sügavus
@@ -304,6 +305,7 @@ Couldn't look through that folder.	Seda kausta ei õnnestunud läbi vaadata.
 Couldn't open it.	Seda ei õnnestunud avada.
 Couldn't open the folder.	Kausta ei õnnestunud avada.
 Couldn't open {}: {}	Ei õnnestunud avada {}: {}
+Couldn't save your settings.	Seadeid ei õnnestunud salvestada.
 Couldn't start a worker thread: {e}	Töölõime ei õnnestunud käivitada: {e}
 Couldn't start it.	Seda ei õnnestunud käivitada.
 Coverage unknown	Katvus teadmata
@@ -696,6 +698,7 @@ Medium	Keskmine
 Memory for Ghidra	Mälu Ghidrale
 Minimise	Minimeeri
 Mode	Režiim
+Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it.	Suurem või väiksem tekst: Ctrl/⌘ + ja Ctrl/⌘ −. Ctrl/⌘ 0 taastab suuruse.
 Model	Mudel
 Model options	Mudeli valikud
 Model: {model}	Mudel: {model}
@@ -894,6 +897,7 @@ Read a Unity game's IL2CPP metadata	Loe Unity mängu IL2CPP metaandmeid
 Read a game's files	Loe mängu faile
 Read a project file	Loe projektifaili
 Read a setting	Loe seadet
+Read a text file	Loe tekstifaili
 Read an app's screen	Loe rakenduse ekraani
 Read bytes	Loe baite
 Read comment	Loe kommentaari
@@ -986,6 +990,7 @@ Saved in	Salvestatud asukohta
 Saves space: copies the program and code, and shares dependencies and media with the project. A shared file rewritten in place changes here too.	Säästab ruumi: kopeerib programmi ja koodi ning jagab projekti sõltuvusi ja meediat. Kohapeal üle kirjutatud jagatud fail muutub ka siin.
 Say what you want	Ütle, mida soovid
 Say what you want first.	Ütle esmalt, mida soovid.
+This applies once you choose something to recreate above.	See kehtib, kui valid ülal, mida uuesti luua.
 Say what you want to make, or drop an app or file on the window to look inside it. Everything runs in Clean room mode unless you switch on Deep.	Ütle, mida soovid luua, või lohista rakendus või fail aknale, et sisse vaadata. Kõik töötab puhta ruumi režiimis, kuni lülitad sisse sügava.
 Screenshot	Ekraanipilt
 Screenshot a page	Tee lehest ekraanipilt
@@ -1191,6 +1196,7 @@ Use the projects folder	Kasuta projektide kausta
 Use this	Kasuta seda
 Use {name}	Kasuta {name}
 Value flow	Väärtuste voog
+About	Teave
 Version	Versioon
 Waiting	Ootab
 Waiting for another build to finish: this one starts next.	Ootab teise ehituse lõppu: see algab järgmisena.
@@ -1366,6 +1372,7 @@ your files there are the app, edited in place	sinu failid seal on rakendus, mida
 {name} builds what you make; answers come from {brain}.	{name} ehitab selle, mida lood; vastused tulevad allikast {brain}.
 {name} can't be attached: a message takes pictures up to 20 MB.	{name} ei saa manustada: sõnum võtab pilte kuni 20 MB.
 {name} can't be attached: it isn't a PNG, JPEG, GIF or WebP picture.	{name} ei saa manustada: see pole PNG-, JPEG-, GIF- ega WebP-pilt.
+{name} can't be kept to only reading, so it isn't asked questions. Ask with Claude Code, or with an AI that has an API key.	{name} ei saa piirata ainult lugemisega, seega talt küsimusi ei küsita. Küsi Claude Code'iga või AI-ga, millel on API-võti.
 {name} is ready	{name} on valmis
 {name} is ready.	{name} on valmis.
 {name} isn't available yet in this build.	{name} pole selles ehituses veel saadaval.
@@ -1445,6 +1452,7 @@ Zoom	Suumi
 Bring all to front	Too kõik ette
 Drag to give the plan more or less room; double-click to reset	Lohista, et anda plaanile rohkem või vähem ruumi; lähtestamiseks tee topeltklõps
 Copy the message	Kopeeri sõnum
+Copy the version	Kopeeri versioon
 Choose what the builder's approvals get	Määra ehitaja kinnituste käitumine
 Reading the web	Veebist lugemine
 Other commands	Muud käsud
@@ -1463,3 +1471,36 @@ In this project, {kind}: {choice}.	Selles projektis {kind}: {choice}.
 Couldn't change the approvals:	Kinnitusi ei õnnestunud muuta:
 What the builder may do without asking you, in this project.	Mida ehitaja tohib selles projektis sinult küsimata teha.
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	Vaikimisi järgib automaatrežiimi: kui see on sees, tehakse tagasipööratavad toimingud ära ja ülejäänud keeldutakse; kui see on väljas, küsib ehitaja.
+Connecting to {name}… {seconds} s	Ühendamine: {name}… {seconds} s
+Stopped adding {name}.	{name} lisamine peatati.
+It isn't there any more, so {program} runs in its place.	Seda pole enam seal, nii et selle asemel käivitub {program}.
+Use it	Kasuta seda
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	Selle rakenduse versiooni haldab ArtCraft Launcher. Muuda versiooni seal.
+Check again	Kontrolli uuesti
+Check for Updates	Otsi uuendusi
+Check for Updates…	Otsi uuendusi…
+Checking for updates…	Uuenduste otsimine…
+Couldn't check for updates: {error}	Uuendusi ei saanud kontrollida: {error}
+Downloading and verifying the update…	Uuenduse allalaadimine ja kontrollimine…
+No installer is available for this platform.	Sellele platvormile pole paigaldajat saadaval.
+Releases	Väljalasked
+Save your work and stop running tasks before installing an update.	Enne uuenduse paigaldamist salvesta töö ja peata töötavad ülesanded.
+The update failed: {error}	Uuendamine nurjus: {error}
+The update worker stopped unexpectedly. Try checking again.	Uuendamisprotsess peatus ootamatult. Proovi uuesti kontrollida.
+This installation is managed externally. Update it with its package manager or open Releases.	Seda paigaldust hallatakse väliselt. Uuenda seda paketihalduriga või ava Väljalasked.
+Update and restart	Uuenda ja taaskäivita
+Update ready. Restarting…	Uuendus on valmis. Taaskäivitamine…
+Updated to {version}.	Uuendatud versioonile {version}.
+Use Releases or your package manager to update this installation.	Selle paigalduse uuendamiseks kasuta Väljalaskeid või paketihaldurit.
+You're up to date.	Sul on uusim versioon.
+{version} is available.	Saadaval on {version}.
+Forget a website sign-in	Unusta veebisaidi sisselogimine
+Sign in to a website	Logi veebisaidile sisse
+Some shared files could not be hard-linked and were copied instead ({size}).	Mõnda jagatud faili ei saanud kõvasti linkida ja need kopeeriti ({size}).
+This server lists several chat models. Choose one:	See server pakub mitut vestlusmudelit. Vali üks:
+Choose a model	Vali mudel
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

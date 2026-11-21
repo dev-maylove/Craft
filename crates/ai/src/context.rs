@@ -19,7 +19,7 @@ pub const CLOUD_CONTEXT_TOKENS: u64 = 150_000;
 /// The same for a local model, whose context is usually small.
 pub const LOCAL_CONTEXT_TOKENS: u64 = 24_000;
 /// The version of `transcript.json`.
-pub const TRANSCRIPT_VERSION: u32 = 1;
+pub const TRANSCRIPT_VERSION: u32 = 2;
 
 /// What the model is asked when the oldest part of a conversation is replaced.
 pub const SUMMARY_REQUEST: &str = "The conversation is getting too long to continue. Write a summary of the work so far that you can carry on from without the earlier messages: the task, what has been done (files made or changed, commands that worked), decisions and the reasons for them, what is left to do, and anything the person asked for. Be specific and complete; leave out pleasantries. Don't call any tools.";
@@ -37,6 +37,9 @@ pub fn estimate_tokens(history: &[Msg]) -> u64 {
             Block::ToolUse { input, name, .. } => name.len() + input.to_string().len(),
             Block::ToolExtra { extra, .. } => extra.to_string().len(),
             Block::ToolResult { content, .. } => content.len(),
+            // A picture's size in a model's context doesn't follow its bytes.
+            Block::Image { name, data, .. } if data.is_empty() => Block::image_note(name).len(),
+            Block::Image { .. } => (crate::model::IMAGE_TOKENS * 4) as usize,
         })
         .sum();
     (chars / 4) as u64
@@ -50,8 +53,8 @@ pub fn estimate_overhead(system: &str, tools: &[crate::model::ToolDef]) -> u64 {
     ((system.len() + tool_chars) / 4) as u64
 }
 
-/// Shorten tool results and drop reasoning in all but the last [`KEEP_RECENT`] messages. Returns
-/// how many blocks changed.
+/// Shorten tool results, drop reasoning and replace pictures by their note in all but the last
+/// [`KEEP_RECENT`] messages. Returns how many blocks changed.
 pub fn trim_old(history: &mut [Msg]) -> usize {
     let end = history.len().saturating_sub(KEEP_RECENT);
     let mut changed = 0;
@@ -61,6 +64,13 @@ pub fn trim_old(history: &mut [Msg]) -> usize {
         m.blocks.retain(|b| !matches!(b, Block::Thinking { .. } | Block::RedactedThinking { .. }));
         changed += before - m.blocks.len();
         for b in &mut m.blocks {
+            if let Block::Image { name, data, .. } = b
+                && !data.is_empty()
+            {
+                *b = Block::Text { text: Block::image_note(name) };
+                changed += 1;
+                continue;
+            }
             if let Block::ToolResult { content, .. } = b
                 && content.len() > TRIMMED_KEEP + 100
                 && !content.ends_with(TRIMMED_NOTE)
@@ -122,21 +132,31 @@ pub fn push_user_text(history: &mut Vec<Msg>, text: &str) {
 #[derive(Serialize, Deserialize)]
 struct Transcript {
     version: u32,
+    /// The mode the conversation ran in (`true`: Deep). A transcript saved before this field was
+    /// kept counts as Deep: resuming it in Clean room could carry what it read there.
+    #[serde(default = "deep_by_default")]
+    deep: bool,
     history: Vec<Msg>,
 }
 
-/// Write the conversation to `path`.
-pub fn save(path: &Path, history: &[Msg]) -> Result<(), ToolError> {
-    let text = serde_json::to_vec(&Transcript { version: TRANSCRIPT_VERSION, history: history.to_vec() })
+/// A transcript saved before the mode was kept may have read the original, so it counts as Deep.
+fn deep_by_default() -> bool {
+    true
+}
+
+/// Write the conversation to `path`, recording the mode it ran in.
+pub fn save(path: &Path, history: &[Msg], deep: bool) -> Result<(), ToolError> {
+    let text = serde_json::to_vec(&Transcript { version: TRANSCRIPT_VERSION, deep, history: history.to_vec() })
         .map_err(|e| ToolError::internal(format!("couldn't write the transcript: {e}")))?;
     craft_anything_engine::project::write_atomic(path, &text)
 }
 
-/// A saved conversation, ready to continue: `None` when there is none, it's unreadable or from a
-/// newer version. An unfinished step at the end (tool calls without results) is dropped.
-pub fn load(path: &Path) -> Option<Vec<Msg>> {
+/// A saved conversation, ready to continue in `deep` mode: `None` when there is none, it's
+/// unreadable, from a newer version, or from the other mode. An unfinished step at the end (tool
+/// calls without results) is dropped.
+pub fn load(path: &Path, deep: bool) -> Option<Vec<Msg>> {
     let t: Transcript = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    if t.version > TRANSCRIPT_VERSION {
+    if t.version > TRANSCRIPT_VERSION || t.deep != deep {
         return None;
     }
     let mut h = t.history;
@@ -215,21 +235,78 @@ mod tests {
         assert!(r.last().unwrap().text().contains("summary"));
     }
 
+    /// A conversation continues with its unfinished last step dropped; a newer or unreadable
+    /// file is left alone.
     #[test]
     fn transcripts_resume_without_an_unfinished_step() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("transcript.json");
-        assert!(load(&p).is_none());
+        assert!(load(&p, true).is_none());
         let mut h = convo(2);
         h.push(step(9, "")[0].clone());
-        save(&p, &h).unwrap();
-        let back = load(&p).unwrap();
+        save(&p, &h, true).unwrap();
+        let back = load(&p, true).unwrap();
         assert_eq!(back.len(), h.len() - 1, "the call without a result is dropped");
         assert!(well_formed(&back));
         let mut back = back;
         push_user_text(&mut back, "Make it blue");
         assert_eq!(back.len(), h.len() - 1, "joined to the last tool results");
-        std::fs::write(&p, r#"{"version":99,"history":[]}"#).unwrap();
-        assert!(load(&p).is_none(), "a newer version is left alone");
+        std::fs::write(&p, b"not a transcript").unwrap();
+        assert!(load(&p, true).is_none(), "an unreadable transcript is left alone");
+        std::fs::write(&p, r#"{"version":99,"deep":true,"history":[]}"#).unwrap();
+        assert!(load(&p, true).is_none(), "a newer version is left alone");
+    }
+
+    /// R2.9: a transcript carries the mode it ran in, so Clean room can't continue a Deep one.
+    #[test]
+    fn a_transcript_is_resumed_only_in_the_mode_that_saved_it() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("transcript.json");
+        let h = convo(1);
+        save(&p, &h, true).unwrap();
+        assert!(load(&p, true).is_some(), "the mode that saved it continues it");
+        assert!(load(&p, false).is_none(), "a Deep transcript isn't resumed in Clean room");
+        save(&p, &h, false).unwrap();
+        assert!(load(&p, false).is_some(), "a Clean room transcript continues there");
+        assert!(load(&p, true).is_none(), "and isn't resumed in Deep");
+    }
+
+    /// A version-1 transcript was saved before the mode was kept: it counts as Deep, so only a
+    /// Deep run resumes it.
+    #[test]
+    fn a_transcript_saved_before_the_mode_was_kept_is_only_resumed_in_deep() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("transcript.json");
+        let text = serde_json::to_vec(&json!({"version": 1, "history": convo(1)})).unwrap();
+        std::fs::write(&p, text).unwrap();
+        assert!(load(&p, true).is_some());
+        assert!(load(&p, false).is_none(), "an old transcript may have read the original");
+    }
+
+    #[test]
+    fn pictures_count_toward_the_budget_and_old_ones_are_trimmed_to_a_note() {
+        let png = b"\x89PNG\r\n\x1a\n".repeat(10_000);
+        let picture = || Block::image("now.png", &png).unwrap();
+        let shown = |text: &str| Msg { role: Speaker::User, blocks: vec![Block::Text { text: text.into() }, picture()] };
+        // A picture is counted as a picture, not by its 80 kB of base64.
+        assert_eq!(estimate_tokens(&[shown("")]), crate::model::IMAGE_TOKENS);
+        let mut h = vec![shown("Like this")];
+        h.extend(convo(KEEP_RECENT));
+        h.push(shown("Now like this"));
+        let changed = trim_old(&mut h);
+        assert!(changed > 0);
+        assert_eq!(h[0].blocks[1], Block::Text { text: Block::image_note("now.png") }, "an old picture becomes its note");
+        assert!(matches!(&h.last().unwrap().blocks[1], Block::Image { data, .. } if !data.is_empty()), "a recent one is kept");
+        assert!(well_formed(&h));
+        assert_eq!(trim_old(&mut h), 0, "nothing more to trim the second time");
+
+        // A resumed conversation knows a picture was there, but not its bytes, and counts its note.
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("transcript.json");
+        save(&p, &[shown("Like this")], true).unwrap();
+        assert!(std::fs::metadata(&p).unwrap().len() < 1000, "the bytes aren't saved");
+        let back = load(&p, true).unwrap();
+        assert!(matches!(&back[0].blocks[1], Block::Image { name, data, .. } if name == "now.png" && data.is_empty()));
+        assert_eq!(estimate_tokens(&back), (("Like this".len() + Block::image_note("now.png").len()) / 4) as u64);
     }
 }
