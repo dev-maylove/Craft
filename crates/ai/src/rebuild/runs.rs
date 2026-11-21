@@ -110,6 +110,9 @@ impl RunSet {
                 ToolError::new(ErrorCode::BadInput, "This project is already building.").with_remediation("Add to it while it works, or stop it first.")
             );
         }
+        // The copy the caller holds may predate a builder saved since. `poll` reloads before it
+        // resolves; do the same here. An explicit `opts.backend` still wins over the saved one.
+        let ws = Workspace::open(&ws.root).unwrap_or(ws);
         // Resolved once. A later reachability change cannot make admission and startup disagree.
         // No builder at all still reaches the starter when a place is free: that is where a real
         // run reports the error, and a stand-in run does not need one.
@@ -522,6 +525,46 @@ mod tests {
         let root = b.root.clone();
         assert!(set.start(&hub, b, RunOptions::default()).is_err());
         assert_eq!(set.position(&root), None);
+    }
+
+    /// A builder saved after the caller loaded the project is the one an immediate start uses.
+    /// An explicit `opts.backend` is not replaced by that save.
+    #[test]
+    fn an_immediate_start_reads_the_builder_saved_since_the_workspace_was_loaded() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "A", "A game", TargetRef::None).unwrap();
+        ws.set_person(|m| m.builder = Some("Agent".into())).unwrap();
+        let loaded = Workspace::open(&ws.root).unwrap();
+        Workspace::open(&ws.root).unwrap().set_person(|m| m.builder = Some("Key".into())).unwrap();
+        assert_eq!(loaded.manifest.builder.as_deref(), Some("Agent"));
+
+        let hub = two_backends();
+        let fake = StandIns::new();
+        let seen = Arc::new(Mutex::new(None));
+        let seen_in = seen.clone();
+        let mut inner = fake.starter();
+        let starter: Starter = Box::new(move |hub, ws, opts| {
+            *seen_in.lock().unwrap() = opts.backend.clone();
+            inner(hub, ws, opts)
+        });
+        let mut set = RunSet::new(1).with_starter(starter);
+        assert_eq!(set.start(&hub, loaded, RunOptions::default()).unwrap(), Started::Running);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("Key"));
+
+        let mut other = Workspace::create(d.path(), "B", "A game", TargetRef::None).unwrap();
+        other.set_person(|m| m.builder = Some("Key".into())).unwrap();
+        let loaded_other = Workspace::open(&other.root).unwrap();
+        let mut set = RunSet::new(1).with_starter({
+            let seen_in = seen.clone();
+            let mut inner = StandIns::new().starter();
+            Box::new(move |hub, ws, opts| {
+                *seen_in.lock().unwrap() = opts.backend.clone();
+                inner(hub, ws, opts)
+            })
+        });
+        let explicit = RunOptions { backend: Some("Agent".into()), ..RunOptions::default() };
+        assert_eq!(set.start(&hub, loaded_other, explicit).unwrap(), Started::Running);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("Agent"));
     }
 
     /// An unnamed local_first choice is made once: the run that starts is given that name, and a
