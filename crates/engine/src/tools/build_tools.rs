@@ -29,7 +29,7 @@ const MAX_ENTRIES: usize = 2_000;
 const OUTPUT_TAIL: usize = 24 * 1024;
 /// Folders of build output and dependencies that listings and searches don't go into.
 const SKIP: [&str; 9] = ["node_modules", "target", "vendor", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
-/// Most files and folders one search visits.
+/// Most folder entries one search reads (skipped and failed ones too).
 const MAX_SEARCHED: usize = 20_000;
 /// Longest piece of a matching line a search returns.
 const MATCH_LINE: usize = 300;
@@ -338,36 +338,23 @@ fn build_files_search(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     let limit = p.limit.unwrap_or(50).clamp(1, 200);
     let mut matches = Vec::new();
     let mut more = false;
-    let mut searched = 0usize;
-    // Folders that couldn't be listed: the search didn't see what's in them.
+    let mut left = MAX_SEARCHED;
+    // Folders that couldn't be listed in full: the search didn't see what's in them.
     let mut unreadable = Vec::new();
     let mut stack = vec![root.clone()];
     'walk: while let Some(path) = stack.pop() {
-        if searched == MAX_SEARCHED {
-            more = true;
-            break;
-        }
-        searched += 1;
         if path.is_dir() {
             let Ok(dir) = std::fs::read_dir(&path) else {
                 unreadable.push(shown(&ws, &path));
                 continue;
             };
-            // Entries already queued count against the budget too, so one huge folder can't
-            // outgrow it.
-            let room = MAX_SEARCHED.saturating_sub(searched + stack.len());
-            let mut items = Vec::new();
-            for e in dir {
-                match e {
-                    Ok(_) if items.len() == room => {
-                        more = true;
-                        break;
-                    }
-                    Ok(e) => items.push(e),
-                    Err(_) => unreadable.push(shown(&ws, &path)),
-                }
+            let (mut items, failed, cut) = take_entries(dir, &mut left);
+            if failed {
+                unreadable.push(shown(&ws, &path));
             }
-            // Popped from the end, so reversed to search in name order.
+            more |= cut;
+            // Popped from the end, so reversed to search in name order (a cut folder keeps the
+            // entries the system listed first).
             items.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
             for e in items {
                 let name = e.file_name();
@@ -398,12 +385,29 @@ fn build_files_search(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
             matches.push(json!({"path": shown(&ws, &path), "offset": offset, "text": shown_line}));
         }
     }
-    unreadable.dedup();
     let mut v = json!({"root": shown(&ws, &root), "matches": matches, "more": more});
     if !unreadable.is_empty() {
         v["unreadable"] = json!(unreadable);
     }
     Ok(ToolOutput::Value(v))
+}
+
+/// Take a folder's entries while `left` allows, each read (a failed one too) counting against it.
+/// Returns them, whether any read failed, and whether entries were left unread.
+fn take_entries<T>(mut entries: impl Iterator<Item = std::io::Result<T>>, left: &mut usize) -> (Vec<T>, bool, bool) {
+    let (mut taken, mut failed) = (Vec::new(), false);
+    loop {
+        if *left == 0 {
+            // One more read says whether there was more.
+            return (taken, failed, entries.next().is_some());
+        }
+        let Some(e) = entries.next() else { return (taken, failed, false) };
+        *left -= 1;
+        match e {
+            Ok(e) => taken.push(e),
+            Err(_) => failed = true,
+        }
+    }
 }
 
 /// Read a project file a builder can hold in memory, with a plain error for one over the cap.
@@ -575,6 +579,19 @@ mod tests {
 
     /// #2251: a builder that can only find byte offsets rereads the same page until it runs out
     /// of steps. A search gives the line, and reading at it shows the match.
+    #[test]
+    fn a_folder_listing_stops_reading_at_the_budget() {
+        let reads = std::cell::Cell::new(0);
+        let entries = std::iter::repeat_with(|| {
+            reads.set(reads.get() + 1);
+            Err::<(), _>(std::io::Error::other("unreadable"))
+        });
+        let mut left = 5;
+        let (taken, failed, cut) = take_entries(entries.take(100_000), &mut left);
+        assert!(taken.is_empty() && failed && cut && left == 0);
+        assert!(reads.get() < 10, "{} reads for a budget of 5", reads.get());
+    }
+
     #[test]
     fn a_search_finds_the_line_a_read_then_opens() {
         let (_d, ws, e) = building();
