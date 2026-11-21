@@ -63,6 +63,10 @@ impl CraftApp {
         if request.is_empty() {
             return;
         }
+        // A study started now would open the site signed out, or find its sign-in busy.
+        if self.signing_in.is_some() {
+            return self.toast(tr("Finish signing in to the site first."), true);
+        }
         // Who builds and who extracts are read when the build starts: a choice still being
         // saved goes first, and the build starts once it is (not if it fails).
         if self.roles_saving() {
@@ -1178,12 +1182,14 @@ fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
             }
         }
         // How long it has worked and what the AI has used, live while it builds.
-        if let Some(u) = app.usage.get(&ws.root).filter(|u| u.working() || !u.elapsed().is_zero()) {
+        if let Some(u) = app.usage.get(&ws.root).filter(|u| u.shown()) {
             ui.add_space(theme::space::LG);
-            let tip = || crate::usage::explain(&u.saved, "Every build of this project.");
-            widgets::stat_row(ui, "Time spent", &crate::usage::duration_words(u.elapsed()));
-            if u.saved.priced {
-                let cost = crate::usage::cost_stat(&u.saved);
+            let tip = || u.explain("Every build of this project.");
+            let time = widgets::stat_row(ui, "Time spent", &u.time_words());
+            if u.unreadable {
+                time.on_hover_text(tip());
+            }
+            if let Some(cost) = u.cost() {
                 widgets::stat_row(ui, cost.label, &cost.value).on_hover_text(tip());
                 // Said outright, not only on hover: on a subscription this isn't what they pay.
                 if let Some(note) = cost.note {
@@ -1198,8 +1204,7 @@ fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
                     );
                 }
             }
-            if u.saved.tokens() > 0 || u.saved.tokens_incomplete {
-                let usage = crate::usage::token_total(&u.saved, false);
+            if let Some(usage) = u.tokens() {
                 widgets::stat_row(ui, "Tokens", &usage).on_hover_text(tip());
             }
             if u.working() {
