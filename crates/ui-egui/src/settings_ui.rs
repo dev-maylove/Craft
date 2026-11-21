@@ -208,7 +208,7 @@ fn general(app: &mut CraftApp, ui: &mut Ui) {
     }
     row(ui, "When a folder you pick has files", "Whether they're the app to edit in place, or material the app starts from beside them.", |ui| {
         let current = crate::folders::EXISTING_CHOICES.iter().find(|(_, v)| *v == app.settings.existing_files).map_or("Ask each time", |(l, _)| *l);
-        widgets::dropdown("existing-files").selected_text(tr(current)).show_ui(ui, |ui| {
+        let response = widgets::dropdown("existing-files").selected_text(tr(current)).show_ui(ui, |ui| {
             for (label, value) in crate::folders::EXISTING_CHOICES {
                 if widgets::menu_item(ui, app.settings.existing_files == value, tr(label)).clicked() {
                     app.settings.existing_files = value;
@@ -216,6 +216,7 @@ fn general(app: &mut CraftApp, ui: &mut Ui) {
                 }
             }
         });
+        response.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, tr("When a folder you pick has files")));
     });
     row(ui, "Theme", "", |ui| {
         // System first: it's the default, and the other two are what it picks between.
@@ -248,7 +249,7 @@ fn language(app: &mut CraftApp, ui: &mut Ui) {
     row(ui, "Language", "", |ui| {
         let selected = (!app.settings.language.trim().is_empty()).then(|| crate::i18n::language_from_tag(&app.settings.language).unwrap_or("en"));
         let current = LANGUAGES.iter().find(|l| Some(l.code) == selected).map(|l| l.name).unwrap_or("System");
-        widgets::dropdown("lang").selected_text(tr(current)).show_ui(ui, |ui| {
+        let response = widgets::dropdown("lang").selected_text(tr(current)).show_ui(ui, |ui| {
             if widgets::menu_item(ui, app.settings.language.trim().is_empty(), tr("System")).clicked() {
                 app.settings.language.clear();
                 crate::i18n::set_language("");
@@ -262,6 +263,7 @@ fn language(app: &mut CraftApp, ui: &mut Ui) {
                 }
             }
         });
+        response.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, tr("Language")));
     });
 }
 
@@ -358,7 +360,8 @@ fn model_options_loading(ui: &mut Ui, backend: &str) {
     ui.add_enabled_ui(false, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(tr("Context window"));
-            widgets::dropdown(("model-context", backend)).selected_text(tr("Default")).show_ui(ui, |_| {});
+            let response = widgets::dropdown(("model-context", backend)).selected_text(tr("Default")).show_ui(ui, |_| {});
+            widgets::named(response.response, "Context window");
         });
     });
 }
@@ -574,13 +577,14 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                                             m.to_string()
                                         }
                                     };
-                                    widgets::dropdown(("model", &b.name)).selected_text(shown(&picked)).show_ui(ui, |ui| {
+                                    let response = widgets::dropdown(("model", &b.name)).selected_text(shown(&picked)).show_ui(ui, |ui| {
                                         for m in models {
                                             if widgets::menu_item(ui, *m == picked, shown(m)).clicked() && *m != picked {
                                                 chosen_model = Some((b.name.clone(), m.clone()));
                                             }
                                         }
                                     });
+                                    widgets::named(response.response, "Model");
                                     if widgets::caption_link(ui, "Cancel").clicked() {
                                         close_picker = true;
                                     }
@@ -589,7 +593,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                             if !effort_levels.is_empty() {
                                 ui.label(RichText::new(tr("Effort:")).color(t.text_faint).size(theme::CAPTION));
                                 let shown = effort.map_or("default", craft_anything_ai::Effort::as_str);
-                                widgets::dropdown(("effort", &b.name)).selected_text(shown).show_ui(ui, |ui| {
+                                let response = widgets::dropdown(("effort", &b.name)).selected_text(shown).show_ui(ui, |ui| {
                                     // Claude always has a level; an OpenAI-style API is sent none until one is chosen.
                                     let unset = (effort_levels != craft_anything_ai::Effort::ALL).then_some(None);
                                     for e in unset.into_iter().chain(effort_levels.iter().map(|&e| Some(e))) {
@@ -599,6 +603,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                                         }
                                     }
                                 });
+                                widgets::named(response.response, "Effort:");
                             }
                         });
                     }
@@ -614,12 +619,13 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                                             .and_then(|value| choices.context.iter().find(|choice| choice.value == value))
                                             .map(|choice| tr(&choice.label))
                                             .unwrap_or_else(|| tr("Default"));
-                                        widgets::dropdown(("model-context", &b.name)).selected_text(label).show_ui(ui, |ui| {
+                                        let response = widgets::dropdown(("model-context", &b.name)).selected_text(label).show_ui(ui, |ui| {
                                             changed |= widgets::menu_choice(ui, &mut draft.context, None, tr("Default"));
                                             for choice in &choices.context {
                                                 changed |= widgets::menu_choice(ui, &mut draft.context, Some(choice.value), tr(&choice.label));
                                             }
                                         });
+                                        widgets::named(response.response, "Context window");
                                     });
                                 });
                                 if changed {
@@ -1110,7 +1116,7 @@ fn builds(app: &mut CraftApp, ui: &mut Ui) {
     let table = craft_anything_engines::assets::Catalogue::built_in();
     row(ui, "Picture model", "What pictures and textures are made with.", |ui| {
         let current = table.image_model(a.image_model.as_deref()).or_else(|_| table.image_model(None)).map(|m| m.name.clone()).unwrap_or_default();
-        widgets::dropdown("image-model").selected_text(current).show_ui(ui, |ui| {
+        let response = widgets::dropdown("image-model").selected_text(current).show_ui(ui, |ui| {
             for m in table.images() {
                 let price = crate::usage::asset_cost_words(m.cost(craft_anything_engines::assets::Shape::Square));
                 let label = format!("{} · {} {}", m.name, price, tr("a picture"));
@@ -1121,6 +1127,7 @@ fn builds(app: &mut CraftApp, ui: &mut Ui) {
                 }
             }
         });
+        widgets::named(response.response, "Picture model");
     });
     if changed {
         app.settings_changed();

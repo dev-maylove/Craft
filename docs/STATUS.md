@@ -1,7 +1,7 @@
 # Status
 
 What works today and how it was checked. The plan, owners and order of work are in
-[ROADMAP.md](ROADMAP.md). Last updated 2026-11-13. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
+[ROADMAP.md](ROADMAP.md). Last updated 2026-11-21. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
 workspace clippy, layers, fmt and the secret scan of all history were clean. Chinese UI checks are listed separately below.
 
 ## What works, and how it was checked
@@ -36,6 +36,21 @@ formatting, layering, locks, translations and secret checks passed. The newer
 Help control preserves macOS title-bar sizing at 50/100/150% zoom; the existing
 strict smoke regression now includes Help explicitly. Hosted checks on the
 updated branch remain separate from these local results.
+
+The 2026-11-21 conflict-resolution rebase targets upstream `e64d7cb`. It retains
+upstream's Figtree variable font, weighted script fallbacks, shared controls,
+Settings/About page and click-through toasts. The shared dropdown constructor is
+adapted to egui 0.37's owned lifetime while its existing settings controls retain
+accessible names. Upstream moved Help out of the title bar; the strict zoom test
+continues checking the remaining Settings/Advanced controls and body scaling.
+The November 9 native shutdown observations are not a new live run of this rebase.
+Current local desktop/GUI run: 308 passed, one existing clipboard test ignored,
+and one unchanged upstream fixture failed on macOS when `create_dir` rejected
+its non-UTF-8 folder name before any app behavior ran (OS error 92). All 123 UI
+smoke tests passed, including zoom and settings selectors. No fixture is skipped
+or changed here. All-target clippy on Rust 1.99.1, formatting, layering, locks,
+translation coverage, secret scan and diff checks passed. Hosted Linux checks
+are separate; local results do not claim a wholly passing suite or a fresh native run.
 
 ### Local Codex discovery and sign-in (R2.2)
 
