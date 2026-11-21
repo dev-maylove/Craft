@@ -37,13 +37,13 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
     let bytes = |n: &[u8]| find_bytes(data, n, SCAN_LIMIT).is_some();
     // Packers and installers put their marker in the header or in data appended after the
     // program; inside its sections it's one of the program's own strings, such as a detector's
-    // (#2226). Raw code (one section made up for the whole file) and a file with no sections are
-    // searched whole.
+    // (#2226). Raw code and DOS programs (one section made up for the whole image, where a DOS
+    // packer's marker sits) and a file with no sections are searched whole.
     let placed = b.sections.iter().filter_map(|s| Some((usize::try_from(s.file_offset?).ok()?, usize::try_from(s.file_size).ok()?)));
     let first = placed.clone().map(|(o, _)| o).min();
     let last_end = placed.map(|(o, n)| o.saturating_add(n)).max();
     let outside_sections = |n: &[u8]| match (first, last_end) {
-        (Some(first), Some(last_end)) if b.format != Format::Raw => {
+        (Some(first), Some(last_end)) if !matches!(b.format, Format::Raw | Format::DosMz | Format::DosCom) => {
             let found = |part: Option<&[u8]>| part.is_some_and(|d| find_bytes(d, n, SCAN_LIMIT).is_some());
             found(data.get(..first.min(data.len()))) || found(data.get(last_end..))
         }
@@ -342,5 +342,14 @@ mod tests {
         let rb = Binary::raw(crate::binary::Arch::X86_64, 0, raw.len() as u64, 0);
         let ids: Vec<&str> = detect(&rb, raw).into_iter().map(|h| h.id).collect();
         assert!(ids.contains(&"nsis") && ids.contains(&"inno"), "{ids:?}");
+        // A DOS packer's marker is inside the load module.
+        let mut mz = vec![0u8; 64];
+        mz[..2].copy_from_slice(b"MZ");
+        mz[2] = 64; // bytes in the last (only) page
+        mz[4] = 1; // pages
+        mz[8] = 2; // header paragraphs: 32 bytes
+        mz[40..44].copy_from_slice(b"UPX!");
+        let mb = crate::dos::mz_binary(&mz).unwrap();
+        assert!(detect(&mb, &mz).iter().any(|h| h.id == "upx"));
     }
 }
