@@ -698,6 +698,7 @@ Medium	Media
 Memory for Ghidra	Memoria para Ghidra
 Minimise	Minimizar
 Mode	Modo
+Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it.	Texto más grande o más pequeño: Ctrl/⌘ + y Ctrl/⌘ −. Ctrl/⌘ 0 lo restablece.
 Model	Modelo
 Model options	Opciones del modelo
 Model: {model}	Modelo: {model}
@@ -1543,3 +1544,6 @@ Sign in to a website	Iniciar sesión en un sitio web
 Some shared files could not be hard-linked and were copied instead ({size}).	Algunos archivos compartidos no se pudieron enlazar de forma rígida y se copiaron ({size}).
 This server lists several chat models. Choose one:	Este servidor ofrece varios modelos de chat. Elige uno:
 Choose a model	Elige un modelo
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

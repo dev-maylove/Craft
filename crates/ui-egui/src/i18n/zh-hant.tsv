@@ -698,6 +698,7 @@ Medium	中
 Memory for Ghidra	Ghidra 記憶體用量
 Minimise	最小化
 Mode	模式
+Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it.	放大或縮小文字：Ctrl/⌘ + 和 Ctrl/⌘ −。Ctrl/⌘ 0 恢復預設。
 Model	模型
 Model options	模型選項
 Model: {model}	模型：{model}
@@ -1543,3 +1544,6 @@ Sign in to a website	登入網站
 Some shared files could not be hard-linked and were copied instead ({size}).	部分共用檔案無法建立硬連結，已改為複製（{size}）。
 This server lists several chat models. Choose one:	此伺服器提供多個聊天模型。請選擇一個：
 Choose a model	選擇模型
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

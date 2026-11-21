@@ -387,6 +387,7 @@ May I {action}?	{action}してもよいですか?
 Memory for Ghidra	Ghidra 用メモリ
 Minimise	最小化
 Mode	モード
+Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it.	文字の拡大・縮小：Ctrl/⌘ + と Ctrl/⌘ −。Ctrl/⌘ 0 で元に戻ります。
 Modules	モジュール
 More detail	詳細を表示
 More makes a big program's first look faster.	メモリが多いほど、大きなプログラムの初回解析が速くなります。
@@ -1000,3 +1001,6 @@ Looking for checkpoints…	チェックポイントを探しています…
 Some shared files could not be hard-linked and were copied instead ({size}).	共有ファイルの一部はハードリンクできず、コピーしました（{size}）。
 This server lists several chat models. Choose one:	このサーバーには複数のチャットモデルがあります。1 つ選んでください:
 Choose a model	モデルを選ぶ
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

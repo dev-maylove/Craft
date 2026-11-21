@@ -62,7 +62,7 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
     if !get("OPENROUTER_API_KEY").is_some_and(|v| !v.trim().is_empty()) {
         out.push(Detected {
             suggestion: cfg("OpenRouter", BackendKind::Openrouter, crate::openai::OPENROUTER_DEFAULT_MODEL),
-            reason: "OpenRouter: paste your key, then choose any model it offers".into(),
+            reason: "OpenRouter: paste your key (it starts with sk-or-), then choose any model it offers".into(),
             needs_key: true,
         });
     }

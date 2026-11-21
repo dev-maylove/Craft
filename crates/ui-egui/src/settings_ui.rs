@@ -170,10 +170,15 @@ fn about(ui: &mut Ui) {
 
 fn general(app: &mut CraftApp, ui: &mut Ui) {
     row(ui, "Mode", "Simple: say what you want and it's handled for you. Advanced: every tool, the evidence and the logs.", |ui| {
-        let sel = usize::from(app.settings.mode == Mode::Experienced);
-        if let Some(i) = widgets::segmented(ui, &["Simple", "Advanced"], sel, theme::ControlSize::Medium) {
-            app.set_mode(if i == 0 { Mode::Beginner } else { Mode::Experienced });
-        }
+        ui.vertical(|ui| {
+            let sel = usize::from(app.settings.mode == Mode::Experienced);
+            if let Some(i) = widgets::segmented(ui, &["Simple", "Advanced"], sel, theme::ControlSize::Medium) {
+                app.set_mode(if i == 0 { Mode::Beginner } else { Mode::Experienced });
+            }
+            // Both modes draw text at one size: zoom is the way to make it bigger.
+            let t = Tokens::get(ui.ctx());
+            ui.label(RichText::new(tr("Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it.")).color(t.text_faint).size(theme::CAPTION));
+        });
     });
     let dir = app.settings.projects_dir();
     row(ui, "New projects go in", &dir.display().to_string(), |ui| {
@@ -1014,13 +1019,17 @@ pub(crate) fn key_controls(app: &mut CraftApp, ui: &mut Ui, d: &Detected, card: 
     model_pick::drive(app, ui, &slot, ask, &d.suggestion.model, model_pick::Start::Chat);
     ui.add_space(theme::space::XS);
     let mut connect = false;
-    let height = if card.compact { 30.0 } else { 32.0 };
+    let height = 32.0;
     // The picker and the button on one row, one vertical centre, however the window is sized.
     ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), egui::Layout::right_to_left(egui::Align::Center), |ui| {
         connect = widgets::primary_icon(ui, None, card.connect, !key.is_empty()).clicked() && !key.is_empty();
         if listing {
             let width = (ui.available_width() - ui.spacing().item_spacing.x).max(80.0);
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            // A drop-down grows downward from the top of its slot, so it is made as tall as the
+            // button (its padding takes up the difference) and both start at the row's top.
+            let line = widgets::label_galley(ui, "Ag", theme::CAPTION + 1.0, egui::Color32::PLACEHOLDER).size().y;
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                ui.spacing_mut().button_padding.y = ((height - line) / 2.0).max(0.0);
                 model_pick::model_picker(ui, ("card-model", &name), model_pick::choice_mut(app, &slot), width);
             });
         }
@@ -1459,6 +1468,16 @@ fn plugins(app: &mut CraftApp, ui: &mut Ui) {
         );
         widgets::named(args, "Plugin arguments");
     });
+    if app.state.plugin_form.args_refused() {
+        ui.add_space(theme::space::XS);
+        ui.label(
+            RichText::new(tr(
+                r#"Arguments in square brackets must be a list of quoted words, like ["--port", "8080"]. Or leave out the brackets and separate them with spaces."#,
+            ))
+            .color(t.warning)
+            .size(theme::CAPTION),
+        );
+    }
     ui.add_space(theme::space::SM);
     let params = app.state.plugin_form.params();
     if widgets::primary_icon(ui, Some("plus"), "Add", params.is_some()).clicked()
