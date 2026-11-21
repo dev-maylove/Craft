@@ -1532,8 +1532,8 @@ Owner: maintainers · Status: in progress
 - [x] Close a pictured program politely before killing it: a helper it started through launchd
       outlives the process group, and can stay running with the program's data files open.
       `native_window_capture` now asks first (an app on macOS quits as from its menu, anything
-      else on macOS and Linux gets SIGTERM to its group), waits up to 3 s, then kills the group
-      — PR #2244
+      else on macOS and Linux gets SIGTERM; the window's owner is asked when a launcher started
+      it), waits up to 3 s, then kills the group — PR #2244
 - [ ] Close a pictured program politely on Windows too: it is still killed straight away, since
       posting WM_CLOSE to its windows needs `unsafe`
 - [x] `apple_calls_observe`: the breakpoint callback is one valid line (it had a literal backslash
