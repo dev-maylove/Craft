@@ -339,6 +339,8 @@ fn build_files_search(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     let mut matches = Vec::new();
     let mut more = false;
     let mut searched = 0usize;
+    // Folders that couldn't be listed: the search didn't see what's in them.
+    let mut unreadable = Vec::new();
     let mut stack = vec![root.clone()];
     'walk: while let Some(path) = stack.pop() {
         if searched == MAX_SEARCHED {
@@ -347,7 +349,24 @@ fn build_files_search(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
         }
         searched += 1;
         if path.is_dir() {
-            let mut items: Vec<_> = std::fs::read_dir(&path).into_iter().flatten().flatten().collect();
+            let Ok(dir) = std::fs::read_dir(&path) else {
+                unreadable.push(shown(&ws, &path));
+                continue;
+            };
+            // Entries already queued count against the budget too, so one huge folder can't
+            // outgrow it.
+            let room = MAX_SEARCHED.saturating_sub(searched + stack.len());
+            let mut items = Vec::new();
+            for e in dir {
+                match e {
+                    Ok(_) if items.len() == room => {
+                        more = true;
+                        break;
+                    }
+                    Ok(e) => items.push(e),
+                    Err(_) => unreadable.push(shown(&ws, &path)),
+                }
+            }
             // Popped from the end, so reversed to search in name order.
             items.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
             for e in items {
@@ -379,7 +398,12 @@ fn build_files_search(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
             matches.push(json!({"path": shown(&ws, &path), "offset": offset, "text": shown_line}));
         }
     }
-    Ok(ToolOutput::Value(json!({"root": shown(&ws, &root), "matches": matches, "more": more})))
+    unreadable.dedup();
+    let mut v = json!({"root": shown(&ws, &root), "matches": matches, "more": more});
+    if !unreadable.is_empty() {
+        v["unreadable"] = json!(unreadable);
+    }
+    Ok(ToolOutput::Value(v))
 }
 
 /// Read a project file a builder can hold in memory, with a plain error for one over the cap.
