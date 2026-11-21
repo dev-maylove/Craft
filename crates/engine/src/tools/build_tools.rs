@@ -344,6 +344,11 @@ fn build_files_search(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     let mut stack = vec![root.clone()];
     'walk: while let Some(path) = stack.pop() {
         if path.is_dir() {
+            // Out of budget: a queued folder isn't opened, only said to be unsearched.
+            if left == 0 {
+                more = true;
+                continue;
+            }
             let Ok(dir) = std::fs::read_dir(&path) else {
                 unreadable.push(shown(&ws, &path));
                 continue;
@@ -399,7 +404,10 @@ fn take_entries<T>(mut entries: impl Iterator<Item = std::io::Result<T>>, left: 
     loop {
         if *left == 0 {
             // One more read says whether there was more.
-            return (taken, failed, entries.next().is_some());
+            return match entries.next() {
+                Some(e) => (taken, failed || e.is_err(), true),
+                None => (taken, failed, false),
+            };
         }
         let Some(e) = entries.next() else { return (taken, failed, false) };
         *left -= 1;
