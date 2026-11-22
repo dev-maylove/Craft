@@ -800,6 +800,7 @@ launch or preview was run for this documentation correction.
   permission round trip. A live deep build on 2026-11-20 finished the build stage and compiled the
   app; its check then needed a display this machine doesn't have, which is unrelated to the
   adapter. The person's own MCP config was not changed.
+  See [command-code.md](command-code.md).
 - Maki (`maki -p`, or over ACP with `acp = true`) is offered when adding a coding agent and found by
   Detect. Over ACP it asks us before commands, our own tools and writes outside its working folder;
   writes inside that folder (a build's project folder, our own records included) and every read

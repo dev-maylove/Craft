@@ -109,19 +109,26 @@ impl AgentAdapter for CommandCode {
             Access::Build => Ok(()),
             Access::Analyse | Access::CleanRoomAnalyse | Access::CleanRoomBuild | Access::CleanRoomQuestion | Access::Question => {
                 Err(ToolError::invalid("Command Code reads files without asking, so a Clean room run, a deep chat, or a question can't hold it back.")
-                    .with_remediation("Use a deep build. Command Code asks before an edit or a command, which a deep build decides through the approval policy."))
+                    .with_remediation(
+                        "Use a deep build. Command Code asks before an edit or a command, which a deep build decides through the approval policy.",
+                    ))
             }
         }
     }
 
     fn sign_in_fix(&self) -> Option<String> {
-        Some("Sign in with `command-code login` (or `cmd login`) in a terminal, then try again. Command Code keeps the sign-in; Craft Anything never sees it.".into())
+        Some(
+            "Sign in with `command-code login` (or `cmd login`) in a terminal, then try again. Command Code keeps the sign-in; Craft Anything never sees it."
+                .into(),
+        )
     }
 
     /// Existence only: the account file holds the person's credentials and is not read. Missing is
     /// unknown rather than signed out, so a run still starts and reports the problem itself.
     fn signed_in(&self, _program: &str) -> Option<bool> {
-        account_path(std::env::var_os("HOME").as_deref().map(Path::new), std::env::var_os("USERPROFILE").as_deref().map(Path::new)).filter(|p| p.is_file()).map(|_| true)
+        account_path(std::env::var_os("HOME").as_deref().map(Path::new), std::env::var_os("USERPROFILE").as_deref().map(Path::new))
+            .filter(|p| p.is_file())
+            .map(|_| true)
     }
 
     /// The session's own model and effort. Model first: switching it can reset the effort.
