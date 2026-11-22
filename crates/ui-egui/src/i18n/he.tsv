@@ -698,6 +698,7 @@ Medium	בינוני
 Memory for Ghidra	זיכרון עבור Ghidra
 Minimise	מזעור
 Mode	מצב
+Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it.	טקסט גדול או קטן יותר: Ctrl/⌘ + ו-Ctrl/⌘ −. Ctrl/⌘ 0 מאפס את הגודל.
 Model	מודל
 Model options	אפשרויות מודל
 Model: {model}	מודל: {model}
