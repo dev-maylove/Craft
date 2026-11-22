@@ -362,6 +362,13 @@ fn text_evidence(
     if !out.success {
         lims.push(Limitation::new("nonzero_exit", format!("The tool exited with {:?}; see stderr.", out.code)));
     }
+    // A failed run or capped output makes the line total untrustworthy, so the coverage keeps
+    // only what was shown — no total, no next page — like the JSON branch treats failed runs.
+    let coverage = if out.success && !out.stdout_truncated {
+        Coverage::page(page.len() as u64, total as u64, offset as u64)
+    } else {
+        Coverage { status: CoverageStatus::Partial, examined: Some(page.len() as u64), total: None, next_offset: None }
+    };
     let b = builder(ctx, op, subject, params)
         .result(json!({
             "tool": exe,
@@ -379,7 +386,7 @@ fn text_evidence(
         .confidence(Confidence::Observed)
         .authority(Authority::OutsideService)
         .limitations(lims)
-        .coverage(Coverage::page(page.len() as u64, total as u64, offset as u64));
+        .coverage(coverage);
     Ok(ToolOutput::evidence(b.build()?))
 }
 
@@ -965,6 +972,33 @@ mod tests {
             assert!(err.message.contains("function") && err.remediation.is_some(), "{err:?}");
         }
         assert_eq!(argv_log(dir.path()), log_before_refused, "refused params never reach kuna");
+    }
+
+    /// A failed run that still printed text keeps its evidence, but the coverage may not claim a
+    /// trustworthy total: partial, no total, no next page.
+    #[cfg(unix)]
+    #[test]
+    fn failed_text_decompile_reports_partial_coverage() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        canned_json(dir.path());
+        let script = dir.path().join("kuna");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nprintf 'partial decompile\\nlines\\n'\nexit 3\n", dir.path().join("argv.log").display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut s = crate::testing::session();
+        s.settings.engines.tools.kuna = Some(script);
+        let e = Engine::new(s);
+        let prog = sample();
+        let v = call(&e, "kuna_decompile", json!({"path": prog.to_string_lossy(), "function": "main"}));
+        assert_eq!(v["result"]["success"], json!(false));
+        assert_eq!(v["result"]["output"], "partial decompile\nlines");
+        assert_eq!(v["coverage"]["status"], "partial");
+        assert_eq!(v["coverage"]["total"], json!(null), "a failed run's line total is not evidence");
+        assert_eq!(v["coverage"]["next_offset"], json!(null));
     }
 
     #[cfg(unix)]
