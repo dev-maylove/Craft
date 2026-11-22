@@ -883,13 +883,14 @@ mod tests {
     fn identical_switches_draw_their_own_selected_cards() {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             for (row, selected) in [0, 2].into_iter().enumerate() {
                 ui.push_id(row, |ui| {
                     segmented(ui, &["Allow", "Ask", "Refuse"], selected, ControlSize::Small);
                 });
             }
         });
+        output.textures_delta.clear();
         let field = Tokens::get(&ctx).field;
         let cards: Vec<_> = output
             .shapes
