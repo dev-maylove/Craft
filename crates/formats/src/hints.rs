@@ -43,10 +43,7 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
     // Go. The build-info marker alone isn't Go: a program that looks for it holds the same bytes
     // (#2249), so it counts only where the build-info reader decodes a block with a Go version.
     let go_report = find_bytes(data, b"\xff Go buildinf:", SCAN_LIMIT).and_then(|_| crate::go::inspect(data, None).ok());
-    let go_block = go_report
-        .as_ref()
-        .and_then(|r| r.buildinfo.as_ref())
-        .filter(|b| b.go_version.as_deref().is_some_and(|v| v.starts_with("go1") || v.starts_with("devel")));
+    let go_block = go_report.as_ref().and_then(|r| r.buildinfo.as_ref()).filter(|b| b.has_go_version());
     if sec(".go.buildinfo") || sec("__go_buildinfo") {
         push(&mut out, hint("go", "language", "Go", "strong", "Go build-info section"));
     } else if let Some(b) = go_block {
@@ -300,6 +297,18 @@ mod tests {
         let b = crate::parse_binary(&elf).unwrap();
         let hints = detect(&b, &elf);
         assert!(hints.iter().all(|h| h.id != "go"), "{hints:?}");
+    }
+
+    #[test]
+    fn a_block_without_a_go_version_does_not_hide_a_real_one() {
+        let (mut elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+        elf.resize(elf.len().next_multiple_of(16), 0);
+        elf.extend_from_slice(&craft_anything_testkit::formats::go_buildinfo_inline("not-a-version", ""));
+        go_block(&mut elf);
+        let b = crate::parse_binary(&elf).unwrap();
+        let hints = detect(&b, &elf);
+        let g = hints.iter().find(|h| h.id == "go").unwrap_or_else(|| panic!("{hints:?}"));
+        assert_eq!(g.label, "Go (go1.22.3)", "{g:?}");
     }
 
     #[test]
