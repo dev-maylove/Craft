@@ -300,7 +300,8 @@ fn escape_regex(s: &str) -> String {
     out
 }
 
-/// Evidence for one page of a JSON list Kuna returned.
+/// Evidence for one page of a JSON list Kuna returned. `lims` join the base limitations, and
+/// `force_partial` marks coverage partial when Kuna itself skipped part of the search space.
 #[allow(clippy::too_many_arguments)]
 fn paged_evidence(
     ctx: &Ctx<'_>,
@@ -315,8 +316,13 @@ fn paged_evidence(
     offset: usize,
     limit: usize,
     summary: String,
+    lims: Vec<Limitation>,
+    force_partial: bool,
 ) -> Result<ToolOutput, ToolError> {
-    let (page_items, cov) = page(items, offset, limit);
+    let (page_items, mut cov) = page(items, offset, limit);
+    if force_partial {
+        cov.status = CoverageStatus::Partial;
+    }
     let mut result = meta(exe, args, out);
     if let Value::Object(m) = &mut result {
         m.insert(field.to_string(), Value::Array(page_items));
@@ -324,12 +330,14 @@ fn paged_evidence(
         m.insert("limit".into(), json!(limit));
         m.insert("total".into(), json!(items.len()));
     }
+    let mut all_lims = base_lims();
+    all_lims.extend(lims);
     let b = builder(ctx, op, subject, params)
         .result(result)
         .summary(summary)
         .confidence(Confidence::Observed)
         .authority(Authority::OutsideService)
-        .limitations(base_lims())
+        .limitations(all_lims)
         .coverage(cov);
     Ok(ToolOutput::evidence(b.build()?))
 }
@@ -522,7 +530,12 @@ fn kuna_functions_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
         return Err(nonzero_error("kuna", &out));
     }
     let v = json_output(&out, "function inventory")?;
-    let items = json_array(&v, "functions", "function inventory")?;
+    let mut items = json_array(&v, "functions", "function inventory")?;
+    // Kuna's --filter also matches aliases, and 1.990's JSON output drops the filter entirely
+    // (text output honours it): enforce the documented case-sensitive name substring here.
+    if let Some(c) = p.contains.as_deref() {
+        items.retain(|f| f.get("name").and_then(Value::as_str).is_some_and(|n| n.contains(c)));
+    }
     let total = items.len();
     paged_evidence(
         ctx,
@@ -537,6 +550,8 @@ fn kuna_functions_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
         p.offset,
         p.limit,
         format!("kuna found {total} functions in {}.", input.name),
+        Vec::new(),
+        false,
     )
 }
 
@@ -602,7 +617,27 @@ fn kuna_xrefs(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError>
         return Err(nonzero_error("kuna", &out));
     }
     let v = json_output(&out, "cross-references")?;
-    let items = json_array(&v, "xrefs", "cross-references")?;
+    let mut items = json_array(&v, "xrefs", "cross-references")?;
+    // Stored-pointer references (relocated function pointers, vtable and init_array entries) sit
+    // in `data_refs`; without them a callback referenced only through a stored pointer would be
+    // reported as unreferenced.
+    let pointers = v.get("data_refs").and_then(Value::as_array).cloned().unwrap_or_default();
+    let pointer_note = (!pointers.is_empty()).then(|| {
+        let source = v.get("data_refs_coverage").and_then(Value::as_str).unwrap_or("relocation");
+        Limitation::new(
+            "pointer_references",
+            format!("{} of the references are stored pointers ({source} metadata), listed as kind \"pointer\".", pointers.len()),
+        )
+    });
+    items.extend(pointers);
+    // Kuna names code it did not examine in `coverage.unwalked` (reasons in `notes`); the page
+    // math alone would then claim complete coverage.
+    let unwalked =
+        v.get("coverage").is_some_and(|c| ["unwalked", "notes"].into_iter().any(|k| c.get(k).and_then(Value::as_array).is_some_and(|a| !a.is_empty())));
+    let mut lims: Vec<Limitation> = pointer_note.into_iter().collect();
+    if unwalked {
+        lims.push(Limitation::new("unwalked_regions", "Kuna skipped some code that may reference the target; the list may be incomplete."));
+    }
     let total = items.len();
     paged_evidence(
         ctx,
@@ -617,6 +652,8 @@ fn kuna_xrefs(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError>
         p.offset,
         p.limit,
         format!("kuna found {total} references {direction} in {}.", input.name),
+        lims,
+        unwalked,
     )
 }
 
@@ -648,6 +685,8 @@ fn kuna_strings(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErro
         p.offset,
         p.limit,
         format!("kuna found {total} strings in {}.", input.name),
+        Vec::new(),
+        false,
     )
 }
 
@@ -892,7 +931,14 @@ mod tests {
         std::fs::write(
             dir.join("xrefs.json"),
             r#"{"binary":"prog.bin","target":{"name":"main","address":4160,"address_hex":"0x1040","aliases":[]},
-                "direction":"to","count":1,"xrefs":[
+                "direction":"to","count":1,
+                "coverage":{"decoded":true,"section":".text","code_section":true,"executable":true,
+                            "unwalked":["0x3000-0x3100 (not marked code)"],"notes":[]},
+                "data_refs_coverage":"dynamic-relocations","data_refs_count":1,
+                "data_refs":[{"kind":"pointer","from_address":792,"from_address_hex":"0x318","from_name":null,
+                              "to_address":4160,"to_address_hex":"0x1040","to_name":"main","width":8,
+                              "source":"dynamic-relocations"}],
+                "xrefs":[
                 {"address":4200,"address_hex":"0x1068","kind":"data","from_address":4200,"from_address_hex":"0x1068",
                  "to_address":4160,"to_address_hex":"0x1040",
                  "from_function":{"name":"_start","address":4176,"address_hex":"0x1050"},
@@ -942,10 +988,15 @@ mod tests {
         assert_eq!(v["coverage"]["next_offset"], 2);
         assert_eq!(v["operation"], "kuna_functions_list");
         assert_eq!(argv_log(dir.path()), format!("functions\n{}\n--json\n", prog.display()), "the exact argv reached kuna");
-        // A contains filter reaches kuna as an escaped literal regex.
+        // A contains filter reaches kuna as an escaped literal regex, and the documented
+        // case-sensitive name substring is enforced on this side: kuna's --filter also matches
+        // aliases, and its JSON output drops the filter entirely.
         let v = call(&e, "kuna_functions_list", json!({"path": prog.to_string_lossy(), "contains": "a.b"}));
-        assert_eq!(v["result"]["total"], 3, "the fake doesn't filter; the argv is what's asserted");
+        assert_eq!(v["result"]["total"], 0, "no canned name contains a.b, whatever kuna did with --filter");
         assert!(argv_log(dir.path()).ends_with(format!("functions\n{}\n--json\n--filter\na\\.b\n", prog.display()).as_str()));
+        let v = call(&e, "kuna_functions_list", json!({"path": prog.to_string_lossy(), "contains": "main"}));
+        assert_eq!(v["result"]["total"], 1);
+        assert_eq!(v["result"]["functions"][0]["name"], "main");
     }
 
     #[cfg(unix)]
@@ -1009,10 +1060,17 @@ mod tests {
         let e = engine_with_fake_kuna(dir.path());
         let prog = sample();
         let v = call(&e, "kuna_xrefs", json!({"path": prog.to_string_lossy(), "to": "main", "limit": 1}));
-        assert_eq!(v["result"]["total"], 1);
+        assert_eq!(v["result"]["total"], 2);
         assert_eq!(v["result"]["xrefs"][0]["kind"], "data");
         assert_eq!(v["result"]["xrefs"][0]["from_function"]["name"], "_start");
         assert_eq!(argv_log(dir.path()), format!("xrefs\n{}\n--to\nmain\n--json\n", prog.display()));
+        // Stored pointers from the relocation metadata join the list, and kuna's unwalked regions
+        // keep the typed coverage partial even when the page shows everything.
+        let v = call(&e, "kuna_xrefs", json!({"path": prog.to_string_lossy(), "to": "main"}));
+        assert_eq!(v["result"]["total"], 2);
+        assert_eq!(v["result"]["xrefs"][1]["kind"], "pointer");
+        assert_eq!(v["result"]["xrefs"][1]["source"], "dynamic-relocations");
+        assert_eq!(v["coverage"]["status"], "partial", "unwalked regions force partial coverage");
         let v = call(&e, "kuna_strings", json!({"path": prog.to_string_lossy(), "min_length": 5, "filter": "libc"}));
         assert_eq!(v["result"]["total"], 2);
         assert_eq!(v["result"]["strings"][1]["text"], "__libc_start_main");
