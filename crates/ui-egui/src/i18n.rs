@@ -748,7 +748,7 @@ mod tests {
         // Wrapping reorders each display row after line breaking, so opening words stay on row 0
         // and characters inside Hebrew words stay in logical order even with a Hebrew font loaded.
         let ctx = egui::Context::default();
-        crate::theme::apply(&ctx, crate::theme::ThemeKind::Studio, false);
+        crate::theme::apply(&ctx, crate::theme::ThemeKind::Studio);
         ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
         let logical = tr_logical_for(
             "he",
