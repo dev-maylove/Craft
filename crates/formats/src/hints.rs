@@ -40,11 +40,17 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
         }
     };
 
-    // Go
+    // Go. The build-info marker alone isn't Go: a program that looks for it holds the same bytes
+    // (#2249), so it counts only where the build-info reader decodes a block with a Go version.
+    let go_report = find_bytes(data, b"\xff Go buildinf:", SCAN_LIMIT).and_then(|_| crate::go::inspect(data, None).ok());
+    let go_block = go_report
+        .as_ref()
+        .and_then(|r| r.buildinfo.as_ref())
+        .filter(|b| b.go_version.as_deref().is_some_and(|v| v.starts_with("go1") || v.starts_with("devel")));
     if sec(".go.buildinfo") || sec("__go_buildinfo") {
         push(&mut out, hint("go", "language", "Go", "strong", "Go build-info section"));
-    } else if let Some(at) = find_bytes(data, b"\xff Go buildinf:", SCAN_LIMIT) {
-        push(&mut out, hint("go", "language", "Go", "strong", format!("Go build-info marker at file offset {at:#x}")));
+    } else if let Some(b) = go_block {
+        push(&mut out, hint("go", "language", "Go", "strong", format!("Go build-info block at file offset {:#x}", b.offset)));
     } else if sec(".gopclntab") || sec("__gopclntab") || sym("runtime.main") {
         push(&mut out, hint("go", "language", "Go", "strong", "Go runtime symbols or pclntab section"));
     }
@@ -52,12 +58,10 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
         // Prefer the version the build-info reader extracts (#1397): it reads the build-info
         // section, so an unrelated `go1.` that happens to come earlier in the file (a constant,
         // a path, a debug string) can't be mistaken for the toolchain version.
-        let (version, from_build_info) = match crate::go::inspect(data, None) {
-            Ok(report) => match report.buildinfo.and_then(|b| b.go_version) {
-                Some(v) if !v.is_empty() => (Some(v), true),
-                _ => (None, false),
-            },
-            Err(_) => (None, false),
+        let report = go_report.or_else(|| crate::go::inspect(data, None).ok());
+        let (version, from_build_info) = match report.and_then(|r| r.buildinfo).and_then(|b| b.go_version) {
+            Some(v) if !v.is_empty() => (Some(v), true),
+            _ => (None, false),
         };
         let version = version.or_else(|| {
             // Fall back to scanning bytes only when there is no build info to read. Start after
@@ -262,7 +266,7 @@ mod tests {
         let (elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
         let mut go = elf.clone();
         go.extend_from_slice(b"go1.190119941996 ");
-        go.extend_from_slice(b"\xff Go buildinf:\x08\x02go1.22.3\0");
+        go_block(&mut go);
         let b = crate::parse_binary(&go).unwrap();
         let hints = detect(&b, &go);
         let g = hints.iter().find(|h| h.id == "go").unwrap();
@@ -281,13 +285,30 @@ mod tests {
         assert_eq!(g.strength, "strong", "{g:?}");
     }
 
+    /// A Go 1.18+ build-info block on a 16-byte boundary, as the Go linker writes it.
+    fn go_block(data: &mut Vec<u8>) {
+        data.resize(data.len().next_multiple_of(16), 0);
+        data.extend_from_slice(&craft_anything_testkit::formats::go_buildinfo_inline("go1.22.3", ""));
+    }
+
+    #[test]
+    fn a_program_holding_only_the_marker_is_not_go() {
+        // A detector compiled into a program keeps the marker in its read-only data (#2249).
+        let (mut elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+        elf.resize(elf.len().next_multiple_of(16), 0);
+        elf.extend_from_slice(b"\xff Go buildinf:\0\0find_bytes\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        let b = crate::parse_binary(&elf).unwrap();
+        let hints = detect(&b, &elf);
+        assert!(hints.iter().all(|h| h.id != "go"), "{hints:?}");
+    }
+
     #[test]
     fn finds_markers() {
         let (elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
         let b = crate::parse_binary(&elf).unwrap();
         assert!(detect(&b, &elf).iter().all(|h| h.id != "go"));
         let mut go = elf.clone();
-        go.extend_from_slice(b"\xff Go buildinf:\x08\x02go1.22.3\0");
+        go_block(&mut go);
         let hints = detect(&b, &go);
         let g = hints.iter().find(|h| h.id == "go").unwrap();
         assert_eq!(g.label, "Go (go1.22.3)");
