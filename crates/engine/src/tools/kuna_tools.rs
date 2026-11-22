@@ -700,9 +700,25 @@ fn kuna_project_export(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
         return Err(ToolError::invalid(format!("{:?} is not an absolute path", p.output_dir))
             .with_remediation("Pass the full path of the folder kuna should create, for example /home/me/prog.kuna."));
     }
-    if dir.exists() {
-        return Err(ToolError::invalid(format!("{} already exists; kuna would overwrite it.", dir.display()))
-            .with_remediation("Choose a folder that doesn't exist yet; kuna creates it and writes the project files."));
+    // Reserve the folder before anything runs: an exists() check and the launch are separate
+    // steps, and two processes passing both would run kuna into one folder and overwrite its
+    // files. Creating the last path component is the atomic reservation.
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ToolError::invalid(format!("{} could not be created: {e}.", dir.display()))
+                .with_remediation("Choose a folder kuna can create, for example under the project.")
+        })?;
+    }
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ToolError::invalid(format!("{} already exists; kuna would overwrite it.", dir.display()))
+                .with_remediation("Choose a folder that doesn't exist yet; kuna creates it and writes the project files."));
+        }
+        Err(e) => {
+            return Err(ToolError::invalid(format!("{} could not be created: {e}.", dir.display()))
+                .with_remediation("Choose a folder kuna can create, for example under the project."));
+        }
     }
     let (addresses, bounded) = match p.max_functions {
         None => (Vec::new(), false),
