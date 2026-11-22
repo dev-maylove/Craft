@@ -771,6 +771,11 @@ Owner: open · Status: todo
       "The user said no" (#1938): it now says nobody was asked and points at a plugin's `consent`
       setting (`Conversation::refuse_consent`, `BUILD_REFUSES_CONSENT`)
       — claimed: justinjohn0306, branch bugfix/r5.5-build-consent-refusal
+- [ ] Every turn of a Claude API build pays full price for the whole conversation again: the
+      request marks only the tools and the system prompt for the prompt cache, never a message, so
+      each step resends every earlier tool call and result uncached. Mark the conversation's last
+      block too, so the next step reads what came before from the cache
+      — claimed: thejesh23, branch bugfix/r5.5-anthropic-cache-conversation
 - [ ] **decision**: should an API-model build ask the person (a card, as coding-agent builds do
       through the project's inbox) before a tool that needs consent, or follow a setting, instead
       of refusing every one outside the Build tools (#1938)
