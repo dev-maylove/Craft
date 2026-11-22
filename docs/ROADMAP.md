@@ -1151,7 +1151,10 @@ Owner: open · Status: in progress
       headless print mode has no way to hand over a server. Clean room, deep chat and questions are
       refused, because a native read does not ask permission (only edits and commands do), so only
       a deep build can be held to what it promises; extra arguments are refused too, so no `--yolo`
-      or `--permission-mode dont-ask` bypasses the approval policy. Verified against Command Code
+      or `--permission-mode dont-ask` bypasses the approval policy. Craft Anything does not pass
+      such a flag, and does not override a saved Command Code setting that approves every tool: an
+      edit may then run without a permission request, as a Grok config that approves every tool
+      does. Verified against Command Code
       1.91.1: the handshake, `session/set_config_option` and the permission round trip. A live deep
       build on 2026-11-20 attached all 326 tools, finished the build stage and compiled the app; its
       check then needed a display the machine didn't have.

@@ -59,7 +59,11 @@ impl AgentAdapter for CommandCode {
         if options.cli_model.is_none() && options.cli_thinking.is_none() {
             return Ok(());
         }
-        models::validate(options, &self.model_catalog(config, options, directory, stop)?)
+        // A chosen level is sent as the nearest one Command Code accepts, so that is what the
+        // catalogue offers; validating the level as written would refuse every level but those four.
+        let sent = options.cli_thinking.map(accepted);
+        let options = BackendOptions { cli_thinking: sent, ..options.clone() };
+        models::validate(&options, &self.model_catalog(config, &options, directory, stop)?)
     }
 
     /// It can be held to reading: the ACP layer sends a question no tool server and refuses every
@@ -159,12 +163,24 @@ fn chosen_effort(options: &BackendOptions) -> Option<String> {
         .map(|effort| effort.as_str())
         .or_else(|| options.cli_reasoning_effort.map(|effort| effort.as_str()))
         .or_else(|| options.effort.map(|effort| effort.as_str()))?;
-    Some(nearest(crate::Effort::parse(name)?).to_string())
+    Some(sent_name(crate::Effort::parse(name)?).to_string())
 }
 
-/// The accepted level closest to `wanted` without asking for more reasoning than was chosen.
-fn nearest(wanted: crate::Effort) -> &'static str {
-    match wanted {
+/// The level Command Code is sent for a chosen one, as an [`Effort`]: the nearest at or below it,
+/// so it never asks for more reasoning than was chosen. `off` is the absence of a depth, which no
+/// [`Effort`] names, so it is [`Effort::None`] here.
+fn accepted(depth: crate::Effort) -> crate::Effort {
+    match depth {
+        crate::Effort::None | crate::Effort::Minimal => crate::Effort::None,
+        crate::Effort::Low => crate::Effort::Low,
+        crate::Effort::Medium | crate::Effort::High => crate::Effort::High,
+        crate::Effort::Xhigh | crate::Effort::Max => crate::Effort::Max,
+    }
+}
+
+/// What Command Code calls the level [`accepted`] gives: `off`, `low`, `high` or `max`.
+fn sent_name(depth: crate::Effort) -> &'static str {
+    match depth {
         crate::Effort::None | crate::Effort::Minimal => "off",
         crate::Effort::Low => "low",
         crate::Effort::Medium | crate::Effort::High => "high",
@@ -173,9 +189,8 @@ fn nearest(wanted: crate::Effort) -> &'static str {
 }
 
 fn catalogue(metadata: &super::super::acp::ModelMetadata, options: &BackendOptions) -> Vec<models::AgentModel> {
-    let tuning = crate::model_options::ModelTuning::from_metadata(metadata.current_model.clone(), &metadata.config_options);
     let active = options.cli_model.as_deref().map(str::trim).filter(|model| !model.is_empty()).unwrap_or(metadata.current_model.as_str());
-    let thinking: Vec<_> = tuning.reasoning.iter().filter_map(|choice| crate::Effort::parse(choice.value.as_str())).collect();
+    let thinking = sent_levels(&metadata.config_options);
     let mut ids = metadata.models.clone();
     if !metadata.current_model.is_empty() {
         ids.push(metadata.current_model.clone());
@@ -189,6 +204,38 @@ fn catalogue(metadata: &super::super::acp::ModelMetadata, options: &BackendOptio
     ordered.into_iter().map(|id| models::AgentModel { name: id.clone(), thinking: if id == active { thinking.clone() } else { Vec::new() }, id }).collect()
 }
 
+/// The thinking levels this session offers, as the [`Effort`]s Command Code is sent for them. Its
+/// option id is `effort`, not the `reasoning_effort` the shared tuning reads, and it accepts only
+/// `off`, `low`, `high` and `max`: these are exactly what a chosen level is mapped onto and then
+/// validated against. Its `default` means "leave the setting alone" and is not a depth.
+fn sent_levels(config_options: &[serde_json::Value]) -> Vec<crate::Effort> {
+    let offered = config_options
+        .iter()
+        .find(|option| option.get("id").and_then(serde_json::Value::as_str) == Some("effort"))
+        .and_then(|option| option.get("options"))
+        .and_then(serde_json::Value::as_array);
+    let mut levels: Vec<crate::Effort> = Vec::new();
+    for value in offered.into_iter().flatten().filter_map(|option| option.get("value").and_then(serde_json::Value::as_str)) {
+        let Some(depth) = accepted_name(value) else { continue };
+        if !levels.contains(&depth) {
+            levels.push(depth);
+        }
+    }
+    levels
+}
+
+/// The [`Effort`] Command Code's own name for a level stands for: `off`, `low`, `high`, `max`, and
+/// its `default` (which means it is not choosing one). `None` for a name it doesn't offer.
+fn accepted_name(name: &str) -> Option<crate::Effort> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(crate::Effort::None),
+        "low" => Some(crate::Effort::Low),
+        "high" => Some(crate::Effort::High),
+        "max" => Some(crate::Effort::Max),
+        other => crate::Effort::parse(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +247,17 @@ mod tests {
         assert!(adapter.requires_acp() && !adapter.plain_fallback());
         assert_eq!(super::super::acp::acp_args("command-code"), Some(&["acp"][..]));
         assert_eq!(display_for("command-code"), "Command Code");
+    }
+
+    /// `ids()` answers to two names, so a backend saved as either must start in ACP mode; without an
+    /// entry the alias resolves to no ACP arguments and the run is refused.
+    #[test]
+    fn both_of_its_names_start_in_acp_mode() {
+        for id in CommandCode.ids() {
+            assert_eq!(super::super::acp::acp_args(id), Some(&["acp"][..]), "{id} has no ACP arguments");
+            assert!(AgentAdapters::built_in().for_agent(id).requires_acp(), "{id} isn't the ACP adapter");
+        }
+        assert_eq!(super::super::acp::acp_args("commandcode"), Some(&["acp"][..]));
     }
 
     /// Reads are not permission-gated, so only a deep build is a promise Command Code keeps.
@@ -231,6 +289,25 @@ mod tests {
         assert_eq!(with(BackendOptions { cli_reasoning_effort: Some(crate::config::CliReasoningEffort::Low), ..Default::default() }).as_deref(), Some("low"));
         assert_eq!(with(BackendOptions { effort: Some(crate::Effort::Max), ..Default::default() }).as_deref(), Some("max"));
         assert_eq!(with(BackendOptions::default()), None, "nothing chosen: the CLI's own default");
+    }
+
+    /// A chosen level is sent as the nearest one Command Code accepts, so the catalogue must offer
+    /// that one: validating the level as written would refuse `minimal`, `medium`, `xhigh` and
+    /// `none`, which are all translated before anything is sent.
+    #[test]
+    fn every_chosen_level_is_accepted_once_translated() {
+        let sent = sent_levels(&[serde_json::json!({"id":"effort","options":[
+            {"value":"default"},{"value":"off"},{"value":"low"},{"value":"high"},{"value":"max"}
+        ]})]);
+        assert_eq!(sent, [crate::Effort::None, crate::Effort::Low, crate::Effort::High, crate::Effort::Max], "only the four depths it sends");
+        for chosen in crate::Effort::CLI_ALL {
+            let translated = accepted(chosen);
+            assert!(sent.contains(&translated), "{chosen:?} translates to {translated:?}, which the catalogue must offer");
+            assert_eq!(accepted_name(sent_name(translated)), Some(translated), "{chosen:?} round-trips");
+        }
+        assert_eq!(sent_levels(&[]), Vec::new(), "no option advertised: nothing to check against");
+        assert_eq!(accepted_name("default"), None, "not a depth");
+        assert_eq!(accepted_name("bogus"), None);
     }
 
     /// The model is set before the effort: switching model can reset the effort.

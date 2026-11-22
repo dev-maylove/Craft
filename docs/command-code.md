@@ -54,8 +54,10 @@ Use the shared model and **Thinking depth** picker (Settings → AI → **Change
 
 Command Code accepts four effort levels: `off`, `low`, `high` and `max` (plus its own `default`,
 which means "leave it alone"). It refuses anything else with `Unknown effort`, so the shared
-levels map onto those: `minimal` becomes `off`, `medium` becomes `high`, and `xhigh` becomes
-`max`. There is no context-window control.
+levels map onto those: `minimal` and `none` become `off`, `medium` becomes `high`, and `xhigh`
+becomes `max`. The picker offers exactly the four translated levels for the selected model, and a
+chosen level is validated after translation, so every shared level can be picked. There is no
+context-window control.
 
 ```toml
 cli_model = "claude-sonnet-5-5"
@@ -77,9 +79,12 @@ command asks permission; a read does not.** That difference is why the rest cann
 question must not change files, and Clean room must keep the original's files out of reach, but
 nothing gates a read, so neither can be held. A deep build is allowed: it may read, and an edit
 or a command is gated by `session/request_permission`, which reaches the same approval policy
-Claude Code's approvals do. A Command Code setting that approves every tool would still edit
-without asking; Craft Anything does not pass such a flag and does not replace the person's
-configuration to force a prompt.
+Claude Code's approvals do.
+
+Craft Anything does not pass a flag that approves everything, and it does not override a saved
+Command Code setting that does. If your Command Code configuration approves every tool, an edit
+can run without a permission request; Craft Anything does not change that configuration to force
+a prompt.
 
 ## What was checked
 

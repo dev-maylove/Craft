@@ -795,7 +795,9 @@ launch or preview was run for this documentation correction.
   "Unknown effort". Clean room, deep chat and questions are refused: reads are not
   permission-gated (only edits and commands ask), so only a deep build can be held to what it
   promises. Extra `args` are refused, so no `--yolo` or `--permission-mode dont-ask` can bypass
-  approvals. A missing `~/.commandcode/auth.json` is unknown rather than signed out. Checked
+  approvals, and a saved Command Code setting that approves every tool is not overridden either:
+  an edit may then run without a permission request. A missing `~/.commandcode/auth.json` is
+  unknown rather than signed out. Checked
   against Command Code 1.91.1: `initialize`, `session/new`, `session/set_config_option` and the
   permission round trip. A live deep build on 2026-11-20 finished the build stage and compiled the
   app; its check then needed a display this machine doesn't have, which is unrelated to the
