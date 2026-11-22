@@ -436,7 +436,7 @@ pub fn segmented_scaled(ui: &mut Ui, options: &[&str], selected: usize, height: 
     let galleys: Vec<_> = options.iter().map(|o| label_galley(ui, &tr(o), text * scale, t.text)).collect();
     let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + segment_pad(text) * scale).collect();
     let total: f32 = widths.iter().sum::<f32>() + 2.0 * pad;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(total, height), Sense::hover());
+    let (rect, track) = ui.allocate_exact_size(Vec2::new(total, height), Sense::hover());
     // A sunken track; the chosen segment is a lighter card on it.
     ui.painter().rect(rect, t.radius, t.canvas, Stroke::new(scale, t.card_border), egui::StrokeKind::Inside);
     // The segments. One under the pointer only brightens its words: the card is what moves.
@@ -451,11 +451,10 @@ pub fn segmented_scaled(ui: &mut Ui, options: &[&str], selected: usize, height: 
         segments.push((seg, resp));
         x += w;
     }
-    // The card slides to the chosen segment (measured from the switch's own
-    // left edge, so moving the whole switch doesn't set it off). Named by its options, not by
-    // where it is drawn, so it keeps its place when the screen around it changes.
+    // Measure from the track's left edge and key the animation by this switch's ID, so switches
+    // with the same options each keep their own card.
     let before: f32 = widths.iter().take(selected).sum();
-    let slide = |part: &str, to: f32| ui.ctx().animate_value_with_time(egui::Id::new(("seg-slide", part, options)), to, SLIDE);
+    let slide = |part: &str, to: f32| ui.ctx().animate_value_with_time(track.id.with(("seg-slide", part)), to, SLIDE);
     let (card_x, card_w) = (slide("x", before), slide("w", widths.get(selected).copied().unwrap_or_default()));
     let card = egui::Rect::from_min_size(egui::pos2(rect.left() + pad + card_x, rect.top() + pad), Vec2::new(card_w, height - 2.0 * pad));
     ui.painter().rect(card, t.radius_sm, t.field, Stroke::new(scale, t.card_border), egui::StrokeKind::Inside);
@@ -878,6 +877,31 @@ mod tests {
     /// spend drawing (`predicted_dt`, a 60th of a second here) off it.
     fn paced(wait: Duration, every: Duration) -> bool {
         wait <= every && wait + Duration::from_millis(17) >= every
+    }
+
+    #[test]
+    fn identical_switches_draw_their_own_selected_cards() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for (row, selected) in [0, 2].into_iter().enumerate() {
+                ui.push_id(row, |ui| {
+                    segmented(ui, &["Allow", "Ask", "Refuse"], selected, ControlSize::Small);
+                });
+            }
+        });
+        output.textures_delta.clear();
+        let field = Tokens::get(&ctx).field;
+        let cards: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(r) if r.fill == field => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        let [first, second] = cards.as_slice() else { panic!("expected two selection cards, got {cards:?}") };
+        assert!(first.right() < second.left(), "each card should sit on its own choice: {cards:?}");
     }
 
     /// #579: egui's `Spinner` asks to be redrawn at once, every frame, for as long as it shows;
