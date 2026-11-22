@@ -106,8 +106,23 @@ pub fn identity_from_version(text: &str) -> Option<AgentIdentity> {
 /// Refuse to start `program` as `want` when its `--version` says it is the other known agent.
 /// A program that won't answer `--version` is not refused here; starting it reports that.
 pub fn check_identity(program: &str, want: AgentIdentity) -> Result<(), ToolError> {
+    probe_identity(program, want).map(|_| ())
+}
+
+/// Cursor-style `YYYY.MM.DD` date on the first non-empty line of a `--version` output.
+fn cursor_version_date(text: &str) -> Option<(u16, u8, u8)> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    line.split_whitespace().find_map(|token| {
+        let date = token.split('-').next().unwrap_or(token);
+        date.split('.').next().is_some_and(|year| year.len() == 4).then(|| acp::version_date(token)).flatten()
+    })
+}
+
+/// Probe `program --version`, refusing when it identifies as the other known agent, and returning
+/// any parsed Cursor `YYYY.MM.DD` version date so versionless `initialize` responses can still check it.
+pub(crate) fn probe_identity(program: &str, want: AgentIdentity) -> Result<Option<(u16, u8, u8)>, ToolError> {
     let Ok(out) = Process::new(program).arg("--version").timeout(Duration::from_secs(10)).stdout_cap(64 * 1024).stderr_cap(64 * 1024).run() else {
-        return Ok(());
+        return Ok(None);
     };
     let text = format!("{}\n{}", out.stdout_text(), out.stderr_text());
     match identity_from_version(&text) {
@@ -119,7 +134,7 @@ pub fn check_identity(program: &str, want: AgentIdentity) -> Result<(), ToolErro
             "Set this backend's `command` to the {} program. Both Grok Build and Cursor install a program named `agent`; which one it is comes from `--version`, not the name.",
             want.display()
         ))),
-        _ => Ok(()),
+        _ => Ok((want == AgentIdentity::Cursor).then(|| cursor_version_date(&text)).flatten()),
     }
 }
 

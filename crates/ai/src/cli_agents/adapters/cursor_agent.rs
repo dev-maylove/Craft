@@ -36,6 +36,18 @@ impl AgentAdapter for CursorAgent {
         Vec::new()
     }
 
+    /// Cursor Agent reads files natively and its ACP permission prompts follow its own approval
+    /// settings, so a Clean room run cannot keep the original out of reach (like Aider and Grok).
+    fn validate_access(&self, access: Access) -> Result<(), ToolError> {
+        match access {
+            Access::CleanRoomAnalyse | Access::CleanRoomBuild | Access::CleanRoomQuestion => {
+                Err(ToolError::invalid("Cursor Agent reads files on its own, so a Clean room run can't hold it back.")
+                    .with_remediation("Use a deep build for Cursor Agent. Its reads aren't checked, so it can't be kept out of the original's files."))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn acp_mcp_since(&self) -> Option<(u16, u8, u8)> {
         Some(ACP_MCP_SINCE)
     }
@@ -85,6 +97,17 @@ mod tests {
             let options = BackendOptions { args: vec![argument.into()], ..Default::default() };
             assert!(CursorAgent.validate_options(&options).is_err(), "{argument}");
             assert!(CursorAgent.acp_options(&options, Access::Build).is_empty(), "{argument} must not reach argv");
+        }
+    }
+
+    #[test]
+    fn clean_room_modes_are_refused_and_deep_modes_allowed() {
+        for access in [Access::CleanRoomAnalyse, Access::CleanRoomBuild, Access::CleanRoomQuestion] {
+            let err = CursorAgent.validate_access(access).expect_err("a clean room can't hold Cursor Agent back");
+            assert_eq!(err.code, ErrorCode::BadInput, "{access:?}");
+        }
+        for access in [Access::Analyse, Access::Build, Access::Question] {
+            assert!(CursorAgent.validate_access(access).is_ok(), "{access:?}");
         }
     }
 }
