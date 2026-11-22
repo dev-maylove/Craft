@@ -133,8 +133,13 @@ pub fn triage(bin: &Binary, data: &[u8], file_name: &str) -> Report {
         tools.insert(0, ("js_app_map", "the app's logic is JavaScript inside resources/app.asar, not in this file"));
     }
     if has("flutter") {
-        toolsets.push("android");
-        tools.insert(0, ("android_flutter_identify", "Flutter apps keep their Dart code in a snapshot (libapp.so)"));
+        if bin.format == Format::Pe {
+            toolsets.push("formats");
+            tools.insert(0, ("app_folder_explain", "inspect the Windows program's install folder for its Flutter engine and assets"));
+        } else {
+            toolsets.push("android");
+            tools.insert(0, ("android_flutter_identify", "Flutter apps keep their Dart code in a snapshot (libapp.so)"));
+        }
     }
     if bin.format == Format::MachO || has("objc") || has("swift") {
         toolsets.push("apple");
@@ -1162,6 +1167,30 @@ mod tests {
         let t = triage(&bin, &data, "Sample.dll");
         assert_eq!(t.result["dotnet_arch"], "anycpu");
         assert!(t.summary.contains("any CPU") && !t.summary.contains("32-bit"), "{}", t.summary);
+    }
+
+    #[test]
+    fn windows_flutter_triage_recommends_the_install_folder() {
+        use craft_anything_formats::binary::{Symbol, SymbolKind};
+
+        let data = tk::pe64();
+        let mut bin = craft_anything_formats::parse_binary(&data).unwrap();
+        bin.symbols.push(Symbol {
+            name: "kDartVmSnapshotData".into(),
+            demangled: None,
+            addr: 0,
+            size: 0,
+            kind: SymbolKind::Data,
+            global: true,
+            weak: false,
+            defined: true,
+            dynamic: false,
+        });
+        let report = triage(&bin, &data, "Sample.exe");
+        assert_eq!(report.result["next_steps"][0]["tool"], "app_folder_explain");
+        let sets = report.result["recommended_toolsets"].as_array().unwrap();
+        assert!(sets.iter().any(|s| s == "formats"));
+        assert!(!sets.iter().any(|s| s == "android"));
     }
 
     #[test]
