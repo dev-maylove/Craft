@@ -36,13 +36,13 @@ pub static LANGUAGES: &[LangInfo] = &[
     LangInfo { code: "tr", name: "Türkçe", source: include_str!("i18n/tr.tsv") },
     LangInfo { code: "th", name: "ไทย", source: include_str!("i18n/th.tsv") },
     LangInfo { code: "et", name: "Eesti", source: include_str!("i18n/et.tsv") },
-    LangInfo { code: "he", name: "עברית", source: include_str!("i18n/he.tsv") },
 ];
 
-/// Match a locale to a registered UI language. An explicit script wins over the region.
-pub fn language_from_tag(tag: &str) -> Option<&'static str> {
+/// Match a locale against `langs`. An explicit script wins over the region, and legacy `iw`
+/// normalizes to `he`.
+pub fn language_from_tag_in(tag: &str, langs: &[LangInfo]) -> Option<&'static str> {
     let tag = tag.trim().split(['.', '@']).next().unwrap_or_default().replace('_', "-").to_ascii_lowercase();
-    if let Some(lang) = LANGUAGES.iter().find(|l| l.code == tag) {
+    if let Some(lang) = langs.iter().find(|l| l.code == tag) {
         return Some(lang.code);
     }
     let mut parts = tag.split('-');
@@ -64,8 +64,13 @@ pub fn language_from_tag(tag: &str) -> Option<&'static str> {
             }
         }
         "pt" => Some("pt-br"),
-        _ => LANGUAGES.iter().find(|l| l.code == primary).map(|l| l.code),
+        _ => langs.iter().find(|l| l.code == primary).map(|l| l.code),
     }
+}
+
+/// Match a locale to a registered UI language. An explicit script wins over the region.
+pub fn language_from_tag(tag: &str) -> Option<&'static str> {
+    language_from_tag_in(tag, LANGUAGES)
 }
 
 fn preferred_language(tags: impl IntoIterator<Item = impl AsRef<str>>) -> &'static str {
@@ -106,6 +111,22 @@ pub fn set_language(code: &str) {
     let map = lang.map(|l| parse(l.source)).unwrap_or_default();
     if let Ok(mut g) = current().write() {
         *g = (lang.map(|l| l.code).unwrap_or("en").to_string(), map);
+    }
+}
+
+/// Activate a language code and TSV catalog directly without registering it in [`LANGUAGES`].
+/// Used by RTL UI tests and offscreen snapshots before a locale catalog is shipped.
+pub fn set_custom_catalog(code: &str, source: &str) {
+    let tag = code.trim().split(['.', '@']).next().unwrap_or_default().replace('_', "-").to_ascii_lowercase();
+    let normalized = if tag == "iw" {
+        "he".to_string()
+    } else if let Some(rest) = tag.strip_prefix("iw-") {
+        format!("he-{rest}")
+    } else {
+        tag
+    };
+    if let Ok(mut g) = current().write() {
+        *g = (normalized, parse(source));
     }
 }
 
@@ -687,8 +708,20 @@ pub fn trf(s: &str, args: &[(&str, &str)]) -> String {
 }
 
 #[cfg(test)]
+pub(crate) const TEST_HE_CATALOG: &str = "\
+Apply\tהחלה
+Command palette\tלוח פקודות
+Command palette (Ctrl/⌘ K)\tלוח פקודות (Ctrl/⌘ K)
+Export a report (Markdown)\tייצוא דוח (Markdown)
+More memory makes Ghidra's first look at a big program faster; leave some for the rest of the computer. Used from the next time Ghidra starts.\tיותר זיכרון הופך את הבדיקה הראשונה של Ghidra בתוכנית גדולה למהירה יותר; חשוב להשאיר קצת לשאר המחשב. נכנס לתוקף בהפעלה הבאה של Ghidra.
+New project\tפרויקט חדש
+Open {name}\tפתיחת {name}
+";
+
+#[cfg(test)]
 pub(crate) fn tr_logical_for(code: &str, s: &str) -> String {
-    let map = LANGUAGES.iter().find(|l| l.code == code).map(|l| parse(l.source)).unwrap_or_default();
+    let source = LANGUAGES.iter().find(|l| l.code == code).map(|l| l.source).or_else(|| (code == "he").then_some(TEST_HE_CATALOG)).unwrap_or_default();
+    let map = parse(source);
     map.get(s).cloned().unwrap_or_else(|| s.to_string())
 }
 
@@ -802,11 +835,14 @@ mod tests {
         assert_eq!(language_from_tag("tr-TR"), Some("tr"));
         assert_eq!(language_from_tag("th-TH"), Some("th"));
         assert_eq!(language_from_tag("th_TH.UTF-8"), Some("th"));
-        assert_eq!(language_from_tag("he"), Some("he"));
-        assert_eq!(language_from_tag("he-IL"), Some("he"));
-        assert_eq!(language_from_tag("iw"), Some("he"));
-        assert_eq!(language_from_tag("iw-IL"), Some("he"));
-        assert_eq!(language_from_tag("iw_IL.UTF-8"), Some("he"));
+        assert_eq!(language_from_tag("he"), None);
+        assert_eq!(language_from_tag("iw"), None);
+        let with_he = [LangInfo { code: "en", name: "English", source: "" }, LangInfo { code: "he", name: "עברית", source: TEST_HE_CATALOG }];
+        assert_eq!(language_from_tag_in("he", &with_he), Some("he"));
+        assert_eq!(language_from_tag_in("he-IL", &with_he), Some("he"));
+        assert_eq!(language_from_tag_in("iw", &with_he), Some("he"));
+        assert_eq!(language_from_tag_in("iw-IL", &with_he), Some("he"));
+        assert_eq!(language_from_tag_in("iw_IL.UTF-8", &with_he), Some("he"));
         assert!(is_rtl_code("he"));
         assert!(is_rtl_code("iw"));
         assert!(is_rtl_code("iw-IL"));
@@ -840,7 +876,7 @@ mod tests {
         let mut catalogs = Vec::new();
         for lang in LANGUAGES
             .iter()
-            .filter(|l| matches!(l.code, "zh-hans" | "zh-hant" | "ru" | "ko" | "cs" | "de" | "ka" | "es" | "it" | "vi" | "pt-br" | "tr" | "th" | "et" | "he"))
+            .filter(|l| matches!(l.code, "zh-hans" | "zh-hant" | "ru" | "ko" | "cs" | "de" | "ka" | "es" | "it" | "vi" | "pt-br" | "tr" | "th" | "et"))
         {
             let mut keys = std::collections::BTreeSet::new();
             for (i, line) in lang.source.lines().enumerate() {
