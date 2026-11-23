@@ -20,6 +20,10 @@ pub const ROUTES_FILE: &str = "routes.json";
 /// desktop width; [`phone_states_dir`] holds them at the phone width (a menu button often only
 /// shows there).
 pub const STATES_DIR: &str = "states";
+/// Where sequential scroll/hover motion burst frames and CLS/Long-Task telemetry are kept.
+pub const MOTION_DIR: &str = "motion";
+/// Where 3D/WebGL/WebGPU canvas probe records and sampled frame PNGs are kept.
+pub const CANVAS3D_DIR: &str = "canvas3d";
 /// What a new site's builder is told to leave for running it outside Craft Anything.
 pub const HOW_TO_RUN: &str = "Craft Anything serves your built folder itself, so the site needs no dev or start script here. For anyone running it without Craft Anything, write app/README.md saying how: the commands that build it (such as `npm install` and `npm run build`, or none for plain files) and the folder to serve with any static web server (for example `npx serve dist`), since opening index.html straight from the disk may not work.";
 
@@ -60,6 +64,16 @@ pub fn pictured_states(ws: &Workspace) -> Vec<String> {
         }));
     }
     out
+}
+
+/// The motion burst record (`capture/motion/motion.json`) if the study captured it.
+pub fn captured_motion(ws: &Workspace) -> Option<Value> {
+    read_json(&ws.capture_dir().join(MOTION_DIR).join("motion.json"))
+}
+
+/// The 3D/WebGL/WebGPU canvas probe record (`capture/canvas3d/canvas3d.json`) if the study captured it.
+pub fn captured_canvas3d(ws: &Workspace) -> Option<Value> {
+    read_json(&ws.capture_dir().join(CANVAS3D_DIR).join("canvas3d.json"))
 }
 
 /// Another page of the site: its path, the folder name its capture uses, and its address.
@@ -209,6 +223,38 @@ impl TargetKind for WebsiteKind {
                 states.join(", ")
             ));
         }
+        if let Some(motion) = captured_motion(cx.ws) {
+            let n_scroll = motion["scroll_frames"].as_array().map_or(0, Vec::len);
+            let n_hover = motion["hover_frames"].as_array().map_or(0, Vec::len);
+            let cls = motion.pointer("/telemetry/cls").and_then(Value::as_f64).unwrap_or(0.0);
+            let avg_ms = motion.pointer("/telemetry/avg_frame_ms").and_then(Value::as_f64).unwrap_or(0.0);
+            let frames_hint = if cx.sees_pictures {
+                format!(
+                    "capture/{MOTION_DIR}/ holds {n_scroll} sequential scroll frame(s) (`burst-scroll-01.png`…) and {n_hover} hover frame(s) (`burst-hover-01.png`…) plus `motion.json` (original CLS {cls:.3}, avg frame {avg_ms:.1} ms). Inspect the burst sequences alongside `capture.json`'s `motion` section and reproduce the scroll reveals, sticky/header transitions and hover feedback using GPU-composited properties (`transform`, `opacity`)."
+                )
+            } else {
+                format!(
+                    "capture/{MOTION_DIR}/motion.json records scroll and hover motion telemetry ({n_scroll} scroll and {n_hover} hover samples; original CLS {cls:.3}, avg frame {avg_ms:.1} ms). Use `motion.json` and `capture.json`'s `motion` section to reproduce transitions, scroll reveals and hover feedback using GPU-composited properties (`transform`, `opacity`)."
+                )
+            };
+            out.push(frames_hint);
+        }
+        if let Some(canvas3d) = captured_canvas3d(cx.ws) {
+            let ctxs: Vec<&str> = canvas3d.get("contexts").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+            let ctx_label = if ctxs.is_empty() { "canvas".to_string() } else { ctxs.join(", ") };
+            let draw_calls = canvas3d.get("draw_calls_per_frame").and_then(Value::as_f64).unwrap_or(0.0);
+            let compute = canvas3d.get("compute_dispatches_per_frame").and_then(Value::as_f64).unwrap_or(0.0);
+            let hint = if cx.sees_pictures {
+                format!(
+                    "capture/{CANVAS3D_DIR}/ holds `canvas3d.json` and sampled rendered frames (`canvas-frame-01.png`, `canvas-frame-02.png`) for the site's 3D/GPU canvases ({ctx_label}; {draw_calls:.1} draw call(s)/frame, {compute:.1} compute dispatch(es)/frame). Read `capture/{CANVAS3D_DIR}/canvas3d.json`, match the 3D rendering pipeline, keep a live `requestAnimationFrame` loop with active draw/compute calls, and implement real procedural shaders rather than a static image."
+                )
+            } else {
+                format!(
+                    "capture/{CANVAS3D_DIR}/canvas3d.json records the site's 3D/GPU canvas pipeline ({ctx_label}; {draw_calls:.1} draw call(s)/frame, {compute:.1} compute dispatch(es)/frame). Read `capture/{CANVAS3D_DIR}/canvas3d.json`, match the 3D rendering pipeline, keep a live `requestAnimationFrame` loop with active draw/compute calls, and implement real procedural shaders rather than a static image."
+                )
+            };
+            out.push(hint);
+        }
         // Craft Anything serves the built folder itself, so outside it there was nothing to run (#1590).
         if !cx.ws.manifest.own_project() {
             out.push(HOW_TO_RUN.into());
@@ -224,14 +270,14 @@ impl TargetKind for WebsiteKind {
     fn refine(&self, check: &CheckResult, sees_pictures: bool) -> String {
         match check.similarity {
             Some(s) if sees_pictures => format!(
-                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). Your screenshots are in checks/round-{}/ (screenshot-<width>.png for each width, and routes/<page>/ for other pages) with the layout measured at each width in its capture.json; the original's are in capture/. Open each pair with the Read tool, fix the biggest visible differences first (layout and section order, spacing, sizes, colours, fonts, missing parts), fix the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, build it again, and reply with 1-2 plain sentences on what you changed.",
+                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). Your screenshots are in checks/round-{}/ (screenshot-<width>.png for each width, motion/burst-*.png for scroll/hover motion when recorded, and routes/<page>/ for other pages) with the layout measured at each width in its capture.json; the original's are in capture/. Open each pair with the Read tool, triage strictly by severity (fix the biggest visible differences first: broken layout/section order, spacing, sizes, colours, fonts, missing parts, motion/CLS regressions), fix the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, keep animations GPU-composited (`transform`/`opacity`), build it again, and reply with 1-2 plain sentences on what you changed.",
                 check.round, check.note, check.round
             ),
             // The likeness is measured from the screenshots, but the same measurements are in
             // text: the build's capture.json beside the original's.
             Some(s) => format!(
-                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). The check measured your build at each width the same way as the original: compare checks/round-{}/capture.json (and routes/<page>/capture.json for other pages) with capture/capture.json, fix the layout and section order and anything missing first, then the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, build it again, and reply with 1-2 plain sentences on what you changed.",
-                check.round, check.note, check.round
+                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). The check measured your build at each width the same way as the original: compare checks/round-{}/capture.json (and routes/<page>/capture.json for other pages, plus checks/round-{}/motion/motion.json when present) with capture/capture.json, triage strictly by severity (fix the layout and section order, missing parts and motion/CLS regressions first), then the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, keep animations GPU-composited (`transform`/`opacity`), build it again, and reply with 1-2 plain sentences on what you changed.",
+                check.round, check.note, check.round, check.round
             ),
             None => format!(
                 "Check {}: {}\n\nFix this in app/, build again until it succeeds, and reply with 1-2 plain sentences on what you changed.",
@@ -722,6 +768,290 @@ fn picture_likeness(cx: &CheckCx, original: &Path, built: &Path) -> Result<Optio
     Ok(Some(((layout + detail) * 50.0, layout * 100.0, detail * 100.0, h("before"), h("after"))))
 }
 
+/// Compare `capture.json`'s `motion` blueprints: flag missing transitions, animations,
+/// backdrop filters, canvas surfaces or smooth scrolling, and warn if the build introduces
+/// layout-triggering (non-composited) CSS transitions the original doesn't have.
+pub fn motion_notes(original: &Value, built: &Value) -> Vec<String> {
+    let (Some(om), Some(bm)) = (original.get("motion"), built.get("motion")) else { return Vec::new() };
+    let mut out = Vec::new();
+    let arr_len = |m: &Value, k: &str| m.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+    let num = |m: &Value, k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+    if arr_len(om, "transitions") > 0 && arr_len(bm, "transitions") == 0 {
+        out.push("the original uses CSS transitions, but the build has none".into());
+    }
+    if arr_len(om, "animations") > 0 && arr_len(bm, "animations") == 0 {
+        out.push("the original runs CSS keyframe animations, but the build has none".into());
+    }
+    if num(om, "backdrop_filters") > 0 && num(bm, "backdrop_filters") == 0 {
+        out.push(format!("the original uses backdrop-filter on {} element(s), but the build uses none", num(om, "backdrop_filters")));
+    }
+    if num(om, "canvases") > 0 && num(bm, "canvases") == 0 {
+        out.push(format!("the original has {} canvas element(s), but the build has none", num(om, "canvases")));
+    }
+    if om.get("scroll_behavior").and_then(Value::as_str) == Some("smooth") && bm.get("scroll_behavior").and_then(Value::as_str) != Some("smooth") {
+        out.push("the original sets scroll-behavior: smooth, but the build doesn't".into());
+    }
+    let built_non_comp: Vec<&str> =
+        bm.get("non_composited").and_then(Value::as_array).into_iter().flatten().filter_map(|x| x.get("value").and_then(Value::as_str)).take(5).collect();
+    if arr_len(om, "non_composited") == 0 && !built_non_comp.is_empty() {
+        out.push(format!(
+            "the build animates layout-triggering CSS properties ({}) — switch to GPU-composited `transform`/`opacity`",
+            built_non_comp.join(", ")
+        ));
+    }
+    out
+}
+
+/// Evaluate `motion.json` telemetry from the original vs built motion capture: produces hard
+/// `Claim`s for CLS regressions, newly introduced non-composited layout transitions, severe
+/// main-thread stalls, and missing hover response, plus a concise summary note.
+pub fn motion_telemetry_claims(original: &Value, built: &Value) -> (Vec<Claim>, Vec<String>) {
+    let (Some(ot), Some(bt)) = (original.get("telemetry"), built.get("telemetry")) else {
+        return (Vec::new(), Vec::new());
+    };
+    let f_opt = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
+    let f = |v: &Value, k: &str| f_opt(v, k).unwrap_or(0.0);
+    let u = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let strs_opt = |v: &Value, k: &str| -> Option<Vec<String>> {
+        v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+    };
+
+    let mut claims = Vec::new();
+    let mut notes = Vec::new();
+
+    if let (Some(o_cls), Some(b_cls)) = (f_opt(ot, "cls"), f_opt(bt, "cls"))
+        && o_cls <= 0.10
+    {
+        claims.push(Claim::new("Motion stays layout-stable (CLS <= 0.15)", b_cls <= 0.15, format!("CLS is {b_cls:.3} (original {o_cls:.3})")));
+    }
+
+    if let (Some(o_non_comp), Some(b_non_comp)) = (strs_opt(ot, "non_composited_transitions"), strs_opt(bt, "non_composited_transitions"))
+        && o_non_comp.is_empty()
+    {
+        claims.push(Claim::new(
+            "Transitions use GPU-composited properties (no layout-triggering CSS transitions)",
+            b_non_comp.is_empty(),
+            format!("found layout transitions: {}", b_non_comp.join(", ")),
+        ));
+    }
+
+    let (o_long_n, b_long_n) = (u(ot, "long_tasks_count"), u(bt, "long_tasks_count"));
+    if let (Some(o_long_ms), Some(b_long_ms)) = (f_opt(ot, "long_tasks_ms"), f_opt(bt, "long_tasks_ms"))
+        && o_long_ms <= 100.0
+    {
+        claims.push(Claim::new(
+            "Motion avoids severe main-thread stalls (long tasks <= 500 ms)",
+            b_long_ms <= 500.0,
+            format!("{b_long_n} long task(s) totalling {b_long_ms:.0} ms (original {o_long_n}, {o_long_ms:.0} ms)"),
+        ));
+    }
+
+    let (o_hover_tiles, b_hover_tiles) = (u(original, "hover_changed_tiles"), u(built, "hover_changed_tiles"));
+    if o_hover_tiles > 0 && built.get("hover_target").is_some_and(|v| !v.is_null()) {
+        claims.push(Claim::new(
+            "Primary interactive control shows visible hover feedback",
+            b_hover_tiles > 0,
+            format!("hover changed {b_hover_tiles} tile(s) (original {o_hover_tiles})"),
+        ));
+        if b_hover_tiles == 0 {
+            notes.push("hovering the primary control changed pixels on the original, but showed no visible hover transition in the build".into());
+        }
+    }
+
+    let (o_cls, b_cls) = (f(ot, "cls"), f(bt, "cls"));
+    let b_long_ms = f(bt, "long_tasks_ms");
+    let (b_avg, b_max) = (f(bt, "avg_frame_ms"), f(bt, "max_frame_ms"));
+    notes.push(format!(
+        "motion telemetry: CLS {b_cls:.3} (orig {o_cls:.3}), {b_long_n} long task(s) ({b_long_ms:.0} ms), avg frame {b_avg:.1} ms (max {b_max:.1} ms)"
+    ));
+    (claims, notes)
+}
+
+fn motion_telemetry_incomplete(v: &Value) -> bool {
+    let Some(t) = v.get("telemetry") else { return true };
+    t.get("missing_state").and_then(Value::as_bool) == Some(true)
+        || t.get("cls").and_then(Value::as_f64).is_none()
+        || t.get("non_composited_transitions").and_then(Value::as_array).is_none()
+        || t.get("long_tasks_ms").and_then(Value::as_f64).is_none()
+}
+
+/// Capture sequential scroll/hover motion bursts and telemetry on the build when the study did.
+fn motion_check(cx: &CheckCx, base: &str, out: &Path, unknowns: &mut Vec<String>, claims: &mut Vec<Claim>) -> Result<Vec<String>, ToolError> {
+    let theirs = cx.ws.capture_dir().join(MOTION_DIR);
+    let Some(original) = read_json(&theirs.join("motion.json")) else { return Ok(Vec::new()) };
+    let ours = out.join(MOTION_DIR);
+    let width = original.get("width").and_then(Value::as_u64).unwrap_or(1440);
+    let height = original.get("height").and_then(Value::as_u64).unwrap_or(900);
+    if let Err(e) = cx.call("web_site_open", json!({"url": base, "settle_ms": 1000, "signed_in": false})) {
+        if e.code == craft_anything_evidence::ErrorCode::Cancelled || cx.stop().cancelled() {
+            return Err(e);
+        }
+        unknowns.push("scroll and hover motion telemetry couldn't be measured".into());
+        return Ok(vec![format!("motion telemetry couldn't be measured: {}", e.message)]);
+    }
+    if let Err(e) = cx.call("web_page_motion_capture", json!({"output_directory": ours.display().to_string(), "width": width, "height": height})) {
+        if e.code == craft_anything_evidence::ErrorCode::Cancelled || cx.stop().cancelled() {
+            return Err(e);
+        }
+        unknowns.push("scroll and hover motion telemetry couldn't be measured".into());
+        return Ok(vec![format!("motion telemetry couldn't be measured: {}", e.message)]);
+    }
+    let Some(built) = read_json(&ours.join("motion.json")) else {
+        unknowns.push("scroll and hover motion telemetry couldn't be read".into());
+        return Ok(Vec::new());
+    };
+    if motion_telemetry_incomplete(&original) || motion_telemetry_incomplete(&built) {
+        unknowns.push("scroll and hover motion telemetry was incomplete".into());
+    }
+    if original.get("hover_changed_tiles").and_then(Value::as_u64).unwrap_or(0) > 0 && built.get("hover_target").is_none_or(Value::is_null) {
+        unknowns.push("hover feedback couldn't be verified: no interactive hover target was found on the built page".into());
+    }
+    let (m_claims, m_notes) = motion_telemetry_claims(&original, &built);
+    claims.extend(m_claims);
+    Ok(m_notes)
+}
+
+/// Check whether a `canvas3d.json` record initialized a 3D GPU context (`webgl`, `webgl2`, `webgpu`).
+fn has_3d_context(v: &Value) -> bool {
+    let is_3d = |s: &str| matches!(s.to_ascii_lowercase().as_str(), "webgl" | "webgl2" | "webgpu");
+    if v.get("has_3d_context").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if v.get("contexts").and_then(Value::as_array).is_some_and(|arr| arr.iter().filter_map(Value::as_str).any(is_3d)) {
+        return true;
+    }
+    v.get("canvases").and_then(Value::as_array).is_some_and(|arr| arr.iter().filter_map(|c| c.get("kind").and_then(Value::as_str)).any(is_3d))
+}
+
+/// Evaluate `canvas3d.json` from the original vs built 3D canvas probe: produces hard `Claim`s
+/// requiring a matching 3D context (`webgl`/`webgl2`/`webgpu`) and active rendered frames (not a
+/// blank or dead canvas), concise notes, and any `unknowns` when instrumentation did not run or
+/// an `OffscreenCanvas` worker context could not be inspected.
+pub fn canvas3d_claims(original: &Value, built: &Value) -> (Vec<Claim>, Vec<String>, Vec<String>) {
+    let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    let b = |v: &Value, k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let ctx_list =
+        |v: &Value| -> Vec<String> { v.get("contexts").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(String::from).collect() };
+
+    let mut claims = Vec::new();
+    let mut notes = Vec::new();
+    let mut unknowns = Vec::new();
+
+    if original.get("instrumented") == Some(&Value::Bool(false)) || built.get("instrumented") == Some(&Value::Bool(false)) {
+        unknowns.push("3D canvas instrumentation did not run on the sampled page".into());
+        return (claims, notes, unknowns);
+    }
+
+    let orig_has_3d = has_3d_context(original);
+    let built_has_3d = has_3d_context(built);
+    let built_offscreen = b(built, "offscreen_transferred");
+    let orig_draw_calls = f(original, "draw_calls_per_frame");
+    let built_draw_calls = f(built, "draw_calls_per_frame");
+    // Distinguish explicit `null` (snapshot failed -> unmeasured) from absent key (legacy record -> fallback).
+    let interval_draws_of = |v: &Value, hist: f64| -> Option<bool> {
+        match v.get("interval_draw_calls") {
+            Some(Value::Null) => None,
+            Some(n) => n.as_u64().map(|c| c > 0),
+            None => Some(hist > 0.0),
+        }
+    };
+    let orig_interval_draws = interval_draws_of(original, orig_draw_calls);
+    let built_interval_draws = interval_draws_of(built, built_draw_calls);
+    let orig_animating_opt = original.get("canvas_animating").and_then(Value::as_bool);
+    let built_animating_opt = built.get("canvas_animating").and_then(Value::as_bool);
+    let orig_animating = orig_animating_opt.unwrap_or(false);
+    let built_animating = built_animating_opt.unwrap_or(false);
+    let orig_compute = f(original, "compute_dispatches_per_frame");
+    let built_compute = f(built, "compute_dispatches_per_frame");
+    let built_instanced = f(built, "instanced_calls_per_frame");
+    let orig_fps = f(original, "fps");
+    let built_fps = f(built, "fps");
+
+    if orig_has_3d {
+        if built_has_3d || !built_offscreen {
+            let orig_ctxs = ctx_list(original);
+            let built_ctxs = ctx_list(built);
+            let orig_desc = if orig_ctxs.is_empty() { "3D context".to_string() } else { orig_ctxs.join(", ") };
+            let detail = if built_ctxs.is_empty() {
+                format!("no 3D canvas context initialized (original uses {orig_desc})")
+            } else {
+                format!("build uses {} (original uses {orig_desc})", built_ctxs.join(", "))
+            };
+            claims.push(Claim::new("3D canvas initializes a WebGL or WebGPU context", built_has_3d, detail));
+        } else {
+            unknowns.push("built canvas transferred control to OffscreenCanvas; 3D context inside worker couldn't be inspected".into());
+        }
+    }
+
+    let orig_active_known = orig_interval_draws == Some(true) || orig_animating;
+    let orig_activity_unmeasured = orig_has_3d && !orig_active_known && (orig_interval_draws.is_none() || orig_animating_opt.is_none());
+    if orig_activity_unmeasured {
+        unknowns.push("original 3D canvas frame activity couldn't be measured".into());
+    } else if orig_has_3d && orig_active_known {
+        if !built_has_3d && built_offscreen {
+            unknowns.push("3D canvas frame activity couldn't be verified because the built canvas transferred control to OffscreenCanvas".into());
+        } else if built_has_3d && built_interval_draws != Some(true) && !built_animating && (built_interval_draws.is_none() || built_animating_opt.is_none()) {
+            unknowns.push("built 3D canvas frame activity couldn't be measured".into());
+        } else {
+            let active = built_has_3d && (built_interval_draws == Some(true) || built_animating);
+            let built_anim_str = built_animating_opt.map_or("unmeasured", |v| if v { "true" } else { "false" });
+            let orig_anim_str = orig_animating_opt.map_or("unmeasured", |v| if v { "true" } else { "false" });
+            claims.push(Claim::new(
+                "3D canvas renders active frames (not blank or static)",
+                active,
+                format!(
+                    "{built_draw_calls:.1} draw call(s)/frame, animating={built_anim_str} (original {orig_draw_calls:.1}/frame, animating={orig_anim_str})"
+                ),
+            ));
+        }
+    }
+
+    if orig_compute > 0.0 && built_compute <= 0.0 && built_instanced <= 0.0 {
+        notes.push(format!(
+            "the original runs WebGPU compute dispatches ({orig_compute:.1}/frame), but the build has zero compute dispatches or instanced simulation"
+        ));
+    }
+
+    if orig_has_3d || orig_draw_calls > 0.0 || orig_compute > 0.0 {
+        notes.push(format!(
+            "3D canvas probe: {built_draw_calls:.1} draw call(s)/frame (orig {orig_draw_calls:.1}), {built_compute:.1} compute dispatch(es)/frame (orig {orig_compute:.1}), {built_fps:.1} fps (orig {orig_fps:.1}), animating={built_animating}"
+        ));
+    }
+
+    (claims, notes, unknowns)
+}
+
+/// Probe the built site's 3D/WebGL/WebGPU canvases when the study recorded `capture/canvas3d/canvas3d.json`.
+fn canvas3d_check(cx: &CheckCx, base: &str, out: &Path, unknowns: &mut Vec<String>, claims: &mut Vec<Claim>) -> Result<Vec<String>, ToolError> {
+    let theirs = cx.ws.capture_dir().join(CANVAS3D_DIR);
+    let Some(original) = read_json(&theirs.join("canvas3d.json")) else { return Ok(Vec::new()) };
+    let ours = out.join(CANVAS3D_DIR);
+    let width = original.get("width").and_then(Value::as_u64).unwrap_or(1440);
+    let height = original.get("height").and_then(Value::as_u64).unwrap_or(900);
+    if let Err(e) = cx.call("web_site_open", json!({"url": base, "settle_ms": 1000, "signed_in": false})) {
+        if e.code == craft_anything_evidence::ErrorCode::Cancelled || cx.stop().cancelled() {
+            return Err(e);
+        }
+        unknowns.push("3D canvas pipeline couldn't be probed".into());
+        return Ok(vec![format!("3D canvas probe couldn't run: {}", e.message)]);
+    }
+    if let Err(e) = cx.call("web_webgl_webgpu_probe", json!({"output_directory": ours.display().to_string(), "width": width, "height": height})) {
+        if e.code == craft_anything_evidence::ErrorCode::Cancelled || cx.stop().cancelled() {
+            return Err(e);
+        }
+        unknowns.push("3D canvas pipeline couldn't be probed".into());
+        return Ok(vec![format!("3D canvas probe couldn't run: {}", e.message)]);
+    }
+    let Some(built) = read_json(&ours.join("canvas3d.json")) else {
+        unknowns.push("3D canvas probe results couldn't be read".into());
+        return Ok(Vec::new());
+    };
+    let (c_claims, c_notes, c_unknowns) = canvas3d_claims(&original, &built);
+    claims.extend(c_claims);
+    unknowns.extend(c_unknowns);
+    Ok(c_notes)
+}
+
 /// Open the build's menus, pop-ups and tabs the way the study opened the original's in `dir`
 /// (`states` or `states-<width>`), at the same width, and compare each pair of pictures. None
 /// when the study pictured none there.
@@ -855,6 +1185,7 @@ impl Check for WebVisualCheck {
                         .into_iter()
                         .flatten()
                         .chain(design_notes(&o, &b))
+                        .chain(motion_notes(&o, &b))
                         .chain(health_notes(&o, &b))
                         .map(|n| format!("; {n}"))
                         .collect::<String>()
@@ -869,6 +1200,8 @@ impl Check for WebVisualCheck {
         for dir in state_dirs(&ws.capture_dir()) {
             notes.extend(states_note(cx, &base, &out, &dir, &mut unknowns, &mut claims)?);
         }
+        notes.extend(motion_check(cx, &base, &out, &mut unknowns, &mut claims)?);
+        notes.extend(canvas3d_check(cx, &base, &out, &mut unknowns, &mut claims)?);
         let failed: Vec<String> = claims.iter().filter(|c| !c.passed).map(|c| format!("{} ({})", c.title, c.detail)).collect();
         if !failed.is_empty() {
             notes.push(format!("{} of {} claims don't hold yet: {}", failed.len(), claims.len(), failed.join("; ")));
@@ -931,5 +1264,154 @@ mod tests {
         assert_eq!(site_dir(d.path()), Some(d.path().to_path_buf()), "a plain page");
         std::fs::write(d.path().join("package.json"), "{}").unwrap();
         assert_eq!(site_dir(d.path()), None, "a page beside a manifest is not a built site");
+    }
+
+    #[test]
+    fn motion_notes_and_telemetry_claims_catch_regressions() {
+        let orig = json!({
+            "motion": {
+                "transitions": [{"value": "transform 0.2s ease", "count": 4}],
+                "animations": [{"value": "float 3s ease-in-out", "count": 1}],
+                "non_composited": [],
+                "backdrop_filters": 2,
+                "canvases": 1,
+                "scroll_behavior": "smooth"
+            }
+        });
+        let bad = json!({
+            "motion": {
+                "transitions": [],
+                "animations": [],
+                "non_composited": [{"value": "width", "count": 2}],
+                "backdrop_filters": 0,
+                "canvases": 0,
+                "scroll_behavior": "auto"
+            }
+        });
+        let notes = motion_notes(&orig, &bad).join(" | ");
+        assert!(notes.contains("CSS transitions") && notes.contains("keyframe animations") && notes.contains("backdrop-filter"), "{notes}");
+        assert!(notes.contains("canvas") && notes.contains("scroll-behavior: smooth") && notes.contains("width"), "{notes}");
+
+        let orig_tel = json!({
+            "hover_changed_tiles": 6,
+            "telemetry": {"cls": 0.01, "long_tasks_count": 0, "long_tasks_ms": 0.0, "avg_frame_ms": 16.5, "max_frame_ms": 24.0, "non_composited_transitions": []}
+        });
+        let bad_tel = json!({
+            "hover_target": {"tag": "button", "label": "Start"},
+            "hover_changed_tiles": 0,
+            "telemetry": {"cls": 0.28, "long_tasks_count": 4, "long_tasks_ms": 620.0, "avg_frame_ms": 48.0, "max_frame_ms": 220.0, "non_composited_transitions": ["top", "height"]}
+        });
+        let (claims, t_notes) = motion_telemetry_claims(&orig_tel, &bad_tel);
+        assert_eq!(claims.len(), 4);
+        assert!(claims.iter().all(|c| !c.passed), "all 4 motion claims should fail on regressed build: {claims:?}");
+        assert!(t_notes.iter().any(|n| n.contains("hover transition")), "{t_notes:?}");
+
+        let good_tel = json!({
+            "hover_target": {"tag": "button", "label": "Start"},
+            "hover_changed_tiles": 5,
+            "telemetry": {"cls": 0.02, "long_tasks_count": 0, "long_tasks_ms": 0.0, "avg_frame_ms": 16.6, "max_frame_ms": 20.0, "non_composited_transitions": []}
+        });
+        let (ok_claims, _) = motion_telemetry_claims(&orig_tel, &good_tel);
+        assert_eq!(ok_claims.len(), 4);
+        assert!(ok_claims.iter().all(|c| c.passed), "{ok_claims:?}");
+    }
+
+    #[test]
+    fn canvas3d_claims_enforce_3d_context_active_frames_and_compute_notes() {
+        let orig = json!({
+            "contexts": ["webgpu"],
+            "has_3d_context": true,
+            "draw_calls_per_frame": 12.0,
+            "instanced_calls_per_frame": 2.0,
+            "compute_dispatches_per_frame": 4.0,
+            "fps": 60.0,
+            "canvas_animating": true,
+        });
+
+        // Blank / missing 3D build fails both claims and reports missing compute simulation.
+        let dead = json!({
+            "contexts": ["2d"],
+            "has_3d_context": false,
+            "draw_calls_per_frame": 0.0,
+            "instanced_calls_per_frame": 0.0,
+            "compute_dispatches_per_frame": 0.0,
+            "fps": 0.0,
+            "canvas_animating": false,
+        });
+        let (dead_claims, dead_notes, dead_unknowns) = canvas3d_claims(&orig, &dead);
+        assert!(dead_unknowns.is_empty());
+        assert_eq!(dead_claims.len(), 2, "{dead_claims:?}");
+        assert!(dead_claims.iter().all(|c| !c.passed), "blank/2D build must fail 3D context and active-frame claims: {dead_claims:?}");
+        assert!(dead_notes.iter().any(|n| n.contains("WebGPU compute dispatches")), "{dead_notes:?}");
+
+        // Active WebGL2 build with instanced simulation passes both claims and clears compute warning.
+        let good = json!({
+            "contexts": ["webgl2"],
+            "has_3d_context": true,
+            "draw_calls_per_frame": 8.0,
+            "interval_draw_calls": 16,
+            "instanced_calls_per_frame": 1.0,
+            "compute_dispatches_per_frame": 0.0,
+            "fps": 59.5,
+            "canvas_animating": true,
+        });
+        let (good_claims, good_notes, good_unknowns) = canvas3d_claims(&orig, &good);
+        assert!(good_unknowns.is_empty());
+        assert_eq!(good_claims.len(), 2, "{good_claims:?}");
+        assert!(good_claims.iter().all(|c| c.passed), "{good_claims:?}");
+        assert!(!good_notes.iter().any(|n| n.contains("zero compute dispatches")), "{good_notes:?}");
+
+        // Offscreen-transferred build with unmeasured 3D context records unknowns and does not pass activity claim.
+        let offscreen_only = json!({
+            "contexts": ["offscreen"],
+            "has_3d_context": false,
+            "offscreen_transferred": true,
+            "draw_calls_per_frame": 0.0,
+            "canvas_animating": true,
+        });
+        let (off_claims, _, off_unknowns) = canvas3d_claims(&orig, &offscreen_only);
+        assert!(off_claims.is_empty(), "must not emit passing 3D claims without measured 3D context: {off_claims:?}");
+        assert_eq!(off_unknowns.len(), 2, "{off_unknowns:?}");
+
+        // Missing instrumentation records an unknown instead of failing claims.
+        let uninstrumented = json!({"instrumented": false, "contexts": [], "has_3d_context": false});
+        let (u_claims, _, u_unknowns) = canvas3d_claims(&orig, &uninstrumented);
+        assert!(u_claims.is_empty() && u_unknowns.len() == 1, "{u_claims:?} {u_unknowns:?}");
+
+        // Explicit null interval_draw_calls or null canvas_animating (with 0 interval draws) records unknown, not a pass/fail.
+        let unmeasured_interval = json!({
+            "contexts": ["webgl2"],
+            "has_3d_context": true,
+            "draw_calls_per_frame": 10.0,
+            "interval_draw_calls": null,
+            "canvas_animating": false,
+        });
+        let (ni_claims, _, ni_unknowns) = canvas3d_claims(&orig, &unmeasured_interval);
+        assert_eq!(ni_claims.len(), 1, "only context claim runs when interval is null: {ni_claims:?}");
+        assert_eq!(ni_unknowns.len(), 1, "{ni_unknowns:?}");
+
+        let unmeasured_anim = json!({
+            "contexts": ["webgl2"],
+            "has_3d_context": true,
+            "draw_calls_per_frame": 0.0,
+            "interval_draw_calls": 0,
+            "canvas_animating": null,
+        });
+        let (na_claims, _, na_unknowns) = canvas3d_claims(&orig, &unmeasured_anim);
+        assert_eq!(na_claims.len(), 1, "null canvas_animating with 0 draws yields unknown: {na_claims:?}");
+        assert_eq!(na_unknowns.len(), 1, "{na_unknowns:?}");
+
+        // Non-3D static or animating 2D canvas emits no 3D claims.
+        for animating in [false, true] {
+            let canvas_2d = json!({
+                "contexts": ["2d"],
+                "has_3d_context": false,
+                "draw_calls_per_frame": 0.0,
+                "compute_dispatches_per_frame": 0.0,
+                "canvas_animating": animating,
+            });
+            let (none_claims, none_notes, none_unknowns) = canvas3d_claims(&canvas_2d, &canvas_2d);
+            assert!(none_claims.is_empty() && none_notes.is_empty() && none_unknowns.is_empty(), "animating={animating}: {none_claims:?} {none_notes:?}");
+        }
     }
 }

@@ -80,6 +80,29 @@ impl Worker {
                 // The widths the check compares at, so every picture has its pair.
                 let widths = self.engine.session().settings.build.widths();
                 self.call("web_site_capture", json!({"output_directory": capture.display().to_string(), "widths": widths, "noise_pass": true}))?;
+                // Sequential scroll and hover motion burst frames + CLS/Long-Task/frame-pacing telemetry,
+                // sampled on the freshly loaded start page before opening menus or dialogs.
+                self.step(ws, Step::Study, Status::Inspecting, "Recording scroll and hover motion telemetry…")?;
+                let motion_width = widths.first().copied().unwrap_or(1440);
+                let motion_dir = capture.join(kinds::website::MOTION_DIR);
+                if let Err(e) = self.call("web_page_motion_capture", json!({"output_directory": motion_dir.display().to_string(), "width": motion_width})) {
+                    self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't record motion telemetry at {motion_width} px: {}", e.message))?;
+                }
+                // Inspect 3D/WebGL/WebGPU canvas pipelines when the captured page includes `<canvas>` elements.
+                let has_canvases = std::fs::read(capture.join("capture.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                    .and_then(|v| v.pointer("/motion/canvases").and_then(Value::as_u64))
+                    .unwrap_or(0)
+                    > 0;
+                if has_canvases {
+                    self.step(ws, Step::Study, Status::Inspecting, "Inspecting 3D canvases, WebGL and WebGPU pipelines…")?;
+                    let canvas3d_dir = capture.join(kinds::website::CANVAS3D_DIR);
+                    if let Err(e) = self.call("web_webgl_webgpu_probe", json!({"output_directory": canvas3d_dir.display().to_string(), "width": motion_width}))
+                    {
+                        self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't inspect 3D canvases at {motion_width} px: {}", e.message))?;
+                    }
+                }
                 // Menus, pop-ups and tabs, one at a time, on a computer and on a phone (where a menu
                 // button often replaces the navigation); a page without them (or a failure) is fine.
                 self.step(ws, Step::Study, Status::Inspecting, "Opening its menus, pop-ups and tabs…")?;
@@ -404,11 +427,13 @@ fn remove_deep_only(capture: &Path) -> Result<(), ToolError> {
             Err(e) => return Err(ToolError::io(path.display(), e)),
         }
     }
-    let runs = capture.join(kinds::runs::RUNS_DIR);
-    match std::fs::remove_dir_all(&runs) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(ToolError::io(runs.display(), e)),
+    for sub in [kinds::runs::RUNS_DIR, kinds::website::CANVAS3D_DIR] {
+        let dir = capture.join(sub);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ToolError::io(dir.display(), e)),
+        }
     }
     Ok(())
 }

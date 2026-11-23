@@ -409,6 +409,8 @@ fn restricted_mode_omits_machine_and_web_tools() {
     assert!(!names.contains(&"web_site_open".to_string()));
     assert!(!names.contains(&"web_site_capture".to_string()));
     assert!(!names.contains(&"web_page_states_capture".to_string()));
+    assert!(!names.contains(&"web_page_motion_capture".to_string()));
+    assert!(!names.contains(&"web_webgl_webgpu_probe".to_string()));
 
     // Tools no list named: what each declares keeps them off too.
     for id in ["project_play", "web_browser_connect", "web_page_screenshot_take", "web_standin_start", "native_cutter_command_run"] {
@@ -436,6 +438,7 @@ fn restricted_mode_refuses_calling_turned_off_tools() {
             req(7, "tools/call", json!({"name": "adb_device_show", "arguments": {}})),
             req(8, "tools/call", json!({"name": "mcp__craft-anything__web_site_open", "arguments": {}})),
             req(9, "tools/call", json!({"name": "web-site-open", "arguments": {}})),
+            req(10, "tools/call", json!({"name": "web_webgl_webgpu_probe", "arguments": {}})),
         ],
     );
 
@@ -449,6 +452,7 @@ fn restricted_mode_refuses_calling_turned_off_tools() {
         (7, "adb_device_show"),
         (8, "web_site_open"),
         (9, "web_site_open"),
+        (10, "web_webgl_webgpu_probe"),
     ] {
         let r = response(&out, id);
         assert_eq!(r["result"]["isError"], true, "id {id} ({tool_name}) should be error");
@@ -472,6 +476,7 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     assert!(names.contains(&"web_site_open".to_string()));
     assert!(!names.contains(&"web_site_capture".to_string()), "--allow-web is only for web tools");
     assert!(!names.contains(&"web_page_states_capture".to_string()));
+    assert!(!names.contains(&"web_webgl_webgpu_probe".to_string()));
     assert!(!names.contains(&"build_command_run".to_string()));
     assert!(!names.iter().any(|n| n.starts_with("adb_")));
     // Signing in opens a window on the host's desktop: never with --restricted.
@@ -484,8 +489,26 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     assert!(!names_cap.contains(&"web_site_open".to_string()), "--allow-capture is only for capture tools");
     assert!(names_cap.contains(&"web_site_capture".to_string()));
     assert!(names_cap.contains(&"web_page_states_capture".to_string()));
+    assert!(names_cap.contains(&"web_page_motion_capture".to_string()));
+    assert!(names_cap.contains(&"web_webgl_webgpu_probe".to_string()));
     assert!(!names_cap.contains(&"build_command_run".to_string()));
     assert!(!names_cap.iter().any(|n| n.starts_with("adb_")));
+}
+
+#[test]
+fn clean_room_lists_visitor_website_tools_including_canvas_probe() {
+    let input = format!("{}\n", req(1, "tools/list", json!({})));
+    let mut session = craft_anything_engine::testing::session();
+    session.settings.deep_mode = false;
+    let engine = Arc::new(Engine::new(session));
+    let buf = Buf::default();
+    serve(engine, ServerOptions { all_tools: true, ..Default::default() }, std::io::Cursor::new(input.into_bytes()), Box::new(buf.clone())).unwrap();
+    let out: Vec<Value> = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let names = tool_names(&response(&out, 1));
+    for allowed in CLEAN_ROOM_WEBSITE_TOOLS {
+        assert!(names.contains(&allowed.to_string()), "{allowed} should be listed in Clean room");
+    }
+    assert!(!names.contains(&"web_page_show".to_string()), "Deep-only web tools stay hidden in Clean room");
 }
 
 /// Review of #1459: --allow-web (with --allow-run) must not let a restricted client open the
