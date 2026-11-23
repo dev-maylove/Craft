@@ -176,7 +176,12 @@ fn general(app: &mut CraftApp, ui: &mut Ui) {
             }
             // Both modes draw text at one size: zoom is the way to make it bigger.
             let t = Tokens::get(ui.ctx());
-            ui.label(RichText::new(tr("Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it.")).color(t.text_faint).size(theme::CAPTION));
+            crate::i18n::wrapped_label(
+                ui,
+                &crate::i18n::tr_logical("Text bigger or smaller: Ctrl/⌘ + and Ctrl/⌘ −. Ctrl/⌘ 0 resets it."),
+                egui::FontId::proportional(theme::CAPTION),
+                |r| r.color(t.text_faint),
+            );
         });
     });
     let dir = app.settings.projects_dir();
