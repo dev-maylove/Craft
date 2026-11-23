@@ -372,6 +372,16 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     ui.add_space(theme::space::LG);
     widgets::caption(ui, "Your brains");
     ui.add_space(theme::space::XS);
+    if app.state.screen == crate::state::Screen::Project
+        && let Some(workspace) = &app.workspace
+    {
+        let choices = app.builder_choices();
+        let project_builder = workspace.manifest.builder.as_ref().filter(|name| choices.iter().any(|choice| &choice.name == *name));
+        let builder = project_builder.cloned().or_else(|| app.default_builder());
+        let label = builder.map_or_else(|| tr("No builder available for a new run."), |name| trf("Builder for a new run: {name}", &[("name", &name)]));
+        ui.label(RichText::new(label).color(t.text_dim));
+        ui.add_space(theme::space::XS);
+    }
     if app.backends.is_empty() {
         ui.label(RichText::new(tr("No AI is set up yet. The built-in engines still work; an AI adds plain-words answers.")).color(t.text_dim));
     }
@@ -407,7 +417,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                         ui.data_mut(|d| d.insert_temp(confirm_id, b.name.clone()));
                     }
                     if app.state.backend.as_ref() == Some(&b.name) {
-                        widgets::pill(ui, "In use", t.on_accent, t.accent);
+                        widgets::pill(ui, "Chat AI", t.on_accent, t.accent);
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(egui::Label::new(RichText::new(&b.name).font(theme::semibold(theme::BODY))).truncate());
@@ -741,7 +751,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
             }
             ui.add_space(theme::space::MD);
             ui.horizontal_wrapped(|ui| {
-                if app.state.backend.as_ref() != Some(&b.name) && widgets::secondary(ui, None, "Use").clicked() {
+                if app.state.backend.as_ref() != Some(&b.name) && widgets::secondary(ui, None, "Use for chat").clicked() {
                     pick = Some(b.name.clone());
                 }
                 // Who builds: the chosen one says so (click to go back to automatic).
@@ -1390,6 +1400,41 @@ mod tests {
             .join("\n");
         assert!(text.contains("Check"));
         assert!(text.contains("Agent test is installed but is not signed in."));
+    }
+
+    #[test]
+    fn settings_distinguishes_chat_from_the_open_projects_builder() {
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = Workspace::create(dir.path(), "Notes", "Notes app", TargetRef::None).unwrap();
+        workspace.manifest.builder = Some("Project builder".into());
+        let mut app = demo::app(demo::engine(craft_anything_engine::Mode::Beginner, true));
+        app.workspace = Some(workspace);
+        app.state.screen = crate::state::Screen::Project;
+        app.state.backend = Some("Chat backend".into());
+        app.builder = Some("Chat backend".into());
+        app.backends = ["Chat backend", "Project builder"]
+            .map(|name| BackendConfig { name: name.into(), kind: BackendKind::Openai, model: "gpt-test".into(), base_url: None, ssh_host: None, enabled: true })
+            .to_vec();
+
+        let context = egui::Context::default();
+        theme::install_fonts(&context);
+        let mut output = context.run_ui(Default::default(), |ui| ai(&mut app, ui));
+        output.textures_delta.clear();
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Chat AI"));
+        assert!(text.contains("Project builder"));
+        assert!(text.contains("Builder for a new run: Project builder"));
+        assert_eq!(app.workspace.as_ref().unwrap().manifest.builder.as_deref(), Some("Project builder"));
     }
 
     /// #1358: an API backend with a saved key can have it replaced or forgotten in place, while an
