@@ -7,7 +7,7 @@
 //! Data minimisation: form field values, cookies and storage are never read; the capture holds
 //! what any visitor sees on the page.
 
-use super::artifact_tools::{create_absent_dir, write_new_file};
+use super::artifact_tools::{abs_path, create_absent_dir, read_capped, write_new_file};
 use super::browser_tools::{browser_env, cleanup, deadline};
 use super::native_common::spec;
 use super::site_sign_in;
@@ -61,6 +61,17 @@ pub fn specs() -> Vec<ToolSpec> {
             Requires::Engine("chromium"),
             schema_of::<StatesParams>,
             web_page_states_capture,
+        ),
+        spec(
+            "web_pixel_diff_heatmap",
+            "Compute visual diff heatmap and pixel divergence",
+            "Compare an original and rebuilt screenshot deterministically using SSIM and perceptual CIELAB (CIE76) Delta-E, cluster contiguous differing pixels into ordered bounding regions, and write a composite numbered heatmap (`heatmap.png`) plus exact geometric metadata (`diff.json`) into a new output folder. Pure computation over image files; no browser required.",
+            "Compare two screenshots pixel by pixel and draw a numbered heatmap highlighting every visual difference.",
+            Toolset::Browser,
+            Effects::EVIDENCE.union(Effects::WRITES_FILESYSTEM),
+            Requires::Nothing,
+            schema_of::<PixelDiffHeatmapParams>,
+            web_pixel_diff_heatmap,
         ),
         spec(
             "web_site_close",
@@ -1314,6 +1325,109 @@ fn block_line(blk: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
+// web_pixel_diff_heatmap (pure computation)
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PixelDiffHeatmapParams {
+    /// Absolute path to the original (reference) screenshot (PNG, JPEG, WebP, or GIF).
+    pub original_image_path: String,
+    /// Absolute path to the rebuilt screenshot (PNG, JPEG, WebP, or GIF).
+    pub built_image_path: String,
+    /// Absolute path of a folder that does not exist yet; `heatmap.png` and `diff.json` are written there.
+    pub output_directory: String,
+    /// Perceptual CIE76 Delta-E threshold above which a pixel counts as differing (0.5..=50.0, default 2.5).
+    #[serde(default)]
+    pub delta_e_threshold: Option<f64>,
+}
+
+fn web_pixel_diff_heatmap(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: PixelDiffHeatmapParams = parse_params(params)?;
+    let threshold = p.delta_e_threshold.unwrap_or(web_common::DEFAULT_DELTA_E_THRESHOLD);
+    if !threshold.is_finite() || !(0.5..=50.0).contains(&threshold) {
+        return Err(ToolError::invalid("delta_e_threshold must be 0.5..=50.0"));
+    }
+    let out_check = abs_path(&p.output_directory, "output_directory")?;
+    if out_check.exists() {
+        return Err(ToolError::invalid(format!("output_directory already exists: {}", out_check.display())));
+    }
+    let orig_path = abs_path(&p.original_image_path, "original_image_path")?;
+    let built_path = abs_path(&p.built_image_path, "built_image_path")?;
+    let orig_bytes = read_capped(&orig_path, web_common::MAX_SCREENSHOT_BYTES as u64)?;
+    let built_bytes = read_capped(&built_path, web_common::MAX_SCREENSHOT_BYTES as u64)?;
+    let orig_img = web_common::decode_picture(&orig_bytes)?;
+    let built_img = web_common::decode_picture(&built_bytes)?;
+
+    let opts = web_common::DiffOptions { delta_e_threshold: threshold, ..web_common::DiffOptions::default() };
+    let report = web_common::compute_pixel_diff_heatmap(&orig_img, &built_img, opts)?;
+    let diff_bytes = serde_json::to_vec_pretty(&report.diff_json).map_err(|e| ToolError::internal(e.to_string()))?;
+
+    let out = create_absent_dir(&p.output_directory)?;
+    let write_res = (|| -> Result<(std::path::PathBuf, std::path::PathBuf), ToolError> {
+        let hm = write_new_file(&out, &["heatmap.png".into()], &report.heatmap_png).map_err(ToolError::invalid)?;
+        let dj = write_new_file(&out, &["diff.json".into()], &diff_bytes).map_err(ToolError::invalid)?;
+        Ok((hm, dj))
+    })();
+    let (heatmap_path, diff_path) = match write_res {
+        Ok(paths) => paths,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&out);
+            return Err(e);
+        }
+    };
+
+    let summary = format!(
+        "Visual diff ({}×{}): SSIM {:.3}, mean Delta-E {:.2}, {} differing pixel(s) ({:.1}%), {} divergence region(s) → {}.",
+        report.width,
+        report.height,
+        report.ssim,
+        report.mean_delta_e,
+        report.differing_pixels,
+        report.difference_fraction * 100.0,
+        report.regions.len(),
+        out.display(),
+    );
+    let ev = EvidenceBuilder::new(
+        "web_pixel_diff_heatmap",
+        Subject { kind: "comparison".into(), sha256: None, name: Some("visual_diff_heatmap".into()) },
+        super::artifact_tools::env(ctx),
+    )
+    .params(json!({
+        "original_image_path": orig_path.display().to_string(),
+        "built_image_path": built_path.display().to_string(),
+        "output_directory": out.display().to_string(),
+        "delta_e_threshold": threshold,
+        "original_sha256": sha256_hex(&orig_bytes),
+        "built_sha256": sha256_hex(&built_bytes),
+    }))
+    .result(json!({
+        "output_directory": out.display().to_string(),
+        "heatmap_path": heatmap_path.display().to_string(),
+        "diff_json_path": diff_path.display().to_string(),
+        "width": report.width,
+        "height": report.height,
+        "original_size": {"width": report.original_width, "height": report.original_height},
+        "built_size": {"width": report.built_width, "height": report.built_height},
+        "ssim": report.ssim,
+        "mean_delta_e": report.mean_delta_e,
+        "max_delta_e": report.max_delta_e,
+        "total_pixels": report.total_pixels,
+        "differing_pixels": report.differing_pixels,
+        "difference_fraction": report.difference_fraction,
+        "delta_e_threshold": report.delta_e_threshold,
+        "region_count": report.regions.len(),
+        "regions": report.regions,
+        "heatmap_sha256": sha256_hex(&report.heatmap_png),
+    }))
+    .summary(summary)
+    .confidence(Confidence::Derived)
+    .coverage(Coverage::complete(1))
+    .location(Location::new("path", out.display().to_string()))
+    .build()?;
+    Ok(ToolOutput::evidence(ev))
+}
+
+// ---------------------------------------------------------------------------------------------
 // web_site_close
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1555,6 +1669,71 @@ mod tests {
             "{md}"
         );
         assert!(md.contains("### 1440 px"), "{md}");
+    }
+
+    #[test]
+    fn web_pixel_diff_heatmap_runs_in_clean_room_writes_artifacts_and_validates_threshold() {
+        let mut s = crate::testing::session();
+        s.settings.deep_mode = false;
+        let e = crate::Engine::new(s);
+        let dir = tempfile::tempdir().unwrap();
+        let orig_path = dir.path().join("orig.png");
+        let built_path = dir.path().join("built.png");
+
+        let solid = |px: [u8; 4]| web_common::Image { width: 80, height: 60, rgba: (0..(80 * 60)).flat_map(|_| px).collect() };
+        let orig = solid([240, 240, 240, 255]);
+        let mut built = solid([240, 240, 240, 255]);
+        for y in 10..26 {
+            for x in 14..38 {
+                let o = ((y * 80 + x) * 4) as usize;
+                built.rgba[o..o + 4].copy_from_slice(&[30, 80, 230, 255]);
+            }
+        }
+        std::fs::write(&orig_path, web_common::encode_png(&orig).unwrap()).unwrap();
+        std::fs::write(&built_path, web_common::encode_png(&built).unwrap()).unwrap();
+
+        let opts = || crate::CallOptions::new(crate::Caller::Mcp);
+        let out_bad = dir.path().join("bad-threshold");
+        let err = e
+            .call(
+                "web_pixel_diff_heatmap",
+                json!({
+                    "original_image_path": orig_path.display().to_string(),
+                    "built_image_path": built_path.display().to_string(),
+                    "output_directory": out_bad.display().to_string(),
+                    "delta_e_threshold": 0.1,
+                }),
+                opts(),
+            )
+            .unwrap_err();
+        assert!(err.message.contains("delta_e_threshold"), "{}", err.message);
+        assert!(!out_bad.exists(), "invalid params must not create output_directory");
+
+        let out = dir.path().join("diff-out");
+        let v = e
+            .call(
+                "web_pixel_diff_heatmap",
+                json!({
+                    "original_image_path": orig_path.display().to_string(),
+                    "built_image_path": built_path.display().to_string(),
+                    "output_directory": out.display().to_string(),
+                }),
+                opts(),
+            )
+            .unwrap()
+            .to_json();
+        let res = &v["result"];
+        assert!(out.join("heatmap.png").is_file());
+        assert!(out.join("diff.json").is_file());
+        assert_eq!(res["region_count"], 1);
+        assert_eq!(res["regions"][0]["id"], 1);
+        assert_eq!(res["regions"][0]["x"], 14);
+        assert_eq!(res["regions"][0]["y"], 10);
+        assert_eq!(res["regions"][0]["width"], 24);
+        assert_eq!(res["regions"][0]["height"], 16);
+        assert_eq!(res["differing_pixels"], 24 * 16);
+        assert!(res["ssim"].as_f64().unwrap() < 1.0);
+        assert!(res["mean_delta_e"].as_f64().unwrap() > 0.0);
     }
 
     #[test]

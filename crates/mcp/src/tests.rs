@@ -488,6 +488,23 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     assert!(!names_cap.iter().any(|n| n.starts_with("adb_")));
 }
 
+#[test]
+fn clean_room_lists_visitor_website_tools_including_canvas_probe() {
+    let input = format!("{}\n", req(1, "tools/list", json!({})));
+    let mut session = craft_anything_engine::testing::session();
+    session.settings.deep_mode = false;
+    let engine = Arc::new(Engine::new(session));
+    let buf = Buf::default();
+    serve(engine, ServerOptions { all_tools: true, ..Default::default() }, std::io::Cursor::new(input.into_bytes()), Box::new(buf.clone())).unwrap();
+    let out: Vec<Value> = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let names = tool_names(&response(&out, 1));
+    for allowed in CLEAN_ROOM_WEBSITE_TOOLS {
+        assert!(names.contains(&allowed.to_string()), "{allowed} should be listed in Clean room");
+    }
+    assert!(CLEAN_ROOM_WEBSITE_TOOLS.contains(&"web_pixel_diff_heatmap"));
+    assert!(!names.contains(&"web_page_show".to_string()), "Deep-only web tools stay hidden in Clean room");
+}
+
 /// Review of #1459: --allow-web (with --allow-run) must not let a restricted client open the
 /// desktop person's saved account; sign-in is hidden there, so reusing one would bypass that.
 #[test]

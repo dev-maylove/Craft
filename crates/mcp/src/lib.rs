@@ -84,6 +84,19 @@ const ACTS_ON_DESKTOP: [&str; 2] = ["web_site_sign_in", "web_site_sign_out"];
 /// mode (see `Server::restricted_args`).
 const SAVED_SIGN_IN_READER: &str = "web_site_open";
 
+/// Website observation and deterministic visual-diff tools permitted in Clean room mode.
+pub const CLEAN_ROOM_WEBSITE_TOOLS: &[&str] = &[
+    "web_site_open",
+    "web_site_capture",
+    "web_page_states_capture",
+    "web_page_screenshot_take",
+    "web_pixels_compare",
+    "web_pixel_diff_heatmap",
+    "web_site_close",
+    "web_site_sign_in",
+    "web_site_sign_out",
+];
+
 impl Default for ServerOptions {
     fn default() -> Self {
         ServerOptions {

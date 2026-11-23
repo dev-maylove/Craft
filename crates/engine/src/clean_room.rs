@@ -110,6 +110,7 @@ pub const TOOLS: &[&str] = &[
     "web_page_states_capture",
     "web_page_screenshot_take",
     "web_pixels_compare",
+    "web_pixel_diff_heatmap",
     "web_site_close",
     // Signing in as yourself in a visible window, and forgetting that sign-in: still a user's view
     // from outside (a policy call; drop these two lines to make them Deep-only).
