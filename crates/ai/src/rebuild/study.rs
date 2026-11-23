@@ -80,6 +80,14 @@ impl Worker {
                 // The widths the check compares at, so every picture has its pair.
                 let widths = self.engine.session().settings.build.widths();
                 self.call("web_site_capture", json!({"output_directory": capture.display().to_string(), "widths": widths, "noise_pass": true}))?;
+                // Sequential scroll and hover motion burst frames + CLS/Long-Task/frame-pacing telemetry,
+                // sampled on the freshly loaded start page before opening menus or dialogs.
+                self.step(ws, Step::Study, Status::Inspecting, "Recording scroll and hover motion telemetry…")?;
+                let motion_width = widths.first().copied().unwrap_or(1440);
+                let motion_dir = capture.join(kinds::website::MOTION_DIR);
+                if let Err(e) = self.call("web_page_motion_capture", json!({"output_directory": motion_dir.display().to_string(), "width": motion_width})) {
+                    self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't record motion telemetry at {motion_width} px: {}", e.message))?;
+                }
                 // Menus, pop-ups and tabs, one at a time, on a computer and on a phone (where a menu
                 // button often replaces the navigation); a page without them (or a failure) is fine.
                 self.step(ws, Step::Study, Status::Inspecting, "Opening its menus, pop-ups and tabs…")?;

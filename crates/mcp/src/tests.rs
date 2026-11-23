@@ -409,6 +409,7 @@ fn restricted_mode_omits_machine_and_web_tools() {
     assert!(!names.contains(&"web_site_open".to_string()));
     assert!(!names.contains(&"web_site_capture".to_string()));
     assert!(!names.contains(&"web_page_states_capture".to_string()));
+    assert!(!names.contains(&"web_page_motion_capture".to_string()));
 
     // Tools no list named: what each declares keeps them off too.
     for id in ["project_play", "web_browser_connect", "web_page_screenshot_take", "web_standin_start", "native_cutter_command_run"] {
@@ -472,6 +473,7 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     assert!(names.contains(&"web_site_open".to_string()));
     assert!(!names.contains(&"web_site_capture".to_string()), "--allow-web is only for web tools");
     assert!(!names.contains(&"web_page_states_capture".to_string()));
+    assert!(!names.contains(&"web_page_motion_capture".to_string()));
     assert!(!names.contains(&"build_command_run".to_string()));
     assert!(!names.iter().any(|n| n.starts_with("adb_")));
     // Signing in opens a window on the host's desktop: never with --restricted.
@@ -484,6 +486,7 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     assert!(!names_cap.contains(&"web_site_open".to_string()), "--allow-capture is only for capture tools");
     assert!(names_cap.contains(&"web_site_capture".to_string()));
     assert!(names_cap.contains(&"web_page_states_capture".to_string()));
+    assert!(names_cap.contains(&"web_page_motion_capture".to_string()));
     assert!(!names_cap.contains(&"build_command_run".to_string()));
     assert!(!names_cap.iter().any(|n| n.starts_with("adb_")));
 }

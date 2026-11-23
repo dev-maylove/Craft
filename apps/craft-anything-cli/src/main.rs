@@ -64,7 +64,7 @@ pub enum Command {
         /// Turn on web tools (web_site_open) in restricted mode.
         #[arg(long)]
         allow_web: bool,
-        /// Turn on capture tools (web_site_capture, web_page_states_capture) in restricted mode.
+        /// Turn on capture tools (web_site_capture, web_page_states_capture, web_page_motion_capture) in restricted mode.
         #[arg(long)]
         allow_capture: bool,
         /// A folder where questions and approvals for the person are posted (`core_person_ask`,

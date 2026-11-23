@@ -20,6 +20,8 @@ pub const ROUTES_FILE: &str = "routes.json";
 /// desktop width; [`phone_states_dir`] holds them at the phone width (a menu button often only
 /// shows there).
 pub const STATES_DIR: &str = "states";
+/// Where sequential scroll/hover motion burst frames and CLS/Long-Task telemetry are kept.
+pub const MOTION_DIR: &str = "motion";
 /// What a new site's builder is told to leave for running it outside Craft Anything.
 pub const HOW_TO_RUN: &str = "Craft Anything serves your built folder itself, so the site needs no dev or start script here. For anyone running it without Craft Anything, write app/README.md saying how: the commands that build it (such as `npm install` and `npm run build`, or none for plain files) and the folder to serve with any static web server (for example `npx serve dist`), since opening index.html straight from the disk may not work.";
 
@@ -60,6 +62,11 @@ pub fn pictured_states(ws: &Workspace) -> Vec<String> {
         }));
     }
     out
+}
+
+/// The motion burst record (`capture/motion/motion.json`) if the study captured it.
+pub fn captured_motion(ws: &Workspace) -> Option<Value> {
+    read_json(&ws.capture_dir().join(MOTION_DIR).join("motion.json"))
 }
 
 /// Another page of the site: its path, the folder name its capture uses, and its address.
@@ -209,7 +216,22 @@ impl TargetKind for WebsiteKind {
                 states.join(", ")
             ));
         }
-        // Craft Anything serves the built folder itself, so outside it there was nothing to run (#1590).
+        if let Some(motion) = captured_motion(cx.ws) {
+            let n_scroll = motion["scroll_frames"].as_array().map_or(0, Vec::len);
+            let n_hover = motion["hover_frames"].as_array().map_or(0, Vec::len);
+            let cls = motion.pointer("/telemetry/cls").and_then(Value::as_f64).unwrap_or(0.0);
+            let avg_ms = motion.pointer("/telemetry/avg_frame_ms").and_then(Value::as_f64).unwrap_or(0.0);
+            let frames_hint = if cx.sees_pictures {
+                format!(
+                    "capture/{MOTION_DIR}/ holds {n_scroll} sequential scroll frame(s) (`burst-scroll-01.png`…) and {n_hover} hover frame(s) (`burst-hover-01.png`…) plus `motion.json` (original CLS {cls:.3}, avg frame {avg_ms:.1} ms). Inspect the burst sequences alongside `capture.json`'s `motion` section and reproduce the scroll reveals, sticky/header transitions and hover feedback using GPU-composited properties (`transform`, `opacity`)."
+                )
+            } else {
+                format!(
+                    "capture/{MOTION_DIR}/motion.json records scroll and hover motion telemetry ({n_scroll} scroll and {n_hover} hover samples; original CLS {cls:.3}, avg frame {avg_ms:.1} ms). Use `motion.json` and `capture.json`'s `motion` section to reproduce transitions, scroll reveals and hover feedback using GPU-composited properties (`transform`, `opacity`)."
+                )
+            };
+            out.push(frames_hint);
+        }
         if !cx.ws.manifest.own_project() {
             out.push(HOW_TO_RUN.into());
         }
@@ -224,14 +246,14 @@ impl TargetKind for WebsiteKind {
     fn refine(&self, check: &CheckResult, sees_pictures: bool) -> String {
         match check.similarity {
             Some(s) if sees_pictures => format!(
-                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). Your screenshots are in checks/round-{}/ (screenshot-<width>.png for each width, and routes/<page>/ for other pages) with the layout measured at each width in its capture.json; the original's are in capture/. Open each pair with the Read tool, fix the biggest visible differences first (layout and section order, spacing, sizes, colours, fonts, missing parts), fix the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, build it again, and reply with 1-2 plain sentences on what you changed.",
+                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). Your screenshots are in checks/round-{}/ (screenshot-<width>.png for each width, motion/burst-*.png for scroll/hover motion when recorded, and routes/<page>/ for other pages) with the layout measured at each width in its capture.json; the original's are in capture/. Open each pair with the Read tool, triage strictly by severity (fix the biggest visible differences first: broken layout/section order, spacing, sizes, colours, fonts, missing parts, motion/CLS regressions), fix the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, keep animations GPU-composited (`transform`/`opacity`), build it again, and reply with 1-2 plain sentences on what you changed.",
                 check.round, check.note, check.round
             ),
             // The likeness is measured from the screenshots, but the same measurements are in
             // text: the build's capture.json beside the original's.
             Some(s) => format!(
-                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). The check measured your build at each width the same way as the original: compare checks/round-{}/capture.json (and routes/<page>/capture.json for other pages) with capture/capture.json, fix the layout and section order and anything missing first, then the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, build it again, and reply with 1-2 plain sentences on what you changed.",
-                check.round, check.note, check.round
+                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). The check measured your build at each width the same way as the original: compare checks/round-{}/capture.json (and routes/<page>/capture.json for other pages, plus checks/round-{}/motion/motion.json when present) with capture/capture.json, triage strictly by severity (fix the layout and section order, missing parts and motion/CLS regressions first), then the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, keep animations GPU-composited (`transform`/`opacity`), build it again, and reply with 1-2 plain sentences on what you changed.",
+                check.round, check.note, check.round, check.round
             ),
             None => format!(
                 "Check {}: {}\n\nFix this in app/, build again until it succeeds, and reply with 1-2 plain sentences on what you changed.",
@@ -722,6 +744,149 @@ fn picture_likeness(cx: &CheckCx, original: &Path, built: &Path) -> Result<Optio
     Ok(Some(((layout + detail) * 50.0, layout * 100.0, detail * 100.0, h("before"), h("after"))))
 }
 
+/// Compare `capture.json`'s `motion` blueprints: flag missing transitions, animations,
+/// backdrop filters, canvas surfaces or smooth scrolling, and warn if the build introduces
+/// layout-triggering (non-composited) CSS transitions the original doesn't have.
+pub fn motion_notes(original: &Value, built: &Value) -> Vec<String> {
+    let (Some(om), Some(bm)) = (original.get("motion"), built.get("motion")) else { return Vec::new() };
+    let mut out = Vec::new();
+    let arr_len = |m: &Value, k: &str| m.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+    let num = |m: &Value, k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+    if arr_len(om, "transitions") > 0 && arr_len(bm, "transitions") == 0 {
+        out.push("the original uses CSS transitions, but the build has none".into());
+    }
+    if arr_len(om, "animations") > 0 && arr_len(bm, "animations") == 0 {
+        out.push("the original runs CSS keyframe animations, but the build has none".into());
+    }
+    if num(om, "backdrop_filters") > 0 && num(bm, "backdrop_filters") == 0 {
+        out.push(format!("the original uses backdrop-filter on {} element(s), but the build uses none", num(om, "backdrop_filters")));
+    }
+    if num(om, "canvases") > 0 && num(bm, "canvases") == 0 {
+        out.push(format!("the original has {} canvas element(s), but the build has none", num(om, "canvases")));
+    }
+    if om.get("scroll_behavior").and_then(Value::as_str) == Some("smooth") && bm.get("scroll_behavior").and_then(Value::as_str) != Some("smooth") {
+        out.push("the original sets scroll-behavior: smooth, but the build doesn't".into());
+    }
+    let built_non_comp: Vec<&str> =
+        bm.get("non_composited").and_then(Value::as_array).into_iter().flatten().filter_map(|x| x.get("value").and_then(Value::as_str)).take(5).collect();
+    if arr_len(om, "non_composited") == 0 && !built_non_comp.is_empty() {
+        out.push(format!(
+            "the build animates layout-triggering CSS properties ({}) — switch to GPU-composited `transform`/`opacity`",
+            built_non_comp.join(", ")
+        ));
+    }
+    out
+}
+
+/// Evaluate `motion.json` telemetry from the original vs built motion capture: produces hard
+/// `Claim`s for CLS regressions, newly introduced non-composited layout transitions, severe
+/// main-thread stalls, and missing hover response, plus a concise summary note.
+pub fn motion_telemetry_claims(original: &Value, built: &Value) -> (Vec<Claim>, Vec<String>) {
+    let (Some(ot), Some(bt)) = (original.get("telemetry"), built.get("telemetry")) else {
+        return (Vec::new(), Vec::new());
+    };
+    let f_opt = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
+    let f = |v: &Value, k: &str| f_opt(v, k).unwrap_or(0.0);
+    let u = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let strs_opt = |v: &Value, k: &str| -> Option<Vec<String>> {
+        v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+    };
+
+    let mut claims = Vec::new();
+    let mut notes = Vec::new();
+
+    if let (Some(o_cls), Some(b_cls)) = (f_opt(ot, "cls"), f_opt(bt, "cls"))
+        && o_cls <= 0.10
+    {
+        claims.push(Claim::new("Motion stays layout-stable (CLS <= 0.15)", b_cls <= 0.15, format!("CLS is {b_cls:.3} (original {o_cls:.3})")));
+    }
+
+    if let (Some(o_non_comp), Some(b_non_comp)) = (strs_opt(ot, "non_composited_transitions"), strs_opt(bt, "non_composited_transitions"))
+        && o_non_comp.is_empty()
+    {
+        claims.push(Claim::new(
+            "Transitions use GPU-composited properties (no layout-triggering CSS transitions)",
+            b_non_comp.is_empty(),
+            format!("found layout transitions: {}", b_non_comp.join(", ")),
+        ));
+    }
+
+    let (o_long_n, b_long_n) = (u(ot, "long_tasks_count"), u(bt, "long_tasks_count"));
+    if let (Some(o_long_ms), Some(b_long_ms)) = (f_opt(ot, "long_tasks_ms"), f_opt(bt, "long_tasks_ms"))
+        && o_long_ms <= 100.0
+    {
+        claims.push(Claim::new(
+            "Motion avoids severe main-thread stalls (long tasks <= 500 ms)",
+            b_long_ms <= 500.0,
+            format!("{b_long_n} long task(s) totalling {b_long_ms:.0} ms (original {o_long_n}, {o_long_ms:.0} ms)"),
+        ));
+    }
+
+    let (o_hover_tiles, b_hover_tiles) = (u(original, "hover_changed_tiles"), u(built, "hover_changed_tiles"));
+    if o_hover_tiles > 0 && built.get("hover_target").is_some_and(|v| !v.is_null()) {
+        claims.push(Claim::new(
+            "Primary interactive control shows visible hover feedback",
+            b_hover_tiles > 0,
+            format!("hover changed {b_hover_tiles} tile(s) (original {o_hover_tiles})"),
+        ));
+        if b_hover_tiles == 0 {
+            notes.push("hovering the primary control changed pixels on the original, but showed no visible hover transition in the build".into());
+        }
+    }
+
+    let (o_cls, b_cls) = (f(ot, "cls"), f(bt, "cls"));
+    let b_long_ms = f(bt, "long_tasks_ms");
+    let (b_avg, b_max) = (f(bt, "avg_frame_ms"), f(bt, "max_frame_ms"));
+    notes.push(format!(
+        "motion telemetry: CLS {b_cls:.3} (orig {o_cls:.3}), {b_long_n} long task(s) ({b_long_ms:.0} ms), avg frame {b_avg:.1} ms (max {b_max:.1} ms)"
+    ));
+    (claims, notes)
+}
+
+fn motion_telemetry_incomplete(v: &Value) -> bool {
+    let Some(t) = v.get("telemetry") else { return true };
+    t.get("missing_state").and_then(Value::as_bool) == Some(true)
+        || t.get("cls").and_then(Value::as_f64).is_none()
+        || t.get("non_composited_transitions").and_then(Value::as_array).is_none()
+        || t.get("long_tasks_ms").and_then(Value::as_f64).is_none()
+}
+
+/// Capture sequential scroll/hover motion bursts and telemetry on the build when the study did.
+fn motion_check(cx: &CheckCx, base: &str, out: &Path, unknowns: &mut Vec<String>, claims: &mut Vec<Claim>) -> Result<Vec<String>, ToolError> {
+    let theirs = cx.ws.capture_dir().join(MOTION_DIR);
+    let Some(original) = read_json(&theirs.join("motion.json")) else { return Ok(Vec::new()) };
+    let ours = out.join(MOTION_DIR);
+    let width = original.get("width").and_then(Value::as_u64).unwrap_or(1440);
+    let height = original.get("height").and_then(Value::as_u64).unwrap_or(900);
+    if let Err(e) = cx.call("web_site_open", json!({"url": base, "settle_ms": 1000, "signed_in": false})) {
+        if e.code == craft_anything_evidence::ErrorCode::Cancelled || cx.stop().cancelled() {
+            return Err(e);
+        }
+        unknowns.push("scroll and hover motion telemetry couldn't be measured".into());
+        return Ok(vec![format!("motion telemetry couldn't be measured: {}", e.message)]);
+    }
+    if let Err(e) = cx.call("web_page_motion_capture", json!({"output_directory": ours.display().to_string(), "width": width, "height": height})) {
+        if e.code == craft_anything_evidence::ErrorCode::Cancelled || cx.stop().cancelled() {
+            return Err(e);
+        }
+        unknowns.push("scroll and hover motion telemetry couldn't be measured".into());
+        return Ok(vec![format!("motion telemetry couldn't be measured: {}", e.message)]);
+    }
+    let Some(built) = read_json(&ours.join("motion.json")) else {
+        unknowns.push("scroll and hover motion telemetry couldn't be read".into());
+        return Ok(Vec::new());
+    };
+    if motion_telemetry_incomplete(&original) || motion_telemetry_incomplete(&built) {
+        unknowns.push("scroll and hover motion telemetry was incomplete".into());
+    }
+    if original.get("hover_changed_tiles").and_then(Value::as_u64).unwrap_or(0) > 0 && built.get("hover_target").is_none_or(Value::is_null) {
+        unknowns.push("hover feedback couldn't be verified: no interactive hover target was found on the built page".into());
+    }
+    let (m_claims, m_notes) = motion_telemetry_claims(&original, &built);
+    claims.extend(m_claims);
+    Ok(m_notes)
+}
+
 /// Open the build's menus, pop-ups and tabs the way the study opened the original's in `dir`
 /// (`states` or `states-<width>`), at the same width, and compare each pair of pictures. None
 /// when the study pictured none there.
@@ -855,6 +1020,7 @@ impl Check for WebVisualCheck {
                         .into_iter()
                         .flatten()
                         .chain(design_notes(&o, &b))
+                        .chain(motion_notes(&o, &b))
                         .chain(health_notes(&o, &b))
                         .map(|n| format!("; {n}"))
                         .collect::<String>()
@@ -869,6 +1035,7 @@ impl Check for WebVisualCheck {
         for dir in state_dirs(&ws.capture_dir()) {
             notes.extend(states_note(cx, &base, &out, &dir, &mut unknowns, &mut claims)?);
         }
+        notes.extend(motion_check(cx, &base, &out, &mut unknowns, &mut claims)?);
         let failed: Vec<String> = claims.iter().filter(|c| !c.passed).map(|c| format!("{} ({})", c.title, c.detail)).collect();
         if !failed.is_empty() {
             notes.push(format!("{} of {} claims don't hold yet: {}", failed.len(), claims.len(), failed.join("; ")));
@@ -931,5 +1098,55 @@ mod tests {
         assert_eq!(site_dir(d.path()), Some(d.path().to_path_buf()), "a plain page");
         std::fs::write(d.path().join("package.json"), "{}").unwrap();
         assert_eq!(site_dir(d.path()), None, "a page beside a manifest is not a built site");
+    }
+
+    #[test]
+    fn motion_notes_and_telemetry_claims_catch_regressions() {
+        let orig = json!({
+            "motion": {
+                "transitions": [{"value": "transform 0.2s ease", "count": 4}],
+                "animations": [{"value": "float 3s ease-in-out", "count": 1}],
+                "non_composited": [],
+                "backdrop_filters": 2,
+                "canvases": 1,
+                "scroll_behavior": "smooth"
+            }
+        });
+        let bad = json!({
+            "motion": {
+                "transitions": [],
+                "animations": [],
+                "non_composited": [{"value": "width", "count": 2}],
+                "backdrop_filters": 0,
+                "canvases": 0,
+                "scroll_behavior": "auto"
+            }
+        });
+        let notes = motion_notes(&orig, &bad).join(" | ");
+        assert!(notes.contains("CSS transitions") && notes.contains("keyframe animations") && notes.contains("backdrop-filter"), "{notes}");
+        assert!(notes.contains("canvas") && notes.contains("scroll-behavior: smooth") && notes.contains("width"), "{notes}");
+
+        let orig_tel = json!({
+            "hover_changed_tiles": 6,
+            "telemetry": {"cls": 0.01, "long_tasks_count": 0, "long_tasks_ms": 0.0, "avg_frame_ms": 16.5, "max_frame_ms": 24.0, "non_composited_transitions": []}
+        });
+        let bad_tel = json!({
+            "hover_target": {"tag": "button", "label": "Start"},
+            "hover_changed_tiles": 0,
+            "telemetry": {"cls": 0.28, "long_tasks_count": 4, "long_tasks_ms": 620.0, "avg_frame_ms": 48.0, "max_frame_ms": 220.0, "non_composited_transitions": ["top", "height"]}
+        });
+        let (claims, t_notes) = motion_telemetry_claims(&orig_tel, &bad_tel);
+        assert_eq!(claims.len(), 4);
+        assert!(claims.iter().all(|c| !c.passed), "all 4 motion claims should fail on regressed build: {claims:?}");
+        assert!(t_notes.iter().any(|n| n.contains("hover transition")), "{t_notes:?}");
+
+        let good_tel = json!({
+            "hover_target": {"tag": "button", "label": "Start"},
+            "hover_changed_tiles": 5,
+            "telemetry": {"cls": 0.02, "long_tasks_count": 0, "long_tasks_ms": 0.0, "avg_frame_ms": 16.6, "max_frame_ms": 20.0, "non_composited_transitions": []}
+        });
+        let (ok_claims, _) = motion_telemetry_claims(&orig_tel, &good_tel);
+        assert_eq!(ok_claims.len(), 4);
+        assert!(ok_claims.iter().all(|c| c.passed), "{ok_claims:?}");
     }
 }

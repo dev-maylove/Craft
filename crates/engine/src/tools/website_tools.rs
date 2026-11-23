@@ -63,6 +63,17 @@ pub fn specs() -> Vec<ToolSpec> {
             web_page_states_capture,
         ),
         spec(
+            "web_page_motion_capture",
+            "Capture motion bursts and web telemetry",
+            "On the open website, capture sequential viewport burst frames while scrolling and hovering a prominent interactive control, while measuring Cumulative Layout Shift (CLS), Long Tasks (>50 ms), requestAnimationFrame pacing, and non-composited layout-triggering CSS transitions. Writes burst-scroll-<n>.png, burst-hover-<n>.png and motion.json into a new folder. Scrolling and hovering run the site's own code, so it needs your approval.",
+            "Record sequential scroll/hover motion frames and smooth-rendering telemetry so animations can be matched and verified.",
+            Toolset::Browser,
+            Effects::EVIDENCE.union(Effects::WRITES_FILESYSTEM).union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK),
+            Requires::Engine("chromium"),
+            schema_of::<MotionParams>,
+            web_page_motion_capture,
+        ),
+        spec(
             "web_site_close",
             "Close the website",
             "Close the private browser started by web_site_open and delete its temporary profile.",
@@ -344,6 +355,7 @@ fn set_viewport(client: &mut CdpClient, width: u32, height: u32, dl: &Deadline) 
 /// Open `url` and wait for it to settle; returns what went wrong while it loaded ([`page_health`]).
 pub(crate) fn navigate(client: &mut CdpClient, url: &str, width: u32, height: u32, settle_ms: u64, dl: &Deadline) -> Result<Value, ToolError> {
     client.call("Page.enable", json!({}), None, dl)?;
+
     // Errors and failed requests are read from the browser's own events; a browser that refuses
     // one of these still loads the page.
     for domain in ["Runtime.enable", "Log.enable", "Network.enable"] {
@@ -661,6 +673,434 @@ fn web_page_states_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
 }
 
 // ---------------------------------------------------------------------------------------------
+// web_page_motion_capture
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MotionParams {
+    /// Absolute path of a folder that does not exist yet; burst frames and motion.json go there.
+    pub output_directory: String,
+    /// Viewport width in CSS pixels (320..=3840, default 1440).
+    #[serde(default = "d_width")]
+    pub width: u32,
+    /// Viewport height in CSS pixels (320..=4000, default 900).
+    #[serde(default = "d_height")]
+    pub height: u32,
+    /// Sequential frames captured per motion burst (1..=8, default 4).
+    #[serde(default = "d_burst_frames")]
+    pub burst_frames: usize,
+    /// Delay between burst frames in milliseconds (40..=1000, default 100).
+    #[serde(default = "d_burst_interval")]
+    pub interval_ms: u64,
+    #[serde(default = "d_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn d_burst_frames() -> usize {
+    4
+}
+fn d_burst_interval() -> u64 {
+    100
+}
+
+/// Start observing CLS, Long Tasks (>50 ms), requestAnimationFrame frame deltas, and
+/// non-composited layout-triggering CSS transitions on the open page.
+const MOTION_START_JS: &str = r#"(() => {
+  const prev = window.__craftMotion;
+  if (prev) {
+    prev.active = false;
+    if (Array.isArray(prev.observers)) {
+      for (const o of prev.observers) { try { (o && o.obs ? o.obs : o).disconnect(); } catch (e) {} }
+    }
+    delete window.__craftMotion;
+  }
+  const nonComp = new Set(['top','left','right','bottom','width','height','min-width','max-width','min-height','max-height','margin','margin-top','margin-right','margin-bottom','margin-left','padding','padding-top','padding-right','padding-bottom','padding-left','border-width','font-size','line-height','gap','box-shadow','background-position']);
+  const foundNonComp = new Set();
+  const els = Array.from(document.querySelectorAll('body *')).slice(0, 6000);
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    const s = getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none') continue;
+    const props = String(s.transitionProperty || '').split(',').map(p => p.trim().toLowerCase()).filter(Boolean);
+    const durs = String(s.transitionDuration || '').split(',').map(x => parseFloat(x) || 0);
+    if (props.length && durs.some(d => d > 0)) {
+      for (let i = 0; i < props.length; i++) {
+        const dur = durs.length ? durs[i % durs.length] : 0;
+        const p = props[i];
+        if (dur > 0 && nonComp.has(p) && foundNonComp.size < 16) foundNonComp.add(p);
+      }
+    }
+  }
+  const supportedTypes = (typeof PerformanceObserver !== 'undefined' && Array.isArray(PerformanceObserver.supportedEntryTypes))
+    ? PerformanceObserver.supportedEntryTypes
+    : null;
+  const state = { active: true, cls: 0, clsSupported: false, windowCls: 0, windowStartTs: -1, lastShiftTs: -1, longCount: 0, longMs: 0, longTaskSupported: false, frames: [], lastTs: 0, observers: [], nonComposited: Array.from(foundNonComp) };
+  const onShifts = entries => {
+    for (const e of entries) {
+      if (e.hadRecentInput) continue;
+      const v = Number(e.value) || 0;
+      const ts = Number(e.startTime) || 0;
+      if (state.windowStartTs >= 0 && (ts - state.lastShiftTs <= 1000) && (ts - state.windowStartTs <= 5000)) {
+        state.windowCls += v;
+      } else {
+        state.windowStartTs = ts;
+        state.windowCls = v;
+      }
+      state.lastShiftTs = ts;
+      if (state.windowCls > state.cls) state.cls = state.windowCls;
+    }
+  };
+  const onLongTasks = entries => {
+    for (const e of entries) {
+      state.longCount++;
+      state.longMs += Number(e.duration) || 0;
+    }
+  };
+  try {
+    if (!supportedTypes || supportedTypes.includes('layout-shift')) {
+      const lo = new PerformanceObserver(list => onShifts(list.getEntries()));
+      lo.observe({ type: 'layout-shift', buffered: false });
+      state.clsSupported = true;
+      state.observers.push({ obs: lo, handle: onShifts });
+    }
+  } catch (e) {}
+  try {
+    if (!supportedTypes || supportedTypes.includes('longtask')) {
+      const to = new PerformanceObserver(list => onLongTasks(list.getEntries()));
+      to.observe({ type: 'longtask', buffered: false });
+      state.longTaskSupported = true;
+      state.observers.push({ obs: to, handle: onLongTasks });
+    }
+  } catch (e) {}
+  const tick = ts => {
+    if (!state.active) return;
+    if (state.lastTs > 0 && state.frames.length < 2000) state.frames.push(ts - state.lastTs);
+    state.lastTs = ts;
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  window.__craftMotion = state;
+  return { max_scroll: Math.max(0, Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0) - innerHeight) };
+})()"#;
+
+/// Find a prominent visible interactive control in the top viewport to test hover transitions.
+const FIND_HOVER_TARGET_JS: &str = r#"(() => {
+  const cap = (s, n) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  const shown = el => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 24 || r.height < 16 || r.top < 0 || r.left < 0 || r.bottom > innerHeight || r.right > innerWidth) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0' && s.pointerEvents !== 'none';
+  };
+  let best = null;
+  let bestScore = -1;
+  for (const el of document.querySelectorAll('a[href], button, [role="button"]')) {
+    if (!shown(el)) continue;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    let score = 0;
+    const hasDur = String(s.transitionDuration || '').split(',').some(d => (parseFloat(d) || 0) > 0);
+    if (hasDur) score += 40;
+    if (s.backgroundColor && s.backgroundColor !== 'rgba(0, 0, 0, 0)' && s.backgroundColor !== 'transparent') score += 25;
+    if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score += 15;
+    if (r.top > 70 && r.top < innerHeight * 0.85) score += 15;
+    const label = cap(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title'), 80);
+    if (label) score += 10;
+    if (score > bestScore) {
+      bestScore = score;
+      const pad = 16;
+      const cl = Math.max(0, Math.round(r.left - pad));
+      const ct = Math.max(0, Math.round(r.top - pad));
+      const cr = Math.min(innerWidth, Math.round(r.right + pad));
+      const cb = Math.min(innerHeight, Math.round(r.bottom + pad));
+      best = {
+        tag: el.tagName.toLowerCase(),
+        label,
+        x: Math.round(r.left + r.width / 2),
+        y: Math.round(r.top + r.height / 2),
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+        left: cl,
+        top: ct,
+        clip_w: Math.max(0, cr - cl),
+        clip_h: Math.max(0, cb - ct),
+      };
+    }
+  }
+  return best;
+})()"#;
+
+/// Stop the motion observers and return the aggregated telemetry. When `window.__craftMotion` is
+/// absent (e.g. a page reload cleared it mid-capture), emit `missing_state: true` with `null`
+/// metrics so downstream checks record an unknown rather than treating fallback zeros as passes.
+const MOTION_STOP_JS: &str = r#"(() => {
+  const st = window.__craftMotion;
+  if (!st) {
+    return {
+      missing_state: true,
+      cls: null,
+      long_tasks_count: null,
+      long_tasks_ms: null,
+      avg_frame_ms: null,
+      max_frame_ms: null,
+      frame_count: 0,
+      non_composited_transitions: null,
+    };
+  }
+  st.active = false;
+  for (const item of st.observers) {
+    try {
+      const obs = item && item.obs ? item.obs : item;
+      if (item && typeof item.handle === 'function' && typeof obs.takeRecords === 'function') {
+        item.handle(obs.takeRecords());
+      }
+      obs.disconnect();
+    } catch (e) {}
+  }
+  const frames = st.frames || [];
+  const sum = frames.reduce((a, b) => a + b, 0);
+  const avg = frames.length ? sum / frames.length : 0;
+  const max = frames.length ? frames.reduce((a, b) => Math.max(a, b), 0) : 0;
+  delete window.__craftMotion;
+  return {
+    cls: st.clsSupported ? Math.round(st.cls * 10000) / 10000 : null,
+    long_tasks_count: st.longTaskSupported ? st.longCount : null,
+    long_tasks_ms: st.longTaskSupported ? Math.round(st.longMs * 10) / 10 : null,
+    avg_frame_ms: Math.round(avg * 100) / 100,
+    max_frame_ms: Math.round(max * 100) / 100,
+    frame_count: frames.length,
+    non_composited_transitions: st.nonComposited || [],
+  };
+})()"#;
+
+/// Count 16×16 tiles whose mean colour changed between two PNG viewport frames within the
+/// bounding box `(x, y, w, h)`. Returns `None` when no valid rectangle exists or frames cannot decode.
+fn changed_tiles_in_rect(before: &[u8], after: &[u8], rect: Option<(u32, u32, u32, u32)>) -> Option<usize> {
+    let (rx, ry, rw, rh) = rect?;
+    if rw == 0 || rh == 0 {
+        return None;
+    }
+    let (Ok(a), Ok(b)) = (web_common::decode_png(before), web_common::decode_png(after)) else {
+        return None;
+    };
+    let x0 = rx.min(a.width).min(b.width);
+    let y0 = ry.min(a.height).min(b.height);
+    let w = rw.min(a.width.saturating_sub(x0)).min(b.width.saturating_sub(x0));
+    let h = rh.min(a.height.saturating_sub(y0)).min(b.height.saturating_sub(y0));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let slice_rect = |img: &web_common::Image| -> web_common::Image {
+        let mut rgba = Vec::with_capacity((w as usize).saturating_mul(h as usize).saturating_mul(4));
+        let row_bytes = (w as usize).saturating_mul(4);
+        for y in y0..y0.saturating_add(h) {
+            let start = ((y as usize).saturating_mul(img.width as usize).saturating_add(x0 as usize)).saturating_mul(4);
+            if let Some(row) = img.rgba.get(start..start.saturating_add(row_bytes)) {
+                rgba.extend_from_slice(row);
+            }
+        }
+        web_common::Image { width: w, height: h, rgba }
+    };
+    let sub_a = slice_rect(&a);
+    let sub_b = slice_rect(&b);
+    Some(web_common::NoiseMask::between(&sub_a, &sub_b, 16).count())
+}
+
+fn capture_viewport_png(client: &mut CdpClient, dl: &Deadline) -> Result<Vec<u8>, ToolError> {
+    let shot = client.call("Page.captureScreenshot", json!({"format": "png"}), None, dl)?;
+    let data = shot.get("data").and_then(Value::as_str).ok_or_else(|| ToolError::new(ErrorCode::GarbledOutput, "the browser returned no screenshot"))?;
+    web_common::b64_decode(data)
+}
+
+fn web_page_motion_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: MotionParams = parse_params(params)?;
+    if !(320..=3840).contains(&p.width) || !(320..=4000).contains(&p.height) {
+        return Err(ToolError::invalid("width must be 320..=3840 and height 320..=4000"));
+    }
+    if !(1..=8).contains(&p.burst_frames) {
+        return Err(ToolError::invalid("burst_frames must be 1..=8"));
+    }
+    if !(40..=1000).contains(&p.interval_ms) {
+        return Err(ToolError::invalid("interval_ms must be 40..=1000"));
+    }
+    let dl = deadline(ctx, p.timeout_secs.max(30))?;
+    let site = open_site(ctx, &dl)?;
+    let mut client = page_client(&site, &dl)?;
+    let here = eval(&mut client, "location.href", &dl).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    if here.is_empty() || here.starts_with("chrome-error:") || here == "about:blank" {
+        cleanup(&mut client, &dl);
+        return Err(ToolError::new(
+            ErrorCode::NotFound,
+            "The website didn't open, so there's no motion to capture: the browser is showing its own error page.",
+        )
+        .with_remediation("Open the site again with web_site_open and make sure it loads."));
+    }
+    let out = match create_absent_dir(&p.output_directory) {
+        Ok(out) => out,
+        Err(e) => {
+            cleanup(&mut client, &dl);
+            return Err(e);
+        }
+    };
+    let r = (|| -> Result<Value, ToolError> {
+        client.call("Page.enable", json!({}), None, &dl)?;
+        set_viewport(&mut client, p.width, p.height, &dl)?;
+        let _ = eval(&mut client, "scrollTo(0, 0)", &dl);
+        settle(&mut client, 350)?;
+        let url = eval(&mut client, "location.href", &dl)?.as_str().unwrap_or_default().to_string();
+        let started = eval(&mut client, MOTION_START_JS, &dl)?;
+        let max_scroll = started.get("max_scroll").and_then(Value::as_u64).unwrap_or(0);
+        let travel = max_scroll.min(u64::from(p.height).saturating_mul(2));
+
+        // Phase 1: Scroll burst frames across the page.
+        let mut scroll_frames = Vec::new();
+        let mut scroll_changed_tiles: usize = 0;
+        let mut prev_img: Option<web_common::Image> = None;
+        for i in 0..p.burst_frames {
+            if dl.expired() {
+                break;
+            }
+            let y = if p.burst_frames <= 1 || travel == 0 { 0 } else { travel.saturating_mul(i as u64) / ((p.burst_frames - 1) as u64) };
+            ctx.report(Some(i as f32 / (p.burst_frames.saturating_mul(2).max(1)) as f32), format!("Recording scroll frame {} of {}…", i + 1, p.burst_frames));
+            let _ = eval(&mut client, &format!("window.scrollTo({{top: {y}, behavior: 'instant'}})"), &dl);
+            settle(&mut client, p.interval_ms)?;
+            let actual_y = eval(&mut client, "Math.round(window.scrollY || 0)", &dl).ok().and_then(|v| v.as_u64()).unwrap_or(y);
+            let bytes = capture_viewport_png(&mut client, &dl)?;
+            let name = format!("burst-scroll-{:02}.png", i + 1);
+            write_new_file(&out, std::slice::from_ref(&name), &bytes).map_err(ToolError::invalid)?;
+            if let Ok(cur) = web_common::decode_png(&bytes) {
+                if let Some(prev) = &prev_img {
+                    scroll_changed_tiles = scroll_changed_tiles.saturating_add(web_common::NoiseMask::between(prev, &cur, 24).count());
+                }
+                prev_img = Some(cur);
+            }
+            scroll_frames.push(json!({"file": name, "scroll_y": actual_y, "sha256": sha256_hex(&bytes)}));
+        }
+        let _ = eval(&mut client, "window.scrollTo({top: 0, behavior: 'instant'})", &dl);
+        settle(&mut client, 250)?;
+
+        // Phase 2: Hover burst frames on a prominent visible interactive control, measuring pixel
+        // changes strictly within the selected control's padded bounding box so unrelated page
+        // motion (banners, carousels, videos) cannot count as button hover feedback.
+        let hover_target = eval(&mut client, FIND_HOVER_TARGET_JS, &dl).unwrap_or(Value::Null);
+        let hover_rect = match (
+            hover_target.get("left").and_then(Value::as_u64),
+            hover_target.get("top").and_then(Value::as_u64),
+            hover_target.get("clip_w").and_then(Value::as_u64),
+            hover_target.get("clip_h").and_then(Value::as_u64),
+        ) {
+            (Some(l), Some(t), Some(w), Some(h)) if w > 0 && h > 0 => Some((l as u32, t as u32, w as u32, h as u32)),
+            _ => None,
+        };
+        let mut hover_frames = Vec::new();
+        let mut hover_changed_tiles: usize = 0;
+        if let (Some(hx), Some(hy)) = (hover_target.get("x").and_then(Value::as_f64), hover_target.get("y").and_then(Value::as_f64)) {
+            let mut base_bytes: Option<Vec<u8>> = None;
+            for i in 0..p.burst_frames {
+                if dl.expired() {
+                    break;
+                }
+                if i == 1 {
+                    let _ = client.call("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": hx, "y": hy}), None, &dl);
+                }
+                if i > 0 {
+                    settle(&mut client, p.interval_ms)?;
+                }
+                let bytes = capture_viewport_png(&mut client, &dl)?;
+                let name = format!("burst-hover-{:02}.png", i + 1);
+                write_new_file(&out, std::slice::from_ref(&name), &bytes).map_err(ToolError::invalid)?;
+                if let Some(base) = &base_bytes {
+                    if let Some(changed) = changed_tiles_in_rect(base, &bytes, hover_rect) {
+                        hover_changed_tiles = hover_changed_tiles.max(changed);
+                    }
+                } else {
+                    base_bytes = Some(bytes.clone());
+                }
+                hover_frames.push(json!({"file": name, "hovered": i > 0, "sha256": sha256_hex(&bytes)}));
+            }
+            let _ = client.call("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": 0, "y": 0}), None, &dl);
+        }
+
+        let telemetry = eval(&mut client, MOTION_STOP_JS, &dl)?;
+        Ok(json!({
+            "url": url,
+            "width": p.width,
+            "height": p.height,
+            "interval_ms": p.interval_ms,
+            "hover_target": hover_target,
+            "scroll_frames": scroll_frames,
+            "hover_frames": hover_frames,
+            "scroll_changed_tiles": scroll_changed_tiles,
+            "hover_changed_tiles": hover_changed_tiles,
+            "telemetry": telemetry,
+        }))
+    })();
+    if r.is_err() {
+        let stop_dl = Deadline::new(Duration::from_secs(3), crate::tool::CancelToken::default());
+        let _ = eval(&mut client, MOTION_STOP_JS, &stop_dl);
+    }
+    cleanup(&mut client, &dl);
+    let mut record = match r {
+        Ok(record) => record,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&out);
+            return Err(e);
+        }
+    };
+    if site.signed_in.is_some()
+        && let Some(o) = record.as_object_mut()
+        && let Some(u) = o.get("url").and_then(Value::as_str).map(shown_url)
+    {
+        o.insert("url".into(), json!(u));
+    }
+    let json_bytes = serde_json::to_vec_pretty(&record).map_err(|e| ToolError::internal(e.to_string()))?;
+    if let Err(e) = write_new_file(&out, &["motion.json".into()], &json_bytes).map_err(ToolError::invalid) {
+        let _ = std::fs::remove_dir_all(&out);
+        return Err(e);
+    }
+
+    let url = record.get("url").and_then(Value::as_str).unwrap_or_default().to_string();
+    let shown = shown_url(&url);
+    let n_scroll = record["scroll_frames"].as_array().map_or(0, Vec::len);
+    let n_hover = record["hover_frames"].as_array().map_or(0, Vec::len);
+    let cls = record.pointer("/telemetry/cls").and_then(Value::as_f64).map_or_else(|| "unmeasured".to_string(), |v| format!("{v:.3}"));
+    let long_tasks =
+        record.pointer("/telemetry/long_tasks_count").and_then(Value::as_u64).map_or_else(|| "unmeasured".to_string(), |n| format!("{n} long task(s)"));
+    let avg_ms = record.pointer("/telemetry/avg_frame_ms").and_then(Value::as_f64).map_or_else(|| "unmeasured".to_string(), |v| format!("{v:.1} ms"));
+    let summary =
+        format!("Recorded {n_scroll} scroll and {n_hover} hover motion frame(s) on {shown} (CLS {cls}, {long_tasks}, avg frame {avg_ms}) → {}.", out.display());
+    let browser = site.handle();
+    let ev = EvidenceBuilder::new(
+        "web_page_motion_capture",
+        Subject { kind: "website".into(), sha256: None, name: Some(shown.clone()) },
+        browser_env(ctx.session.clean_room(), &browser),
+    )
+    .params(json!({"width": p.width, "height": p.height, "burst_frames": p.burst_frames, "interval_ms": p.interval_ms}))
+    .result(json!({
+        "url": shown,
+        "folder": out.display().to_string(),
+        "scroll_frames": n_scroll,
+        "hover_frames": n_hover,
+        "scroll_changed_tiles": record["scroll_changed_tiles"],
+        "hover_changed_tiles": record["hover_changed_tiles"],
+        "telemetry": record["telemetry"],
+    }))
+    .summary(summary)
+    .confidence(Confidence::Observed)
+    .authority(Authority::OurRun)
+    .limitation(Limitation::new(
+        "motion_sample",
+        "Samples scroll and one prominent hover interaction in a headless browser; frame times reflect software rasterisation when GPU acceleration is off.",
+    ))
+    .coverage(Coverage::complete((n_scroll + n_hover) as u64))
+    .location(Location::new("url", shown))
+    .location(Location::new("path", out.display().to_string()))
+    .build()?;
+    Ok(ToolOutput::evidence(ev))
+}
+
+// ---------------------------------------------------------------------------------------------
 // web_site_capture
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -704,6 +1144,9 @@ const BLUEPRINT_JS: &str = r#"(() => {
   const tally = (m, k) => { if (k) m[k] = (m[k] || 0) + 1; };
   const top = (m, n) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, n).map(([value, count]) => ({value, count}));
   const fonts = {}, sizes = {}, weights = {}, colors = {}, backgrounds = {}, radii = {}, shadows = {}, bgImages = {}, spacing = {}, maxWidths = {};
+  const transitions = {}, animations = {}, animationTimings = {}, nonComposited = {};
+  let transforms = 0, backdropFilters = 0, willChange = 0;
+  const NON_COMP = new Set(['top','left','right','bottom','width','height','min-width','max-width','min-height','max-height','margin','margin-top','margin-right','margin-bottom','margin-left','padding','padding-top','padding-right','padding-bottom','padding-left','border-width','font-size','line-height','gap','box-shadow','background-position']);
   // Colours as #rrggbb(aa), whatever notation the CSS used. Computed rgb()/rgba() is read as numbers: a canvas read
   // can be off by one per channel (Brave adds noise to it, #154). Anything else (oklch, color()…) is painted on a 1×1
   // canvas and read back.
@@ -722,13 +1165,33 @@ const BLUEPRINT_JS: &str = r#"(() => {
     if (s.borderRadius && s.borderRadius !== '0px') tally(radii, s.borderRadius.replace(/[\d.]+(?:e\+?\d+)?px/g, n => parseFloat(n) > 9999 ? '9999px' : n));
     if (s.boxShadow && s.boxShadow !== 'none') tally(shadows, s.boxShadow);
     const bi = s.backgroundImage; if (bi && bi !== 'none') for (const m of bi.matchAll(/url\(["']?([^"')]+)["']?\)/g)) tally(bgImages, m[1]);
+    if (s.transitionProperty && s.transitionProperty !== 'none') {
+      const props = String(s.transitionProperty).split(',').map(p => p.trim().toLowerCase()).filter(Boolean);
+      const durs = String(s.transitionDuration || '').split(',').map(d => parseFloat(d) || 0);
+      if (props.length && durs.some(d => d > 0)) {
+        tally(transitions, cap(s.transitionProperty + ' ' + s.transitionDuration + ' ' + s.transitionTimingFunction, 100));
+        for (let i = 0; i < props.length; i++) {
+          const dur = durs.length ? durs[i % durs.length] : 0;
+          if (dur > 0 && NON_COMP.has(props[i])) tally(nonComposited, props[i]);
+        }
+      }
+    }
+    if (s.animationName && s.animationName !== 'none' && String(s.animationDuration || '').split(',').some(d => (parseFloat(d) || 0) > 0)) {
+      const animTiming = cap(s.animationDuration + ' ' + s.animationTimingFunction, 80);
+      tally(animations, cap(s.animationName + ' ' + animTiming, 100));
+      tally(animationTimings, animTiming);
+    }
+    if (s.transform && s.transform !== 'none') transforms++;
+    if ((s.backdropFilter && s.backdropFilter !== 'none') || (s.webkitBackdropFilter && s.webkitBackdropFilter !== 'none')) backdropFilters++;
+    if (s.willChange && s.willChange !== 'auto') willChange++;
   }
-  const vars = {}, bps = {}; let ruleCount = 0, unreadable = 0;
+  const vars = {}, bps = {}, keyframes = []; let ruleCount = 0, unreadable = 0;
   const bp = (side, n, unit) => tally(bps, side + '-width ' + Math.round(parseFloat(n) * (unit === 'px' ? 1 : 16)) + 'px');
   const walk = (rules, depth) => {
     if (!rules || depth > 6) return;
     for (const r of Array.from(rules)) {
       if (++ruleCount > 40000) return;
+      if (r.type === 7 && r.name && keyframes.length < 40 && !keyframes.includes(r.name)) keyframes.push(cap(r.name, 80));
       if (r.selectorText && r.selectorText.includes(':root') && r.style) for (const name of Array.from(r.style)) if (name.startsWith('--') && Object.keys(vars).length < 300) vars[name] = cap(r.style.getPropertyValue(name), 120);
       const media = r.media && r.media.mediaText ? r.media.mediaText : (r.conditionText || '');
       for (const m of media.matchAll(/(min|max)-width\s*:\s*([\d.]+)(px|r?em)/g)) bp(m[1], m[2], m[3]);
@@ -783,11 +1246,26 @@ const BLUEPRINT_JS: &str = r#"(() => {
     unnamed_examples: unnamed.slice(0, 5).map(el => el.tagName.toLowerCase() + (el.className && typeof el.className === 'string' ? '.' + cap(el.className, 40).split(' ')[0] : '')),
     images_without_alt: Array.from(document.images).filter(i => shown(i) && !i.hasAttribute('alt')).length};
   const fontFaces = []; try { document.fonts.forEach(f => { if (fontFaces.length < 80) fontFaces.push({family: f.family, weight: f.weight, style: f.style, status: f.status}); }); } catch (e) {}
+
   return {
     url: location.href, title: document.title, lang: document.documentElement.lang || '',
     viewport: {w: innerWidth, h: innerHeight}, page: {w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight},
     meta: {description: meta('description'), theme_color: meta('theme-color'), og_title: meta('og:title'), og_image: meta('og:image'), icons},
     design: {fonts: top(fonts, 12), font_sizes: top(sizes, 16), font_weights: top(weights, 8), text_colors: top(colors, 16), backgrounds: top(backgrounds, 16), radii: top(radii, 10), shadows: top(shadows, 8), spacing: top(spacing, 24), max_widths: top(maxWidths, 8), css_variables: vars, font_faces: fontFaces},
+    motion: {
+      transitions: top(transitions, 12),
+      animations: top(animations, 12),
+      animation_timings: top(animationTimings, 12),
+      non_composited: top(nonComposited, 8),
+      keyframes,
+      transforms,
+      backdrop_filters: backdropFilters,
+      will_change: willChange,
+      scroll_behavior: getComputedStyle(document.documentElement).scrollBehavior || 'auto',
+      canvases: document.querySelectorAll('canvas').length,
+      videos: document.querySelectorAll('video').length,
+      svgs: document.querySelectorAll('svg').length,
+    },
     breakpoints, unreadable_stylesheets: unreadable, a11y,
     outline, forms, links,
     assets: {
@@ -920,6 +1398,9 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     if visitor {
         visitor_view(&mut blueprint);
     } else if let (Value::Object(b), Ok(h)) = (&mut blueprint, site.health.lock()) {
+        if let Some(Value::Object(m)) = b.get_mut("motion") {
+            m.remove("animation_timings");
+        }
         b.insert("health".into(), h.clone());
     }
     let signed_in = site.signed_in.is_some();
@@ -1131,6 +1612,29 @@ fn visitor_view(blueprint: &mut Value) {
         d.remove("css_variables");
         d.remove("font_faces");
     }
+    if let Some(Value::Object(m)) = b.get_mut("motion") {
+        // @keyframes rule names and custom CSS property identifiers stay out of Clean room;
+        // observable transition/animation timing stays.
+        m.remove("keyframes");
+        if let Some(timings) = m.remove("animation_timings") {
+            m.insert("animations".into(), timings);
+        } else if let Some(Value::Array(anims)) = m.get_mut("animations") {
+            anims.retain_mut(|entry| {
+                let Some(item) = entry.as_object_mut() else { return false };
+                let Some(val) = item.get("value").and_then(Value::as_str) else { return false };
+                let Some(stripped) = strip_animation_names(val) else { return false };
+                item.insert("value".into(), Value::String(stripped));
+                true
+            });
+        }
+        if let Some(Value::Array(trans)) = m.get_mut("transitions") {
+            for item in trans.iter_mut().filter_map(Value::as_object_mut) {
+                if let Some(val) = item.get("value").and_then(Value::as_str) {
+                    item.insert("value".into(), Value::String(sanitize_transition_custom_props(val)));
+                }
+            }
+        }
+    }
     let images: Vec<Value> = b
         .get("assets")
         .and_then(|a| a.get("images"))
@@ -1138,6 +1642,25 @@ fn visitor_view(blueprint: &mut Value) {
         .map(|a| a.iter().map(|i| json!({"w": i.get("w"), "h": i.get("h")})).collect())
         .unwrap_or_default();
     b.insert("assets".into(), json!({"images": images}));
+}
+
+fn strip_animation_names(val: &str) -> Option<String> {
+    let tokens: Vec<&str> = val.split_whitespace().collect();
+    let idx = tokens.iter().position(|t| {
+        let clean = t.trim_end_matches(',');
+        clean.as_bytes().first().is_some_and(u8::is_ascii_digit) && (clean.ends_with('s') || clean.ends_with("ms"))
+    })?;
+    Some(tokens[idx..].join(" "))
+}
+
+fn sanitize_transition_custom_props(val: &str) -> String {
+    val.split_whitespace()
+        .map(|tok| {
+            let trimmed = tok.trim_end_matches(',');
+            if trimmed.starts_with("--") { if tok.ends_with(',') { "custom-property," } else { "custom-property" } } else { tok }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A short human/agent-readable summary of the capture folder.
@@ -1209,6 +1732,7 @@ fn readme(b: &Value, shots: &[Value], (html_bytes, html_total): (usize, usize), 
         md.push_str(&format!("- Font files: {}\n\n", b.pointer("/assets/fonts").and_then(Value::as_array).map_or(0, Vec::len)));
     }
     md.push_str(&layout_section(b, visitor));
+    md.push_str(&motion_section(b, visitor));
     if !visitor {
         md.push_str(&health_section(b));
     }
@@ -1217,6 +1741,71 @@ fn readme(b: &Value, shots: &[Value], (html_bytes, html_total): (usize, usize), 
         let level = h.get("level").and_then(Value::as_u64).unwrap_or(1) as usize;
         md.push_str(&format!("{}- {}\n", "  ".repeat(level.saturating_sub(1)), h.get("text").and_then(Value::as_str).unwrap_or_default()));
     }
+    md
+}
+
+/// What transitions, animations, visual effects and dynamic surfaces the page uses, for the README.
+fn motion_section(b: &Value, visitor: bool) -> String {
+    let Some(m) = b.get("motion").and_then(Value::as_object) else { return String::new() };
+    let top_vals = |k: &str, n: usize| -> String {
+        m.get(k)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().take(n).filter_map(|x| x.get("value").and_then(Value::as_str)).map(|v| format!("`{v}`")).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default()
+    };
+    let num = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let transitions = top_vals("transitions", 6);
+    let animations = top_vals("animations", 6);
+    let non_comp = top_vals("non_composited", 6);
+    let keyframes: Vec<&str> =
+        if visitor { Vec::new() } else { m.get("keyframes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).take(12).collect() };
+    let scroll_behavior = m.get("scroll_behavior").and_then(Value::as_str).unwrap_or("auto");
+    let (transforms, backdrop, canvases, videos) = (num("transforms"), num("backdrop_filters"), num("canvases"), num("videos"));
+    if transitions.is_empty()
+        && animations.is_empty()
+        && keyframes.is_empty()
+        && transforms == 0
+        && backdrop == 0
+        && canvases == 0
+        && videos == 0
+        && scroll_behavior == "auto"
+    {
+        return String::new();
+    }
+    let mut md = String::from("## Motion & animations\n\n");
+    if !transitions.is_empty() {
+        md.push_str(&format!("- Transitions: {transitions}\n"));
+    }
+    if !animations.is_empty() {
+        md.push_str(&format!("- Animations: {animations}\n"));
+    }
+    if !keyframes.is_empty() {
+        let names = keyframes.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+        md.push_str(&format!("- Keyframes: {names}\n"));
+    }
+    if !non_comp.is_empty() {
+        md.push_str(&format!("- Layout-triggering transitions observed on original (prefer GPU-composited `transform`/`opacity` in rebuild): {non_comp}\n"));
+    }
+    let mut extras = Vec::new();
+    if scroll_behavior != "auto" {
+        extras.push(format!("scroll-behavior: `{scroll_behavior}`"));
+    }
+    if transforms > 0 {
+        extras.push(format!("{transforms} transformed element(s)"));
+    }
+    if backdrop > 0 {
+        extras.push(format!("{backdrop} backdrop-filter element(s)"));
+    }
+    if canvases > 0 {
+        extras.push(format!("{canvases} canvas element(s)"));
+    }
+    if videos > 0 {
+        extras.push(format!("{videos} video element(s)"));
+    }
+    if !extras.is_empty() {
+        md.push_str(&format!("- Effects & surfaces: {}\n", extras.join(", ")));
+    }
+    md.push('\n');
     md
 }
 
@@ -1555,6 +2144,69 @@ mod tests {
             "{md}"
         );
         assert!(md.contains("### 1440 px"), "{md}");
+    }
+
+    #[test]
+    fn motion_blueprint_is_summarised_and_keyframes_stay_out_of_clean_room() {
+        let mut b = json!({
+            "url": "https://ex.com/",
+            "title": "Motion",
+            "page": {"w": 1440, "h": 1800},
+            "motion": {
+                "transitions": [
+                    {"value": "transform 0.25s ease-out", "count": 12},
+                    {"value": "--panel-progress 0.2s linear", "count": 3}
+                ],
+                "animations": [
+                    {"value": "pulse 2s ease-in-out", "count": 2},
+                    {"value": "very_long_internal_keyframe_identifier_without_any_timing_token_left_after_truncation", "count": 1}
+                ],
+                "non_composited": [{"value": "height", "count": 1}],
+                "keyframes": ["pulse", "fadeUp"],
+                "transforms": 8,
+                "backdrop_filters": 3,
+                "scroll_behavior": "smooth",
+                "canvases": 1,
+                "videos": 0,
+                "svgs": 5
+            }
+        });
+        let deep_md = readme(&b, &[], (0, 0), false);
+        assert!(deep_md.contains("## Motion & animations") && deep_md.contains("`transform 0.25s ease-out`") && deep_md.contains("`fadeUp`"), "{deep_md}");
+        assert!(deep_md.contains("1 canvas element(s)") && deep_md.contains("3 backdrop-filter element(s)"), "{deep_md}");
+
+        visitor_view(&mut b);
+        assert!(b.pointer("/motion/keyframes").is_none(), "CSS @keyframes rules are stripped in Clean room");
+        assert!(b.pointer("/motion/transitions").is_some(), "observable computed transitions stay");
+        assert_eq!(b.pointer("/motion/transitions/1/value").and_then(Value::as_str), Some("custom-property 0.2s linear"));
+        assert_eq!(b.pointer("/motion/animations").and_then(Value::as_array).map(Vec::len), Some(1));
+        assert_eq!(b.pointer("/motion/animations/0/value").and_then(Value::as_str), Some("2s ease-in-out"));
+        let clean_md = readme(&b, &[], (0, 0), true);
+        assert!(
+            clean_md.contains("## Motion & animations")
+                && !clean_md.contains("fadeUp")
+                && !clean_md.contains("pulse")
+                && !clean_md.contains("--panel-progress")
+                && !clean_md.contains("very_long_internal_keyframe"),
+            "{clean_md}"
+        );
+    }
+
+    #[test]
+    fn motion_capture_validates_bounds_and_requires_open_site() {
+        let mut s = crate::testing::session();
+        s.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
+        let e = crate::Engine::new(s);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("motion");
+        let opts = || crate::CallOptions::new(crate::Caller::Mcp).with_consent(crate::Consent::Granted);
+        let bad = e.call("web_page_motion_capture", json!({"output_directory": out.display().to_string(), "burst_frames": 0}), opts()).unwrap_err();
+        assert!(bad.message.contains("burst_frames"), "{}", bad.message);
+        let bad_ms = e.call("web_page_motion_capture", json!({"output_directory": out.display().to_string(), "interval_ms": 10}), opts()).unwrap_err();
+        assert!(bad_ms.message.contains("interval_ms"), "{}", bad_ms.message);
+        let no_site = e.call("web_page_motion_capture", json!({"output_directory": out.display().to_string()}), opts()).unwrap_err();
+        assert!(no_site.message.contains("no website is open"), "{}", no_site.message);
+        assert!(!out.exists());
     }
 
     #[test]

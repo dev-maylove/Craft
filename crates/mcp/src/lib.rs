@@ -65,7 +65,7 @@ pub struct ServerOptions {
     pub restricted: bool,
     /// Allow tools that open or reach websites (`web_site_open`) in restricted mode.
     pub allow_web: bool,
-    /// Allow website capture tools (`web_site_capture`, `web_page_states_capture`) in restricted mode.
+    /// Allow website capture tools (`web_site_capture`, `web_page_states_capture`, `web_page_motion_capture`) in restricted mode.
     pub allow_capture: bool,
     pub max_response_bytes: usize,
     /// Lower the budget for a client known to take less (Claude Code), from its name in
@@ -83,6 +83,17 @@ const ACTS_ON_DESKTOP: [&str; 2] = ["web_site_sign_in", "web_site_sign_out"];
 /// The web tool that starts from a saved sign-in unless told not to: always fresh in restricted
 /// mode (see `Server::restricted_args`).
 const SAVED_SIGN_IN_READER: &str = "web_site_open";
+
+/// Website observation and deterministic visual-diff tools permitted in Clean room mode.
+pub const CLEAN_ROOM_WEBSITE_TOOLS: &[&str] = &[
+    "web_site_open",
+    "web_site_capture",
+    "web_page_states_capture",
+    "web_page_motion_capture",
+    "web_page_screenshot_take",
+    "web_pixels_compare",
+    "web_site_close",
+];
 
 impl Default for ServerOptions {
     fn default() -> Self {

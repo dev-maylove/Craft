@@ -4739,6 +4739,38 @@ fn the_brief_says_signed_in_only_when_the_capture_was() {
 }
 
 #[test]
+fn website_brief_includes_engineering_contract_and_blind_safe_motion_guidance() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Motion", "Clone it", TargetRef::Website { url: "https://motion.example.com/".into() }).unwrap();
+    std::fs::create_dir_all(ws.capture_dir().join(kinds::website::MOTION_DIR)).unwrap();
+    std::fs::write(
+        ws.capture_dir().join(kinds::website::MOTION_DIR).join("motion.json"),
+        serde_json::to_vec(&json!({
+            "scroll_frames": [{"file": "burst-scroll-01.png"}],
+            "hover_frames": [{"file": "burst-hover-01.png"}],
+            "telemetry": {"cls": 0.01, "avg_frame_ms": 16.4}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for deep in [false, true] {
+        let sighted = super::brief(
+            &kinds::WebsiteKind,
+            &BriefCx { ws: &ws, deep, ghidra: false, editor: None, assets: false, image_model: None, sees_pictures: true },
+            None,
+        );
+        let blind = super::brief(
+            &kinds::WebsiteKind,
+            &BriefCx { ws: &ws, deep, ghidra: false, editor: None, assets: false, image_model: None, sees_pictures: false },
+            None,
+        );
+        assert!(sighted.contains("Engineering contract") && sighted.contains("burst-scroll-01.png"), "{sighted}");
+        assert!(blind.contains("Engineering contract") && blind.contains("capture/motion/motion.json"), "{blind}");
+        assert_eq!(said_to_look(&blind), None, "blind website motion brief must never tell the builder to look at pictures:\n{blind}");
+    }
+}
+
+#[test]
 fn a_new_build_stops_before_any_turn_when_its_stacks_program_is_missing() {
     let err = missing_program_stop("Rust + egui (eframe)", |_| false).unwrap_err();
     assert!(err.message.contains("cargo") && err.remediation.as_deref().is_some_and(|r| r.contains("rustup.rs")), "{err:?}");
