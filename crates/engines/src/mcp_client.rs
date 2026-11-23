@@ -390,25 +390,7 @@ impl Http {
                     req = req.header(k, v);
                 }
             }
-            let resp = req.send(body.as_str()).map_err(|e| {
-                if matches!(e, ureq::Error::RequireHttpsOnly(_)) {
-                    // This error carries the redirect URI, which can contain tokens or signed parameters.
-                    return ToolError::new(ErrorCode::EngineMissing, format!("The {} plugin redirected to plain HTTP and was refused.", self.name))
-                        .with_remediation("Keep every redirect for a remote MCP plugin on HTTPS.");
-                }
-                if matches!(e, ureq::Error::Protocol(_)) {
-                    // These carry raw text from the answer, such as a malformed redirect target
-                    // with signed parameters. A send failure invalidates the cached session.
-                    return ToolError::new(
-                        ErrorCode::EngineMissing,
-                        format!("The {} plugin sent an HTTP answer that couldn't be read, such as a malformed redirect.", self.name),
-                    )
-                    .with_remediation("Check its url in config.toml ([[plugins.mcp]]) and the server's redirects.");
-                }
-                let code = if timed_out(&e) { ErrorCode::TimedOut } else { ErrorCode::EngineMissing };
-                ToolError::new(code, format!("Couldn't reach the {} plugin: {e}", self.name))
-                    .with_remediation("Check its url in config.toml ([[plugins.mcp]]) and your connection.")
-            })?;
+            let resp = req.send(body.as_str()).map_err(|e| send_error(&self.name, e))?;
             let status = resp.status().as_u16();
             if !matches!(status, 301 | 302 | 303 | 307 | 308) {
                 break resp;
@@ -620,6 +602,35 @@ fn origin(url: &str) -> Option<(String, String, u16)> {
 }
 
 /// Whether a ureq error is its timeout, also when a body reader wrapped it in an I/O error.
+/// The failure of one POST to the plugin. A signal that cuts the call short (EINTR) is reported as
+/// an interrupted call rather than an unreachable plugin: the request may have reached the server,
+/// and a JSON-RPC POST is not safe to send again.
+fn send_error(name: &str, e: ureq::Error) -> ToolError {
+    if matches!(e, ureq::Error::RequireHttpsOnly(_)) {
+        // This error carries the redirect URI, which can contain tokens or signed parameters.
+        return ToolError::new(ErrorCode::EngineMissing, format!("The {name} plugin redirected to plain HTTP and was refused."))
+            .with_remediation("Keep every redirect for a remote MCP plugin on HTTPS.");
+    }
+    if matches!(e, ureq::Error::Protocol(_)) {
+        // These carry raw text from the answer, such as a malformed redirect target with signed
+        // parameters. A send failure invalidates the cached session.
+        return ToolError::new(ErrorCode::EngineMissing, format!("The {name} plugin sent an HTTP answer that couldn't be read, such as a malformed redirect."))
+            .with_remediation("Check its url in config.toml ([[plugins.mcp]]) and the server's redirects.");
+    }
+    if interrupted(&e) {
+        return ToolError::new(ErrorCode::ProgramFailed, format!("The call to the {name} plugin was interrupted before it answered: {e}")).with_remediation(
+            "A signal on this computer cut the call short, not the plugin: the request may have reached it, so check what it did before sending it again.",
+        );
+    }
+    let code = if timed_out(&e) { ErrorCode::TimedOut } else { ErrorCode::EngineMissing };
+    ToolError::new(code, format!("Couldn't reach the {name} plugin: {e}"))
+        .with_remediation("Check its url in config.toml ([[plugins.mcp]]) and your connection.")
+}
+
+fn interrupted(e: &ureq::Error) -> bool {
+    matches!(e, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::Interrupted)
+}
+
 fn timed_out(e: &ureq::Error) -> bool {
     match e {
         ureq::Error::Timeout(_) => true,
@@ -701,6 +712,31 @@ mod tests {
         assert!(err.details.as_ref().and_then(|d| d["output_tail"].as_str()).is_some_and(|t| t.contains("still loading 3 plugins")), "{err:?}");
         assert!(err.remediation.unwrap_or_default().contains("What it printed last:\nstill loading 3 plugins"));
         assert!(started.elapsed() < Duration::from_secs(20), "the server is stopped, not waited for");
+    }
+
+    /// A signal that cuts a POST short (EINTR) reads as an interrupted call, not as an unreachable
+    /// plugin, and is not retryable: the request may have reached the server already.
+    #[test]
+    fn an_interrupted_call_is_reported_as_interrupted() {
+        let e = ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::Interrupted));
+
+        let err = send_error("demo", e);
+
+        assert_eq!(err.code, ErrorCode::ProgramFailed, "{err:?}");
+        assert!(err.message.contains("interrupted"), "{err:?}");
+        assert!(!err.retryable, "a JSON-RPC POST must not be sent again: {err:?}");
+        assert!(err.remediation.unwrap_or_default().contains("may have reached it"));
+    }
+
+    /// Every other send failure keeps the previous reading: the plugin is unreachable.
+    #[test]
+    fn another_send_failure_is_still_unreachable() {
+        let e = ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+
+        let err = send_error("demo", e);
+
+        assert_eq!(err.code, ErrorCode::EngineMissing, "{err:?}");
+        assert!(err.message.contains("Couldn't reach the demo plugin"), "{err:?}");
     }
 
     #[test]

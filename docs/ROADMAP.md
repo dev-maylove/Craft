@@ -365,6 +365,7 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       — claimed: tanish2k09, branch bugfix/r5.2-interrupted-loopback-call
 - [ ] `mcp_client.rs`'s `post` reports an interrupted call (EINTR) as "Couldn't reach the plugin"
       (`EngineMissing`); a JSON-RPC POST isn't safe to send again, so say it was interrupted instead
+      — claimed: XiaoBinGan, branch bugfix/r5.3-mcp-interrupted-call
 
 ### R5.3 A builder that can't make progress stops
 Owner: open · Status: todo
