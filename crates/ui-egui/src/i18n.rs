@@ -36,6 +36,7 @@ pub static LANGUAGES: &[LangInfo] = &[
     LangInfo { code: "tr", name: "Türkçe", source: include_str!("i18n/tr.tsv") },
     LangInfo { code: "th", name: "ไทย", source: include_str!("i18n/th.tsv") },
     LangInfo { code: "et", name: "Eesti", source: include_str!("i18n/et.tsv") },
+    LangInfo { code: "he", name: "עברית", source: include_str!("i18n/he.tsv") },
 ];
 
 /// Match a locale against `langs`. An explicit script wins over the region, and legacy `iw`
@@ -835,14 +836,11 @@ mod tests {
         assert_eq!(language_from_tag("tr-TR"), Some("tr"));
         assert_eq!(language_from_tag("th-TH"), Some("th"));
         assert_eq!(language_from_tag("th_TH.UTF-8"), Some("th"));
-        assert_eq!(language_from_tag("he"), None);
-        assert_eq!(language_from_tag("iw"), None);
-        let with_he = [LangInfo { code: "en", name: "English", source: "" }, LangInfo { code: "he", name: "עברית", source: TEST_HE_CATALOG }];
-        assert_eq!(language_from_tag_in("he", &with_he), Some("he"));
-        assert_eq!(language_from_tag_in("he-IL", &with_he), Some("he"));
-        assert_eq!(language_from_tag_in("iw", &with_he), Some("he"));
-        assert_eq!(language_from_tag_in("iw-IL", &with_he), Some("he"));
-        assert_eq!(language_from_tag_in("iw_IL.UTF-8", &with_he), Some("he"));
+        assert_eq!(language_from_tag("he"), Some("he"));
+        assert_eq!(language_from_tag("he-IL"), Some("he"));
+        assert_eq!(language_from_tag("iw"), Some("he"));
+        assert_eq!(language_from_tag("iw-IL"), Some("he"));
+        assert_eq!(language_from_tag("iw_IL.UTF-8"), Some("he"));
         assert!(is_rtl_code("he"));
         assert!(is_rtl_code("iw"));
         assert!(is_rtl_code("iw-IL"));
@@ -876,7 +874,7 @@ mod tests {
         let mut catalogs = Vec::new();
         for lang in LANGUAGES
             .iter()
-            .filter(|l| matches!(l.code, "zh-hans" | "zh-hant" | "ru" | "ko" | "cs" | "de" | "ka" | "es" | "it" | "vi" | "pt-br" | "tr" | "th" | "et"))
+            .filter(|l| matches!(l.code, "zh-hans" | "zh-hant" | "ru" | "ko" | "cs" | "de" | "ka" | "es" | "it" | "vi" | "pt-br" | "tr" | "th" | "et" | "he"))
         {
             let mut keys = std::collections::BTreeSet::new();
             for (i, line) in lang.source.lines().enumerate() {

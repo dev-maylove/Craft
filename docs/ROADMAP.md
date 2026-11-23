@@ -2254,8 +2254,8 @@ First right-to-left language support (Hebrew and the shared RTL text, wrapping, 
       (`wrapped_label`) for egui 0.36, logical-order lookups for native menus and command-palette
       search, desktop Hebrew fallback font lookup, and RTL/LTR UI layout tests at the 760×520
       minimum window — claimed: hrb9, branch feat/hebrew-i18n-and-rtl; PR #2181
-- [ ] Hebrew UI catalog (`crates/ui-egui/src/i18n/he.tsv`) and language registration in
-      `LANGUAGES` and `xtask i18n-coverage` (follow-up PR on top of #2181)
+- [x] Hebrew UI catalog (`crates/ui-egui/src/i18n/he.tsv`) and language registration in
+      `LANGUAGES` and `xtask i18n-coverage` — claimed: hrb9, branch feature/r2.11-hebrew-catalog
 - [ ] Mixed-direction text in prose and feed items: full UAX #9 paragraph embedding/directional
       runs for multi-sentence mixed RTL/LTR content (tool notes, agent replies, feed cards)
       beyond single-label UI strings

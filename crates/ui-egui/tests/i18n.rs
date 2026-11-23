@@ -129,6 +129,7 @@ fn chinese_startup_language_menu_and_saved_selection() {
     for (code, native, label) in [
         ("de", "Deutsch", "Sprache"),
         ("fr", "Français", "Langue"),
+        ("he", "עברית", "שפה"),
         ("ja", "日本語", "言語"),
         ("ka", "ქართული", "ენა"),
         ("ko", "한국어", "언어"),
@@ -159,11 +160,16 @@ fn builder_replacement_notices(dir: &Path) {
         std::fs::create_dir_all(&dir).unwrap();
         let settings = Settings { mode: Mode::Beginner, first_run_done: true, language: code.into(), ..Default::default() };
         let mut h = harness(settings, &dir);
-        let turkish = i18n::language() == "tr";
+        let lang = i18n::language();
         let notice = |saved: &str, used: &str| {
-            if turkish {
+            if lang == "tr" {
                 format!(
                     "Bu proje için seçilen yapay zekâ ({saved}) devre dışı bırakılmış veya artık yapılandırılmamış. Projeyi bunun yerine {used} oluşturacak."
+                )
+            } else if lang == "he" {
+                i18n::trf(
+                    "The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.",
+                    &[("saved", saved), ("used", used)],
                 )
             } else {
                 craft_anything_ai::rebuild::replaced_builder_notice(saved, used)
