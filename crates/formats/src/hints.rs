@@ -301,14 +301,16 @@ mod tests {
 
     #[test]
     fn a_block_without_a_go_version_does_not_hide_a_real_one() {
-        let (mut elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
-        elf.resize(elf.len().next_multiple_of(16), 0);
-        elf.extend_from_slice(&craft_anything_testkit::formats::go_buildinfo_inline("not-a-version", ""));
-        go_block(&mut elf);
-        let b = crate::parse_binary(&elf).unwrap();
-        let hints = detect(&b, &elf);
-        let g = hints.iter().find(|h| h.id == "go").unwrap_or_else(|| panic!("{hints:?}"));
-        assert_eq!(g.label, "Go (go1.22.3)", "{g:?}");
+        for decoy in ["not-a-version", "gopher"] {
+            let (mut elf, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+            elf.resize(elf.len().next_multiple_of(16), 0);
+            elf.extend_from_slice(&craft_anything_testkit::formats::go_buildinfo_inline(decoy, ""));
+            go_block(&mut elf);
+            let b = crate::parse_binary(&elf).unwrap();
+            let hints = detect(&b, &elf);
+            let g = hints.iter().find(|h| h.id == "go").unwrap_or_else(|| panic!("{decoy}: {hints:?}"));
+            assert_eq!(g.label, "Go (go1.22.3)", "{decoy}: {g:?}");
+        }
     }
 
     #[test]

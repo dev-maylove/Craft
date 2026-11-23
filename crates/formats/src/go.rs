@@ -368,7 +368,7 @@ fn find_buildinfo(m: &Mapped<'_>, reg: &SearchRegion, warnings: &mut Vec<String>
 
 /// Whether a build-info version string looks like a Go release (`go1.22.3`, `devel go1.23-…`).
 fn looks_like_go_version(v: &str) -> bool {
-    v.starts_with("go") || v.starts_with("devel")
+    v.starts_with("go1") || v.starts_with("devel")
 }
 
 impl GoBuildInfo {
