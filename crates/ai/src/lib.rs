@@ -63,6 +63,19 @@ pub fn models_to_choose(e: &ToolError) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether `cfg` can act as an independent blind visual critic (`Role::Reviewer`): every API
+/// vision backend, plus local agent CLIs whose adapter enforces read-only, staging-folder-bounded
+/// execution ([`cli_agents::AgentAdapter::supports_blind_review`]).
+pub fn supports_reviewer(cfg: &BackendConfig) -> bool {
+    if cfg.kind != BackendKind::AgentCli {
+        return true;
+    }
+    if cfg.ssh_host.as_deref().is_some_and(|h| !h.trim().is_empty()) {
+        return false;
+    }
+    cli_agents::adapter_for(&cfg.model).supports_blind_review()
+}
+
 /// Kinds of backend. See `plan/05-ai-backends.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -565,18 +578,21 @@ impl AiHub {
     /// else any AI backend; the extractor: none).
     pub fn set_role(&self, role: Role, name: Option<&str>) -> Result<(), ToolError> {
         let mut cfg = self.config_to_change()?;
-        let role = config::role_key(role).to_string();
+        let role_str = config::role_key(role).to_string();
         match name {
-            Some(n) if cfg.get(n).is_none() => {
-                return Err(
-                    ToolError::invalid(format!("No AI backend named {n:?}")).with_remediation("See `craft-anything-cli ai list`, or add one in Settings → AI.")
-                );
-            }
             Some(n) => {
-                cfg.roles.insert(role, n.to_string());
+                let Some(entry) = cfg.get(n) else {
+                    return Err(ToolError::invalid(format!("No AI backend named {n:?}"))
+                        .with_remediation("See `craft-anything-cli ai list`, or add one in Settings → AI."));
+                };
+                if role == Role::Reviewer && !supports_reviewer(&entry.config) {
+                    return Err(ToolError::invalid(format!("{n} can't enforce code-blind, read-only review scoped to the staged screenshot folder."))
+                        .with_remediation("Choose an API vision backend or a local Claude Code backend as the reviewer."));
+                }
+                cfg.roles.insert(role_str, n.to_string());
             }
             None => {
-                cfg.roles.remove(&role);
+                cfg.roles.remove(&role_str);
             }
         }
         self.save_config(&cfg)

@@ -110,6 +110,10 @@ pub enum AiCommand {
     /// Choose the backend that takes a game's own files out after the study, in Deep mode (an API
     /// backend such as Kimi K3 through OpenRouter; leave the name out to turn it off).
     Extractor { name: Option<String> },
+    /// Choose the backend (an agent app or an API vision backend) that acts as an independent
+    /// blind visual critic after each check round (sees only screenshots and motion burst frames,
+    /// never source code; leave the name out to turn it off).
+    Reviewer { name: Option<String> },
 }
 
 fn hub(cli: &Cli) -> Result<AiHub, ToolError> {
@@ -488,6 +492,13 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
         AiCommand::Extractor { name } => match hub.set_role(craft_anything_ai::Role::Extractor, name.as_deref()) {
             Ok(()) => {
                 emit(&json!({"extractor": name}), f);
+                0
+            }
+            Err(e) => fail(&e, f),
+        },
+        AiCommand::Reviewer { name } => match hub.set_role(craft_anything_ai::Role::Reviewer, name.as_deref()) {
+            Ok(()) => {
+                emit(&json!({"reviewer": name}), f);
                 0
             }
             Err(e) => fail(&e, f),

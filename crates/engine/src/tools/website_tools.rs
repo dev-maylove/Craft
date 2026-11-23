@@ -7,7 +7,7 @@
 //! Data minimisation: form field values, cookies and storage are never read; the capture holds
 //! what any visitor sees on the page.
 
-use super::artifact_tools::{create_absent_dir, write_new_file};
+use super::artifact_tools::{abs_path, create_absent_dir, read_capped, write_new_file};
 use super::browser_tools::{browser_env, cleanup, deadline};
 use super::native_common::spec;
 use super::site_sign_in;
@@ -61,6 +61,39 @@ pub fn specs() -> Vec<ToolSpec> {
             Requires::Engine("chromium"),
             schema_of::<StatesParams>,
             web_page_states_capture,
+        ),
+        spec(
+            "web_page_motion_capture",
+            "Capture motion bursts and web telemetry",
+            "On the open website, capture sequential viewport burst frames while scrolling and hovering a prominent interactive control, while measuring Cumulative Layout Shift (CLS), Long Tasks (>50 ms), requestAnimationFrame pacing, and non-composited layout-triggering CSS transitions. Writes burst-scroll-<n>.png, burst-hover-<n>.png and motion.json into a new folder. Scrolling and hovering run the site's own code, so it needs your approval.",
+            "Record sequential scroll/hover motion frames and smooth-rendering telemetry so animations can be matched and verified.",
+            Toolset::Browser,
+            Effects::EVIDENCE.union(Effects::WRITES_FILESYSTEM).union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK),
+            Requires::Engine("chromium"),
+            schema_of::<MotionParams>,
+            web_page_motion_capture,
+        ),
+        spec(
+            "web_webgl_webgpu_probe",
+            "Inspect 3D canvases, WebGL and WebGPU pipelines",
+            "On the open website, inspect visible <canvas> surfaces, WebGL/WebGL2 and WebGPU rendering pipelines, shader modules, semantic uniform categories, per-frame draw calls and compute dispatches, pointer/wheel interactivity, and live frame animation across two sampled frames (canvas-frame-01.png and canvas-frame-02.png). In Clean room mode only black-box observable specifications are kept (never raw shader code or internal scene identifiers); in Deep mode full captured GLSL and WGSL shader sources, uniform names, pipeline descriptors, and Three.js scene metadata are recorded. Writes canvas3d.json and frame PNGs into a new folder. Dispatching pointer events runs the site's own code, so it needs your approval.",
+            "Inspect 3D canvases, WebGL/WebGPU draw calls, shader pipelines and rendered frames so GPU scenes can be rebuilt and verified.",
+            Toolset::Browser,
+            Effects::EVIDENCE.union(Effects::WRITES_FILESYSTEM).union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK),
+            Requires::Engine("chromium"),
+            schema_of::<Canvas3dProbeParams>,
+            web_webgl_webgpu_probe,
+        ),
+        spec(
+            "web_pixel_diff_heatmap",
+            "Compute visual diff heatmap and pixel divergence",
+            "Compare an original and rebuilt screenshot deterministically using SSIM and perceptual CIELAB (CIE76) Delta-E, cluster contiguous differing pixels into ordered bounding regions, and write a composite numbered heatmap (`heatmap.png`) plus exact geometric metadata (`diff.json`) into a new output folder. Pure computation over image files; no browser required.",
+            "Compare two screenshots pixel by pixel and draw a numbered heatmap highlighting every visual difference.",
+            Toolset::Browser,
+            Effects::EVIDENCE.union(Effects::WRITES_FILESYSTEM),
+            Requires::Nothing,
+            schema_of::<PixelDiffHeatmapParams>,
+            web_pixel_diff_heatmap,
         ),
         spec(
             "web_site_close",
@@ -199,7 +232,8 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     drop(reservation);
     ctx.report(None, format!("Loading {url}…"));
     let mut client = page_client(&site, &dl)?;
-    let r = navigate(&mut client, &url, p.width, p.height, p.settle_ms, &dl).and_then(|health| Ok((health, page_facts(&mut client, &dl)?)));
+    let r = navigate_with_mode(&mut client, &url, p.width, p.height, p.settle_ms, ctx.session.clean_room(), &dl)
+        .and_then(|health| Ok((health, page_facts(&mut client, &dl)?)));
     cleanup(&mut client, &dl);
     let (health, facts) = r?;
     let final_url = facts.get("url").and_then(Value::as_str).unwrap_or(&url).to_string();
@@ -341,9 +375,386 @@ fn set_viewport(client: &mut CdpClient, width: u32, height: u32, dl: &Deadline) 
     Ok(())
 }
 
-/// Open `url` and wait for it to settle; returns what went wrong while it loaded ([`page_health`]).
+/// Build the pre-navigation 3D instrumentation script registered via
+/// `Page.addScriptToEvaluateOnNewDocument`. When `visitor` is true (Clean room), the script never
+/// reads or retains GLSL/WGSL shader source strings, WGSL workgroup attributes, uniform names,
+/// pipeline labels, or Three.js scene internals — observing only context types, shader/pipeline
+/// counts, frame/draw/compute counters, and canvas pointer/wheel interactivity.
+fn canvas_3d_preload_js(visitor: bool) -> String {
+    format!("({CANVAS_3D_PRELOAD_BODY})({})", if visitor { "true" } else { "false" })
+}
+
+const CANVAS_3D_PRELOAD_BODY: &str = r#"visitor => {
+  if (window.__craft3d && window.__craft3d.__installed) return;
+  const MAX_SHADERS = 32;
+  const MAX_SHADER_BYTES = 16384;
+  const MAX_UNIFORMS = 64;
+  const MAX_PIPELINES = 64;
+  const MAX_FRAMES = 60;
+  const state = {
+    __installed: true,
+    contexts: [],
+    glslShaders: [],
+    glslSeen: Object.create(null),
+    wgslShaders: [],
+    wgslSeen: Object.create(null),
+    uniforms: [],
+    uniformSeen: Object.create(null),
+    uniformCategories: Object.create(null),
+    pipelines: [],
+    renderPipelineCount: 0,
+    computePipelineCount: 0,
+    currentFrame: { drawCalls: 0, instancedCalls: 0, vertices: 0, computeDispatches: 0, workgroups: 0 },
+    totals: { drawCalls: 0, instancedCalls: 0, vertices: 0, computeDispatches: 0, workgroups: 0 },
+    frameHistory: [],
+    lastFrameTs: 0,
+    activeFrameTs: -1,
+    pointerListeners: 0,
+    wheelListeners: 0,
+    canvasPointerListeners: 0,
+    canvasWheelListeners: 0,
+    offscreenCanvases: 0,
+    threeObserved: { scenes: [], renderers: 0 },
+  };
+  window.__craft3d = state;
+
+  const cap = (s, n) => String(s || '').slice(0, n);
+  const addContext = kind => {
+    if (!kind) return;
+    const norm = String(kind).toLowerCase() === 'experimental-webgl' ? 'webgl' : String(kind).toLowerCase();
+    if (!state.contexts.includes(norm)) state.contexts.push(norm);
+    return norm;
+  };
+  const classifyUniform = name => {
+    const n = String(name || '');
+    if (/(^|_)u?time$|elapsed|clock|delta|tick|frame|phase|speed/i.test(n)) return 'time';
+    if (/resolution|viewport|aspect|screen|pixelratio|dpr|size/i.test(n)) return 'resolution';
+    if (/mouse|pointer|cursor|touch|hover|drag|scroll/i.test(n)) return 'pointer';
+    if (/camera|view|proj|projection|mvp|model|matrix|world|normalmatrix|eye|fov|near|far|orbit|zoom/i.test(n)) return 'camera';
+    if (/colou?r|tint|albedo|emissive|specular|diffuse|ambient|fog|light|bg|background|palette|glow|hue|saturation/i.test(n)) return 'color';
+    return 'custom';
+  };
+  const recordDraw = (vertices, instanced) => {
+    const v = Math.max(0, Number(vertices) || 0);
+    state.currentFrame.drawCalls++;
+    state.totals.drawCalls++;
+    if (instanced) {
+      state.currentFrame.instancedCalls++;
+      state.totals.instancedCalls++;
+    }
+    state.currentFrame.vertices += v;
+    state.totals.vertices += v;
+  };
+  const recordCompute = (x, y, z) => {
+    const wg = Math.max(1, Number(x) || 1) * Math.max(1, Number(y) || 1) * Math.max(1, Number(z) || 1);
+    state.currentFrame.computeDispatches++;
+    state.currentFrame.workgroups += wg;
+    state.totals.computeDispatches++;
+    state.totals.workgroups += wg;
+  };
+  const wrapMethod = (proto, name, makeWrapper) => {
+    try {
+      if (!proto) return;
+      const orig = proto[name];
+      if (typeof orig !== 'function' || orig.__craft3dWrapped) return;
+      const wrapped = makeWrapper(orig);
+      wrapped.__craft3dWrapped = true;
+      proto[name] = wrapped;
+    } catch (_) {}
+  };
+
+  // 1. Canvas context creation and OffscreenCanvas transfer.
+  wrapMethod(typeof HTMLCanvasElement !== 'undefined' ? HTMLCanvasElement.prototype : null, 'getContext', orig => function(type) {
+    if (this && this.dataset && this.dataset.craftInternal === '1') {
+      return orig.apply(this, arguments);
+    }
+    const ctx = orig.apply(this, arguments);
+    if (ctx) {
+      try {
+        const norm = addContext(type);
+        if (norm && typeof this.setAttribute === 'function') this.setAttribute('data-craft-canvas-kind', norm);
+      } catch (_) {}
+    }
+    return ctx;
+  });
+  wrapMethod(typeof HTMLCanvasElement !== 'undefined' ? HTMLCanvasElement.prototype : null, 'transferControlToOffscreen', orig => function() {
+    if (this && this.dataset && this.dataset.craftInternal === '1') {
+      return orig.apply(this, arguments);
+    }
+    const offscreen = orig.apply(this, arguments);
+    try {
+      state.offscreenCanvases++;
+      addContext('offscreen');
+      if (this && typeof this.setAttribute === 'function') {
+        this.setAttribute('data-craft-canvas-kind', 'offscreen');
+        this.setAttribute('data-craft-offscreen', '1');
+      }
+    } catch (_) {}
+    return offscreen;
+  });
+
+  // 2. WebGL / WebGL2 hooks.
+  const shaderTypes = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+  const wrapGlProto = proto => {
+    if (!proto) return;
+    wrapMethod(proto, 'createShader', orig => function(type) {
+      const sh = orig.apply(this, arguments);
+      try {
+        if (sh && shaderTypes) {
+          shaderTypes.set(sh, type === 0x8B31 ? 'vertex' : type === 0x8B30 ? 'fragment' : 'unknown');
+        }
+      } catch (_) {}
+      return sh;
+    });
+    wrapMethod(proto, 'shaderSource', orig => function(shader, source) {
+      try {
+        if (state.glslShaders.length < MAX_SHADERS) {
+          let stage = (shaderTypes && shader && shaderTypes.get(shader)) || 'unknown';
+          if (visitor) {
+            state.glslShaders.push({ stage });
+          } else if (typeof source === 'string') {
+            if (stage === 'unknown') {
+              if (/\bgl_Position\b/.test(source)) stage = 'vertex';
+              else if (/\b(gl_FragColor|gl_FragData)\b|out\s+vec4\b/.test(source)) stage = 'fragment';
+            }
+            const code = cap(source, MAX_SHADER_BYTES);
+            const key = stage + ':' + source.length + ':' + code.slice(0, 128);
+            if (!state.glslSeen[key]) {
+              state.glslSeen[key] = true;
+              state.glslShaders.push({ stage, code, length: source.length, truncated: source.length > MAX_SHADER_BYTES });
+            }
+          }
+        }
+      } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(proto, 'getUniformLocation', orig => function(program, name) {
+      if (!visitor) {
+        try {
+          if (typeof name === 'string' && name && !state.uniformSeen[name] && Object.keys(state.uniformSeen).length < MAX_UNIFORMS) {
+            state.uniformSeen[name] = true;
+            const category = classifyUniform(name);
+            state.uniforms.push({ name: cap(name, 120), category });
+            state.uniformCategories[category] = (state.uniformCategories[category] || 0) + 1;
+          }
+        } catch (_) {}
+      }
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(proto, 'drawArrays', orig => function(mode, first, count) {
+      try { recordDraw(count, false); } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(proto, 'drawElements', orig => function(mode, count) {
+      try { recordDraw(count, false); } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(proto, 'drawArraysInstanced', orig => function(mode, first, count, instanceCount) {
+      try {
+        const inst = Math.max(1, Number(instanceCount) || 1);
+        recordDraw((Number(count) || 0) * inst, true);
+      } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(proto, 'drawElementsInstanced', orig => function(mode, count, type, offset, instanceCount) {
+      try {
+        const inst = Math.max(1, Number(instanceCount) || 1);
+        recordDraw((Number(count) || 0) * inst, true);
+      } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(proto, 'getExtension', orig => function(name) {
+      const ext = orig.apply(this, arguments);
+      try {
+        if (ext && typeof name === 'string' && name.toLowerCase() === 'angle_instanced_arrays' && !ext.__craft3dWrapped) {
+          ext.__craft3dWrapped = true;
+          wrapMethod(ext, 'drawArraysInstancedANGLE', origDraw => function(mode, first, count, primcount) {
+            try {
+              const inst = Math.max(1, Number(primcount) || 1);
+              recordDraw((Number(count) || 0) * inst, true);
+            } catch (_) {}
+            return origDraw.apply(this, arguments);
+          });
+          wrapMethod(ext, 'drawElementsInstancedANGLE', origDraw => function(mode, count, type, offset, primcount) {
+            try {
+              const inst = Math.max(1, Number(primcount) || 1);
+              recordDraw((Number(count) || 0) * inst, true);
+            } catch (_) {}
+            return origDraw.apply(this, arguments);
+          });
+        }
+      } catch (_) {}
+      return ext;
+    });
+  };
+  if (typeof WebGLRenderingContext !== 'undefined') wrapGlProto(WebGLRenderingContext.prototype);
+  if (typeof WebGL2RenderingContext !== 'undefined') wrapGlProto(WebGL2RenderingContext.prototype);
+
+  // 3. WebGPU hooks.
+  if (typeof GPUDevice !== 'undefined' && GPUDevice.prototype) {
+    wrapMethod(GPUDevice.prototype, 'createShaderModule', orig => function(descriptor) {
+      try {
+        if (state.wgslShaders.length < MAX_SHADERS) {
+          if (visitor) {
+            state.wgslShaders.push({ hasVertex: false, hasFragment: false, hasCompute: false });
+          } else if (descriptor && typeof descriptor.code === 'string') {
+            const raw = descriptor.code;
+            const label = descriptor.label ? cap(descriptor.label, 120) : '';
+            const code = cap(raw, MAX_SHADER_BYTES);
+            const key = label + ':' + raw.length + ':' + code.slice(0, 128);
+            if (!state.wgslSeen[key]) {
+              state.wgslSeen[key] = true;
+              const workgroupSizes = [];
+              for (const m of raw.matchAll(/@workgroup_size\s*\(([^)]*)\)/g)) {
+                if (workgroupSizes.length >= 8) break;
+                workgroupSizes.push(m[1].replace(/\s+/g, ' ').trim());
+              }
+              state.wgslShaders.push({
+                label,
+                code,
+                length: raw.length,
+                truncated: raw.length > MAX_SHADER_BYTES,
+                hasVertex: /@vertex\b/.test(raw),
+                hasFragment: /@fragment\b/.test(raw),
+                hasCompute: /@compute\b/.test(raw),
+                workgroupSizes,
+              });
+            }
+          }
+        }
+      } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+    const recordPipeline = (kind, descriptor) => {
+      try {
+        if (kind === 'render') state.renderPipelineCount++;
+        else state.computePipelineCount++;
+        if (!visitor && state.pipelines.length < MAX_PIPELINES) {
+          const label = descriptor && descriptor.label ? cap(descriptor.label, 120) : '';
+          const topology = kind === 'render'
+            ? ((descriptor && descriptor.primitive && descriptor.primitive.topology) ? String(descriptor.primitive.topology) : 'triangle-list')
+            : null;
+          state.pipelines.push({ kind, label, topology });
+        }
+      } catch (_) {}
+    };
+    wrapMethod(GPUDevice.prototype, 'createRenderPipeline', orig => function(descriptor) {
+      recordPipeline('render', descriptor);
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(GPUDevice.prototype, 'createRenderPipelineAsync', orig => function(descriptor) {
+      recordPipeline('render', descriptor);
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(GPUDevice.prototype, 'createComputePipeline', orig => function(descriptor) {
+      recordPipeline('compute', descriptor);
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(GPUDevice.prototype, 'createComputePipelineAsync', orig => function(descriptor) {
+      recordPipeline('compute', descriptor);
+      return orig.apply(this, arguments);
+    });
+  }
+  if (typeof GPURenderPassEncoder !== 'undefined' && GPURenderPassEncoder.prototype) {
+    wrapMethod(GPURenderPassEncoder.prototype, 'draw', orig => function(vertexCount, instanceCount) {
+      try {
+        const inst = instanceCount === undefined ? 1 : Math.max(1, Number(instanceCount) || 1);
+        recordDraw((Number(vertexCount) || 0) * inst, inst > 1);
+      } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+    wrapMethod(GPURenderPassEncoder.prototype, 'drawIndexed', orig => function(indexCount, instanceCount) {
+      try {
+        const inst = instanceCount === undefined ? 1 : Math.max(1, Number(instanceCount) || 1);
+        recordDraw((Number(indexCount) || 0) * inst, inst > 1);
+      } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+  }
+  if (typeof GPUComputePassEncoder !== 'undefined' && GPUComputePassEncoder.prototype) {
+    wrapMethod(GPUComputePassEncoder.prototype, 'dispatchWorkgroups', orig => function(x, y, z) {
+      try { recordCompute(x, y, z); } catch (_) {}
+      return orig.apply(this, arguments);
+    });
+  }
+
+  // 4. Pointer & wheel interactivity listeners.
+  wrapMethod(typeof EventTarget !== 'undefined' ? EventTarget.prototype : null, 'addEventListener', orig => function(type) {
+    try {
+      if (typeof type === 'string') {
+        const t = type.toLowerCase();
+        const onCanvas = typeof HTMLCanvasElement !== 'undefined' && (this instanceof HTMLCanvasElement);
+        if (t === 'pointermove' || t === 'mousemove' || t === 'pointerdown' || t === 'mousedown' || t === 'touchmove') {
+          state.pointerListeners++;
+          if (onCanvas) state.canvasPointerListeners++;
+        } else if (t === 'wheel' || t === 'mousewheel') {
+          state.wheelListeners++;
+          if (onCanvas) state.canvasWheelListeners++;
+        }
+      }
+    } catch (_) {}
+    return orig.apply(this, arguments);
+  });
+
+  // 5. Non-intrusive Three.js DevTools observation hook (installed only in Deep mode).
+  if (!visitor) {
+    try {
+      if (typeof window.__THREE_DEVTOOLS__ === 'undefined') {
+        window.__THREE_DEVTOOLS__ = {
+          dispatchEvent(ev) {
+            try {
+              const d = ev && ev.detail;
+              if (!d || typeof d !== 'object') return;
+              if (d.isWebGLRenderer || d.isWebGPURenderer) state.threeObserved.renderers++;
+              if (d.isScene && state.threeObserved.scenes.length < 4 && !state.threeObserved.scenes.includes(d)) {
+                state.threeObserved.scenes.push(d);
+              }
+            } catch (_) {}
+          },
+          addEventListener() {},
+          removeEventListener() {},
+        };
+      }
+    } catch (_) {}
+  }
+
+  // 6. Per-frame rolling window on requestAnimationFrame (last 60 frames).
+  wrapMethod(window, 'requestAnimationFrame', orig => function(cb) {
+    if (typeof cb !== 'function') return orig.apply(this, arguments);
+    return orig.call(this, function(ts) {
+      try {
+        if (state.activeFrameTs !== ts) {
+          if (state.lastFrameTs > 0) {
+            const deltaMs = Math.max(0, ts - state.lastFrameTs);
+            state.frameHistory.push({
+              drawCalls: state.currentFrame.drawCalls,
+              instancedCalls: state.currentFrame.instancedCalls,
+              vertices: state.currentFrame.vertices,
+              computeDispatches: state.currentFrame.computeDispatches,
+              workgroups: state.currentFrame.workgroups,
+              deltaMs,
+            });
+            if (state.frameHistory.length > MAX_FRAMES) state.frameHistory.shift();
+          }
+          state.currentFrame = { drawCalls: 0, instancedCalls: 0, vertices: 0, computeDispatches: 0, workgroups: 0 };
+          state.lastFrameTs = ts;
+          state.activeFrameTs = ts;
+        }
+      } catch (_) {}
+      return cb.call(this, ts);
+    });
+  });
+}"#;
+
+/// Open `url` and wait for it to settle (visitor-safe Clean room preload by default); returns
+/// what went wrong while it loaded ([`page_health`]).
 pub(crate) fn navigate(client: &mut CdpClient, url: &str, width: u32, height: u32, settle_ms: u64, dl: &Deadline) -> Result<Value, ToolError> {
+    navigate_with_mode(client, url, width, height, settle_ms, true, dl)
+}
+
+fn navigate_with_mode(client: &mut CdpClient, url: &str, width: u32, height: u32, settle_ms: u64, visitor: bool, dl: &Deadline) -> Result<Value, ToolError> {
     client.call("Page.enable", json!({}), None, dl)?;
+    let _ = client.call("Page.addScriptToEvaluateOnNewDocument", json!({"source": canvas_3d_preload_js(visitor)}), None, dl);
     // Errors and failed requests are read from the browser's own events; a browser that refuses
     // one of these still loads the page.
     for domain in ["Runtime.enable", "Log.enable", "Network.enable"] {
@@ -618,7 +1029,7 @@ fn web_page_states_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
             // Put the page back for the next one: close what opened, or go back to where it was.
             press_escape(&mut client, &dl);
             if after["url"].as_str().is_some_and(|u| u != start) {
-                let _ = navigate(&mut client, &start, p.width, 900, 800, &dl)?;
+                let _ = navigate_with_mode(&mut client, &start, p.width, 900, 800, ctx.session.clean_room(), &dl)?;
                 // The page reloaded: its marks are gone, so mark the toggles again.
                 let _ = eval(&mut client, &FIND_STATES_JS.replace("__MAX__", &p.max_states.to_string()), &dl);
             } else if after["expanded"] == "true" || after["open"] == true {
@@ -656,6 +1067,893 @@ fn web_page_states_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
     .limitation(Limitation::new("first_controls", "Only the first controls found are opened, one at a time; menus inside menus and hover-only menus are not."))
     .coverage(Coverage::complete(states.len() as u64))
     .location(Location::new("url", start))
+    .build()?;
+    Ok(ToolOutput::evidence(ev))
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_page_motion_capture
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MotionParams {
+    /// Absolute path of a folder that does not exist yet; burst frames and motion.json go there.
+    pub output_directory: String,
+    /// Viewport width in CSS pixels (320..=3840, default 1440).
+    #[serde(default = "d_width")]
+    pub width: u32,
+    /// Viewport height in CSS pixels (320..=4000, default 900).
+    #[serde(default = "d_height")]
+    pub height: u32,
+    /// Sequential frames captured per motion burst (1..=8, default 4).
+    #[serde(default = "d_burst_frames")]
+    pub burst_frames: usize,
+    /// Delay between burst frames in milliseconds (40..=1000, default 100).
+    #[serde(default = "d_burst_interval")]
+    pub interval_ms: u64,
+    #[serde(default = "d_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn d_burst_frames() -> usize {
+    4
+}
+fn d_burst_interval() -> u64 {
+    100
+}
+
+/// Start observing CLS, Long Tasks (>50 ms), requestAnimationFrame frame deltas, and
+/// non-composited layout-triggering CSS transitions on the open page.
+const MOTION_START_JS: &str = r#"(() => {
+  const prev = window.__craftMotion;
+  if (prev) {
+    prev.active = false;
+    if (Array.isArray(prev.observers)) {
+      for (const o of prev.observers) { try { (o && o.obs ? o.obs : o).disconnect(); } catch (e) {} }
+    }
+    delete window.__craftMotion;
+  }
+  const nonComp = new Set(['top','left','right','bottom','width','height','min-width','max-width','min-height','max-height','margin','margin-top','margin-right','margin-bottom','margin-left','padding','padding-top','padding-right','padding-bottom','padding-left','border-width','font-size','line-height','gap','box-shadow','background-position']);
+  const foundNonComp = new Set();
+  const els = Array.from(document.querySelectorAll('body *')).slice(0, 6000);
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    const s = getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none') continue;
+    const props = String(s.transitionProperty || '').split(',').map(p => p.trim().toLowerCase()).filter(Boolean);
+    const durs = String(s.transitionDuration || '').split(',').map(x => parseFloat(x) || 0);
+    if (props.length && durs.some(d => d > 0)) {
+      for (let i = 0; i < props.length; i++) {
+        const dur = durs.length ? durs[i % durs.length] : 0;
+        const p = props[i];
+        if (dur > 0 && nonComp.has(p) && foundNonComp.size < 16) foundNonComp.add(p);
+      }
+    }
+  }
+  const supportedTypes = (typeof PerformanceObserver !== 'undefined' && Array.isArray(PerformanceObserver.supportedEntryTypes))
+    ? PerformanceObserver.supportedEntryTypes
+    : null;
+  const state = { active: true, cls: 0, clsSupported: false, windowCls: 0, windowStartTs: -1, lastShiftTs: -1, longCount: 0, longMs: 0, longTaskSupported: false, frames: [], lastTs: 0, observers: [], nonComposited: Array.from(foundNonComp) };
+  const onShifts = entries => {
+    for (const e of entries) {
+      if (e.hadRecentInput) continue;
+      const v = Number(e.value) || 0;
+      const ts = Number(e.startTime) || 0;
+      if (state.windowStartTs >= 0 && (ts - state.lastShiftTs <= 1000) && (ts - state.windowStartTs <= 5000)) {
+        state.windowCls += v;
+      } else {
+        state.windowStartTs = ts;
+        state.windowCls = v;
+      }
+      state.lastShiftTs = ts;
+      if (state.windowCls > state.cls) state.cls = state.windowCls;
+    }
+  };
+  const onLongTasks = entries => {
+    for (const e of entries) {
+      state.longCount++;
+      state.longMs += Number(e.duration) || 0;
+    }
+  };
+  try {
+    if (!supportedTypes || supportedTypes.includes('layout-shift')) {
+      const lo = new PerformanceObserver(list => onShifts(list.getEntries()));
+      lo.observe({ type: 'layout-shift', buffered: false });
+      state.clsSupported = true;
+      state.observers.push({ obs: lo, handle: onShifts });
+    }
+  } catch (e) {}
+  try {
+    if (!supportedTypes || supportedTypes.includes('longtask')) {
+      const to = new PerformanceObserver(list => onLongTasks(list.getEntries()));
+      to.observe({ type: 'longtask', buffered: false });
+      state.longTaskSupported = true;
+      state.observers.push({ obs: to, handle: onLongTasks });
+    }
+  } catch (e) {}
+  const tick = ts => {
+    if (!state.active) return;
+    if (state.lastTs > 0 && state.frames.length < 2000) state.frames.push(ts - state.lastTs);
+    state.lastTs = ts;
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  window.__craftMotion = state;
+  return { max_scroll: Math.max(0, Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0) - innerHeight) };
+})()"#;
+
+/// Find a prominent visible interactive control in the top viewport to test hover transitions.
+const FIND_HOVER_TARGET_JS: &str = r#"(() => {
+  const cap = (s, n) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  const shown = el => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 24 || r.height < 16 || r.top < 0 || r.left < 0 || r.bottom > innerHeight || r.right > innerWidth) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0' && s.pointerEvents !== 'none';
+  };
+  let best = null;
+  let bestScore = -1;
+  for (const el of document.querySelectorAll('a[href], button, [role="button"]')) {
+    if (!shown(el)) continue;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    let score = 0;
+    const hasDur = String(s.transitionDuration || '').split(',').some(d => (parseFloat(d) || 0) > 0);
+    if (hasDur) score += 40;
+    if (s.backgroundColor && s.backgroundColor !== 'rgba(0, 0, 0, 0)' && s.backgroundColor !== 'transparent') score += 25;
+    if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score += 15;
+    if (r.top > 70 && r.top < innerHeight * 0.85) score += 15;
+    const label = cap(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title'), 80);
+    if (label) score += 10;
+    if (score > bestScore) {
+      bestScore = score;
+      const pad = 16;
+      const cl = Math.max(0, Math.round(r.left - pad));
+      const ct = Math.max(0, Math.round(r.top - pad));
+      const cr = Math.min(innerWidth, Math.round(r.right + pad));
+      const cb = Math.min(innerHeight, Math.round(r.bottom + pad));
+      best = {
+        tag: el.tagName.toLowerCase(),
+        label,
+        x: Math.round(r.left + r.width / 2),
+        y: Math.round(r.top + r.height / 2),
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+        left: cl,
+        top: ct,
+        clip_w: Math.max(0, cr - cl),
+        clip_h: Math.max(0, cb - ct),
+      };
+    }
+  }
+  return best;
+})()"#;
+
+/// Stop the motion observers and return the aggregated telemetry. When `window.__craftMotion` is
+/// absent (e.g. a page reload cleared it mid-capture), emit `missing_state: true` with `null`
+/// metrics so downstream checks record an unknown rather than treating fallback zeros as passes.
+const MOTION_STOP_JS: &str = r#"(() => {
+  const st = window.__craftMotion;
+  if (!st) {
+    return {
+      missing_state: true,
+      cls: null,
+      long_tasks_count: null,
+      long_tasks_ms: null,
+      avg_frame_ms: null,
+      max_frame_ms: null,
+      frame_count: 0,
+      non_composited_transitions: null,
+    };
+  }
+  st.active = false;
+  for (const item of st.observers) {
+    try {
+      const obs = item && item.obs ? item.obs : item;
+      if (item && typeof item.handle === 'function' && typeof obs.takeRecords === 'function') {
+        item.handle(obs.takeRecords());
+      }
+      obs.disconnect();
+    } catch (e) {}
+  }
+  const frames = st.frames || [];
+  const sum = frames.reduce((a, b) => a + b, 0);
+  const avg = frames.length ? sum / frames.length : 0;
+  const max = frames.length ? frames.reduce((a, b) => Math.max(a, b), 0) : 0;
+  delete window.__craftMotion;
+  return {
+    cls: st.clsSupported ? Math.round(st.cls * 10000) / 10000 : null,
+    long_tasks_count: st.longTaskSupported ? st.longCount : null,
+    long_tasks_ms: st.longTaskSupported ? Math.round(st.longMs * 10) / 10 : null,
+    avg_frame_ms: Math.round(avg * 100) / 100,
+    max_frame_ms: Math.round(max * 100) / 100,
+    frame_count: frames.length,
+    non_composited_transitions: st.nonComposited || [],
+  };
+})()"#;
+
+fn capture_viewport_png(client: &mut CdpClient, dl: &Deadline) -> Result<Vec<u8>, ToolError> {
+    let shot = client.call("Page.captureScreenshot", json!({"format": "png"}), None, dl)?;
+    let data = shot.get("data").and_then(Value::as_str).ok_or_else(|| ToolError::new(ErrorCode::GarbledOutput, "the browser returned no screenshot"))?;
+    web_common::b64_decode(data)
+}
+
+fn web_page_motion_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: MotionParams = parse_params(params)?;
+    if !(320..=3840).contains(&p.width) || !(320..=4000).contains(&p.height) {
+        return Err(ToolError::invalid("width must be 320..=3840 and height 320..=4000"));
+    }
+    if !(1..=8).contains(&p.burst_frames) {
+        return Err(ToolError::invalid("burst_frames must be 1..=8"));
+    }
+    if !(40..=1000).contains(&p.interval_ms) {
+        return Err(ToolError::invalid("interval_ms must be 40..=1000"));
+    }
+    let dl = deadline(ctx, p.timeout_secs.max(30))?;
+    let site = open_site(ctx, &dl)?;
+    let mut client = page_client(&site, &dl)?;
+    let here = eval(&mut client, "location.href", &dl).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    if here.is_empty() || here.starts_with("chrome-error:") || here == "about:blank" {
+        cleanup(&mut client, &dl);
+        return Err(ToolError::new(
+            ErrorCode::NotFound,
+            "The website didn't open, so there's no motion to capture: the browser is showing its own error page.",
+        )
+        .with_remediation("Open the site again with web_site_open and make sure it loads."));
+    }
+    let out = match create_absent_dir(&p.output_directory) {
+        Ok(out) => out,
+        Err(e) => {
+            cleanup(&mut client, &dl);
+            return Err(e);
+        }
+    };
+    let r = (|| -> Result<Value, ToolError> {
+        client.call("Page.enable", json!({}), None, &dl)?;
+        set_viewport(&mut client, p.width, p.height, &dl)?;
+        let _ = eval(&mut client, "scrollTo(0, 0)", &dl);
+        settle(&mut client, 350)?;
+        let url = eval(&mut client, "location.href", &dl)?.as_str().unwrap_or_default().to_string();
+        let started = eval(&mut client, MOTION_START_JS, &dl)?;
+        let max_scroll = started.get("max_scroll").and_then(Value::as_u64).unwrap_or(0);
+        let travel = max_scroll.min(u64::from(p.height).saturating_mul(2));
+
+        // Phase 1: Scroll burst frames across the page.
+        let mut scroll_frames = Vec::new();
+        let mut scroll_changed_tiles: usize = 0;
+        let mut prev_img: Option<web_common::Image> = None;
+        for i in 0..p.burst_frames {
+            if dl.expired() {
+                break;
+            }
+            let y = if p.burst_frames <= 1 || travel == 0 { 0 } else { travel.saturating_mul(i as u64) / ((p.burst_frames - 1) as u64) };
+            ctx.report(Some(i as f32 / (p.burst_frames.saturating_mul(2).max(1)) as f32), format!("Recording scroll frame {} of {}…", i + 1, p.burst_frames));
+            let _ = eval(&mut client, &format!("window.scrollTo({{top: {y}, behavior: 'instant'}})"), &dl);
+            settle(&mut client, p.interval_ms)?;
+            let actual_y = eval(&mut client, "Math.round(window.scrollY || 0)", &dl).ok().and_then(|v| v.as_u64()).unwrap_or(y);
+            let bytes = capture_viewport_png(&mut client, &dl)?;
+            let name = format!("burst-scroll-{:02}.png", i + 1);
+            write_new_file(&out, std::slice::from_ref(&name), &bytes).map_err(ToolError::invalid)?;
+            if let Ok(cur) = web_common::decode_png(&bytes) {
+                if let Some(prev) = &prev_img {
+                    scroll_changed_tiles = scroll_changed_tiles.saturating_add(web_common::NoiseMask::between(prev, &cur, 24).count());
+                }
+                prev_img = Some(cur);
+            }
+            scroll_frames.push(json!({"file": name, "scroll_y": actual_y, "sha256": sha256_hex(&bytes)}));
+        }
+        let _ = eval(&mut client, "window.scrollTo({top: 0, behavior: 'instant'})", &dl);
+        settle(&mut client, 250)?;
+
+        // Phase 2: Hover burst frames on a prominent visible interactive control, measuring pixel
+        // changes strictly within the selected control's padded bounding box so unrelated page
+        // motion (banners, carousels, videos) cannot count as button hover feedback.
+        let hover_target = eval(&mut client, FIND_HOVER_TARGET_JS, &dl).unwrap_or(Value::Null);
+        let hover_rect = match (
+            hover_target.get("left").and_then(Value::as_u64),
+            hover_target.get("top").and_then(Value::as_u64),
+            hover_target.get("clip_w").and_then(Value::as_u64),
+            hover_target.get("clip_h").and_then(Value::as_u64),
+        ) {
+            (Some(l), Some(t), Some(w), Some(h)) if w > 0 && h > 0 => Some((l as u32, t as u32, w as u32, h as u32)),
+            _ => None,
+        };
+        let mut hover_frames = Vec::new();
+        let mut hover_changed_tiles: usize = 0;
+        if let (Some(hx), Some(hy)) = (hover_target.get("x").and_then(Value::as_f64), hover_target.get("y").and_then(Value::as_f64)) {
+            let mut base_bytes: Option<Vec<u8>> = None;
+            for i in 0..p.burst_frames {
+                if dl.expired() {
+                    break;
+                }
+                if i == 1 {
+                    let _ = client.call("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": hx, "y": hy}), None, &dl);
+                }
+                if i > 0 {
+                    settle(&mut client, p.interval_ms)?;
+                }
+                let bytes = capture_viewport_png(&mut client, &dl)?;
+                let name = format!("burst-hover-{:02}.png", i + 1);
+                write_new_file(&out, std::slice::from_ref(&name), &bytes).map_err(ToolError::invalid)?;
+                if let Some(base) = &base_bytes {
+                    if let Some(changed) = changed_tiles_in_rect(base, &bytes, hover_rect) {
+                        hover_changed_tiles = hover_changed_tiles.max(changed);
+                    }
+                } else {
+                    base_bytes = Some(bytes.clone());
+                }
+                hover_frames.push(json!({"file": name, "hovered": i > 0, "sha256": sha256_hex(&bytes)}));
+            }
+            let _ = client.call("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": 0, "y": 0}), None, &dl);
+        }
+
+        let telemetry = eval(&mut client, MOTION_STOP_JS, &dl)?;
+        Ok(json!({
+            "url": url,
+            "width": p.width,
+            "height": p.height,
+            "interval_ms": p.interval_ms,
+            "hover_target": hover_target,
+            "scroll_frames": scroll_frames,
+            "hover_frames": hover_frames,
+            "scroll_changed_tiles": scroll_changed_tiles,
+            "hover_changed_tiles": hover_changed_tiles,
+            "telemetry": telemetry,
+        }))
+    })();
+    if r.is_err() {
+        let stop_dl = Deadline::new(Duration::from_secs(3), crate::tool::CancelToken::default());
+        let _ = eval(&mut client, MOTION_STOP_JS, &stop_dl);
+    }
+    cleanup(&mut client, &dl);
+    let mut record = match r {
+        Ok(record) => record,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&out);
+            return Err(e);
+        }
+    };
+    if site.signed_in.is_some()
+        && let Some(o) = record.as_object_mut()
+        && let Some(u) = o.get("url").and_then(Value::as_str).map(shown_url)
+    {
+        o.insert("url".into(), json!(u));
+    }
+    let json_bytes = serde_json::to_vec_pretty(&record).map_err(|e| ToolError::internal(e.to_string()))?;
+    if let Err(e) = write_new_file(&out, &["motion.json".into()], &json_bytes).map_err(ToolError::invalid) {
+        let _ = std::fs::remove_dir_all(&out);
+        return Err(e);
+    }
+
+    let url = record.get("url").and_then(Value::as_str).unwrap_or_default().to_string();
+    let shown = shown_url(&url);
+    let n_scroll = record["scroll_frames"].as_array().map_or(0, Vec::len);
+    let n_hover = record["hover_frames"].as_array().map_or(0, Vec::len);
+    let cls = record.pointer("/telemetry/cls").and_then(Value::as_f64).map_or_else(|| "unmeasured".to_string(), |v| format!("{v:.3}"));
+    let long_tasks =
+        record.pointer("/telemetry/long_tasks_count").and_then(Value::as_u64).map_or_else(|| "unmeasured".to_string(), |n| format!("{n} long task(s)"));
+    let avg_ms = record.pointer("/telemetry/avg_frame_ms").and_then(Value::as_f64).map_or_else(|| "unmeasured".to_string(), |v| format!("{v:.1} ms"));
+    let summary =
+        format!("Recorded {n_scroll} scroll and {n_hover} hover motion frame(s) on {shown} (CLS {cls}, {long_tasks}, avg frame {avg_ms}) → {}.", out.display());
+    let browser = site.handle();
+    let ev = EvidenceBuilder::new(
+        "web_page_motion_capture",
+        Subject { kind: "website".into(), sha256: None, name: Some(shown.clone()) },
+        browser_env(ctx.session.clean_room(), &browser),
+    )
+    .params(json!({"width": p.width, "height": p.height, "burst_frames": p.burst_frames, "interval_ms": p.interval_ms}))
+    .result(json!({
+        "url": shown,
+        "folder": out.display().to_string(),
+        "scroll_frames": n_scroll,
+        "hover_frames": n_hover,
+        "scroll_changed_tiles": record["scroll_changed_tiles"],
+        "hover_changed_tiles": record["hover_changed_tiles"],
+        "telemetry": record["telemetry"],
+    }))
+    .summary(summary)
+    .confidence(Confidence::Observed)
+    .authority(Authority::OurRun)
+    .limitation(Limitation::new(
+        "motion_sample",
+        "Samples scroll and one prominent hover interaction in a headless browser; frame times reflect software rasterisation when GPU acceleration is off.",
+    ))
+    .coverage(Coverage::complete((n_scroll + n_hover) as u64))
+    .location(Location::new("url", shown))
+    .location(Location::new("path", out.display().to_string()))
+    .build()?;
+    Ok(ToolOutput::evidence(ev))
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_webgl_webgpu_probe
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Canvas3dProbeParams {
+    /// Absolute path of a folder that does not exist yet; canvas3d.json and frame PNGs go there.
+    pub output_directory: String,
+    /// Viewport width in CSS pixels (320..=3840, default 1440).
+    #[serde(default = "d_width")]
+    pub width: u32,
+    /// Viewport height in CSS pixels (320..=4000, default 900).
+    #[serde(default = "d_height")]
+    pub height: u32,
+    /// Delay between the two sampled canvas frames in milliseconds (200..=3000, default 600).
+    #[serde(default = "d_sample_ms")]
+    pub sample_ms: u64,
+    #[serde(default = "d_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn d_sample_ms() -> u64 {
+    600
+}
+
+/// Find the largest visible `<canvas>` in the current viewport for pointer-interactivity sampling,
+/// clipping both edges to the viewport bounds so out-of-bounds pixels are never included.
+const FIND_LARGEST_CANVAS_JS: &str = r#"(() => {
+  let best = null;
+  let bestArea = 0;
+  for (const el of document.querySelectorAll('canvas')) {
+    if (el.dataset && el.dataset.craftInternal === '1') continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8 || r.bottom <= 0 || r.right <= 0 || r.top >= innerHeight || r.left >= innerWidth) continue;
+    const s = getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') continue;
+    const cl = Math.max(0, Math.round(r.left));
+    const ct = Math.max(0, Math.round(r.top));
+    const cr = Math.min(innerWidth, Math.round(r.right));
+    const cb = Math.min(innerHeight, Math.round(r.bottom));
+    const cw = Math.max(0, cr - cl);
+    const ch = Math.max(0, cb - ct);
+    if (cw < 8 || ch < 8) continue;
+    const area = cw * ch;
+    if (area > bestArea) {
+      bestArea = area;
+      best = {
+        x: Math.max(0, Math.min(innerWidth - 1, Math.round(cl + cw / 2))),
+        y: Math.max(0, Math.min(innerHeight - 1, Math.round(ct + ch / 2))),
+        left: cl,
+        top: ct,
+        w: cw,
+        h: ch,
+      };
+    }
+  }
+  return best;
+})()"#;
+
+/// Read a lightweight snapshot of cumulative draw and compute counters at a probe sample boundary.
+const CANVAS_3D_SNAPSHOT_JS: &str = r#"(() => {
+  const st = window.__craft3d;
+  if (!st || !st.totals) return null;
+  return { draw_calls: Number(st.totals.drawCalls) || 0, compute_dispatches: Number(st.totals.computeDispatches) || 0 };
+})()"#;
+
+/// Read `window.__craft3d` instrumentation together with visible `<canvas>` surfaces and
+/// (only in Deep mode, when `visitor` is false) Three.js scene metadata.
+fn collect_canvas_3d_js(visitor: bool) -> String {
+    format!("({COLLECT_CANVAS_3D_BODY})({})", if visitor { "true" } else { "false" })
+}
+
+const COLLECT_CANVAS_3D_BODY: &str = r#"visitor => {
+  const st = window.__craft3d || null;
+  const cap = (s, n) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  const canvases = [];
+  const contextSet = new Set(st && Array.isArray(st.contexts) ? st.contexts : []);
+  for (const el of Array.from(document.querySelectorAll('canvas')).slice(0, 32)) {
+    if (el.dataset && el.dataset.craftInternal === '1') continue;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    const visible = r.width >= 1 && r.height >= 1 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+    const kind = el.getAttribute('data-craft-canvas-kind') || '';
+    if (kind) contextSet.add(kind);
+    const entry = {
+      kind: kind || 'unknown',
+      width: el.width || 0,
+      height: el.height || 0,
+      css_width: Math.round(r.width),
+      css_height: Math.round(r.height),
+      x: Math.round(r.left),
+      y: Math.round(r.top),
+      visible,
+    };
+    if (el.id) entry.id = cap(el.id, 60);
+    if (typeof el.className === 'string' && el.className.trim()) entry.class = cap(el.className, 120);
+    canvases.push(entry);
+  }
+  const contexts = Array.from(contextSet);
+  const has3d = contexts.some(c => c === 'webgl' || c === 'webgl2' || c === 'webgpu');
+
+  const history = st && Array.isArray(st.frameHistory) ? st.frameHistory : [];
+  const cur = st && st.currentFrame ? st.currentFrame : { drawCalls: 0, instancedCalls: 0, vertices: 0, computeDispatches: 0, workgroups: 0 };
+  const totals = st && st.totals ? st.totals : { drawCalls: 0, instancedCalls: 0, vertices: 0, computeDispatches: 0, workgroups: 0 };
+  const samples = history.length > 0 ? history : (cur.drawCalls > 0 || cur.computeDispatches > 0 ? [cur] : []);
+  const avgOf = fn => samples.length ? samples.reduce((acc, f) => acc + fn(f), 0) / samples.length : 0;
+  const round2 = v => Math.round(v * 100) / 100;
+  const deltas = history.map(f => Number(f.deltaMs) || 0).filter(d => d > 0 && d < 2000);
+  const avgFrameMs = deltas.length ? deltas.reduce((a, b) => a + b, 0) / deltas.length : 0;
+  const fps = avgFrameMs > 0 ? Math.round((1000 / avgFrameMs) * 10) / 10 : 0;
+
+  const glslShaders = (st && Array.isArray(st.glslShaders) ? st.glslShaders : []).map(s => ({
+    stage: s.stage || 'unknown',
+    code: s.code || '',
+    length: s.length || 0,
+    truncated: !!s.truncated,
+  }));
+  const glslVertexCount = glslShaders.filter(s => s.stage === 'vertex').length;
+  const glslFragmentCount = glslShaders.filter(s => s.stage === 'fragment').length;
+
+  const wgslShaders = (st && Array.isArray(st.wgslShaders) ? st.wgslShaders : []).map(s => ({
+    label: s.label || '',
+    code: s.code || '',
+    length: s.length || 0,
+    truncated: !!s.truncated,
+    has_vertex: !!s.hasVertex,
+    has_fragment: !!s.hasFragment,
+    has_compute: !!s.hasCompute,
+    workgroup_sizes: Array.isArray(s.workgroupSizes) ? s.workgroupSizes : [],
+  }));
+  const pipelines = (st && Array.isArray(st.pipelines) ? st.pipelines : []).map(p => ({
+    kind: p.kind || 'render',
+    label: p.label || '',
+    topology: p.topology || null,
+  }));
+  const uniforms = (st && Array.isArray(st.uniforms) ? st.uniforms : []).map(u => ({
+    name: u.name || '',
+    category: u.category || 'custom',
+  }));
+  const uniformCategories = st && st.uniformCategories ? Object.assign({}, st.uniformCategories) : {};
+
+  const renderPipelineCount = st ? Number(st.renderPipelineCount) || 0 : 0;
+  const computePipelineCount = st ? Number(st.computePipelineCount) || 0 : 0;
+  const computeDispatchesPerFrame = round2(avgOf(f => Number(f.computeDispatches) || 0));
+  const hasComputeShader = wgslShaders.some(s => s.has_compute) || computePipelineCount > 0 || computeDispatchesPerFrame > 0;
+
+  // Deep-mode Three.js scene metadata (skipped completely in Clean room).
+  let threeScene = null;
+  if (!visitor) {
+    try {
+      const rev = window.__THREE__ || (window.THREE && window.THREE.REVISION) || null;
+      const observedScenes = st && st.threeObserved && Array.isArray(st.threeObserved.scenes) ? st.threeObserved.scenes : [];
+      const renderers = st && st.threeObserved ? Number(st.threeObserved.renderers) || 0 : 0;
+      const summarizeScene = scene => {
+        let objects = 0, meshes = 0, instancedMeshes = 0, lights = 0, cameras = 0;
+        const materials = new Set(), geometries = new Set(), names = [];
+        const stack = [scene];
+        while (stack.length > 0 && objects < 200) {
+          const node = stack.pop();
+          if (!node || typeof node !== 'object') continue;
+          objects++;
+          if (node.isInstancedMesh) instancedMeshes++;
+          else if (node.isMesh) meshes++;
+          if (node.isLight) lights++;
+          if (node.isCamera) cameras++;
+          if (typeof node.name === 'string' && node.name.trim() && names.length < 32) names.push(cap(node.name, 80));
+          if (node.material) {
+            const mats = Array.isArray(node.material) ? node.material : [node.material];
+            for (const m of mats) if (m && m.type && materials.size < 24) materials.add(String(m.type));
+          }
+          if (node.geometry && node.geometry.type && geometries.size < 24) geometries.add(String(node.geometry.type));
+          if (Array.isArray(node.children)) {
+            for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]);
+          }
+        }
+        return {
+          objects,
+          meshes,
+          instanced_meshes: instancedMeshes,
+          lights,
+          cameras,
+          material_types: Array.from(materials),
+          geometry_types: Array.from(geometries),
+          object_names: names,
+        };
+      };
+      const scenes = observedScenes.map(summarizeScene);
+      if (rev || renderers > 0 || scenes.length > 0) {
+        threeScene = { revision: rev ? String(rev) : null, renderers, scenes };
+      }
+    } catch (_) {}
+  }
+
+  const pointerInteractive = (st ? Number(st.canvasPointerListeners) || 0 : 0) > 0 || (Number(uniformCategories.pointer) || 0) > 0;
+  const wheelInteractive = (st ? Number(st.canvasWheelListeners) || 0 : 0) > 0;
+  const offscreenTransferred = (st ? Number(st.offscreenCanvases) || 0 : 0) > 0 || canvases.some(c => c.kind === 'offscreen');
+
+  return {
+    url: location.href,
+    instrumented: !!st,
+    contexts,
+    has_3d_context: has3d,
+    offscreen_transferred: offscreenTransferred,
+    canvases,
+    fps,
+    avg_frame_ms: round2(avgFrameMs),
+    frames_sampled: history.length,
+    draw_calls_per_frame: round2(avgOf(f => Number(f.drawCalls) || 0)),
+    instanced_calls_per_frame: round2(avgOf(f => Number(f.instancedCalls) || 0)),
+    compute_dispatches_per_frame: computeDispatchesPerFrame,
+    vertices_per_frame: round2(avgOf(f => Number(f.vertices) || 0)),
+    total_draw_calls: Number(totals.drawCalls) || 0,
+    total_instanced_calls: Number(totals.instancedCalls) || 0,
+    total_compute_dispatches: Number(totals.computeDispatches) || 0,
+    glsl_shader_count: glslShaders.length,
+    glsl_vertex_count: glslVertexCount,
+    glsl_fragment_count: glslFragmentCount,
+    glsl_shaders: glslShaders,
+    wgsl_shader_count: wgslShaders.length,
+    wgsl_shaders: wgslShaders,
+    has_compute_shader: hasComputeShader,
+    render_pipeline_count: renderPipelineCount,
+    compute_pipeline_count: computePipelineCount,
+    pipelines,
+    uniform_categories: uniformCategories,
+    uniforms,
+    pointer_interactive: pointerInteractive,
+    wheel_interactive: wheelInteractive,
+    three_scene: threeScene,
+  };
+}"#;
+
+/// Count 16×16 tiles whose mean colour changed between two PNG viewport frames within the
+/// target canvas bounding box `(x, y, w, h)`. Returns `None` when no visible canvas rectangle
+/// exists or the frames could not be decoded.
+fn changed_tiles_in_rect(before: &[u8], after: &[u8], rect: Option<(u32, u32, u32, u32)>) -> Option<usize> {
+    let (rx, ry, rw, rh) = rect?;
+    if rw == 0 || rh == 0 {
+        return None;
+    }
+    let (Ok(a), Ok(b)) = (web_common::decode_png(before), web_common::decode_png(after)) else {
+        return None;
+    };
+    let x0 = rx.min(a.width).min(b.width);
+    let y0 = ry.min(a.height).min(b.height);
+    let w = rw.min(a.width.saturating_sub(x0)).min(b.width.saturating_sub(x0));
+    let h = rh.min(a.height.saturating_sub(y0)).min(b.height.saturating_sub(y0));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let slice_rect = |img: &web_common::Image| -> web_common::Image {
+        let mut rgba = Vec::with_capacity((w as usize).saturating_mul(h as usize).saturating_mul(4));
+        let row_bytes = (w as usize).saturating_mul(4);
+        for y in y0..y0.saturating_add(h) {
+            let start = ((y as usize).saturating_mul(img.width as usize).saturating_add(x0 as usize)).saturating_mul(4);
+            if let Some(row) = img.rgba.get(start..start.saturating_add(row_bytes)) {
+                rgba.extend_from_slice(row);
+            }
+        }
+        web_common::Image { width: w, height: h, rgba }
+    };
+    let sub_a = slice_rect(&a);
+    let sub_b = slice_rect(&b);
+    Some(web_common::NoiseMask::between(&sub_a, &sub_b, 16).count())
+}
+
+/// Clean room view of a 3D canvas probe payload: strips raw GLSL/WGSL shader source code,
+/// internal uniform names, pipeline labels, DOM identifiers and Three.js scene graph metadata,
+/// keeping only black-box observable specifications (contexts, dimensions, shader/pipeline counts,
+/// `@compute` presence, semantic uniform categories, draw/compute counts, FPS, interactivity and
+/// rendered frame animation status).
+fn visitor_view_canvas3d(payload: &mut Value) {
+    let Value::Object(obj) = payload else { return };
+    if let Some(Value::Array(shaders)) = obj.get_mut("glsl_shaders") {
+        for shader in shaders.iter_mut().filter_map(Value::as_object_mut) {
+            shader.remove("code");
+        }
+    }
+    if let Some(Value::Array(shaders)) = obj.get_mut("wgsl_shaders") {
+        for shader in shaders.iter_mut().filter_map(Value::as_object_mut) {
+            shader.remove("code");
+            shader.remove("label");
+            shader.remove("workgroup_sizes");
+        }
+    }
+    if let Some(Value::Array(canvases)) = obj.get_mut("canvases") {
+        for canvas in canvases.iter_mut().filter_map(Value::as_object_mut) {
+            canvas.remove("id");
+            canvas.remove("class");
+        }
+    }
+    obj.remove("uniforms");
+    obj.remove("pipelines");
+    obj.remove("three_scene");
+    obj.insert("visitor_view".into(), json!(true));
+}
+
+fn web_webgl_webgpu_probe(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: Canvas3dProbeParams = parse_params(params)?;
+    if !(320..=3840).contains(&p.width) || !(320..=4000).contains(&p.height) {
+        return Err(ToolError::invalid("width must be 320..=3840 and height 320..=4000"));
+    }
+    if !(200..=3000).contains(&p.sample_ms) {
+        return Err(ToolError::invalid("sample_ms must be 200..=3000"));
+    }
+    let visitor = ctx.session.clean_room();
+    let dl = deadline(ctx, p.timeout_secs.max(30))?;
+    let site = open_site(ctx, &dl)?;
+    let mut client = page_client(&site, &dl)?;
+    let here = eval(&mut client, "location.href", &dl).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    if here.is_empty() || here.starts_with("chrome-error:") || here == "about:blank" {
+        cleanup(&mut client, &dl);
+        return Err(ToolError::new(ErrorCode::NotFound, "The website didn't open, so there's nothing to probe: the browser is showing its own error page.")
+            .with_remediation("Open the site again with web_site_open and make sure it loads."));
+    }
+    let out = match create_absent_dir(&p.output_directory) {
+        Ok(out) => out,
+        Err(e) => {
+            cleanup(&mut client, &dl);
+            return Err(e);
+        }
+    };
+    let r = (|| -> Result<Value, ToolError> {
+        client.call("Page.enable", json!({}), None, &dl)?;
+        set_viewport(&mut client, p.width, p.height, &dl)?;
+        settle(&mut client, 250)?;
+
+        ctx.report(Some(0.25), "Capturing initial 3D canvas frame…");
+        let frame1 = capture_viewport_png(&mut client, &dl)?;
+        write_new_file(&out, &["canvas-frame-01.png".into()], &frame1).map_err(ToolError::invalid)?;
+        let snap1 = eval(&mut client, CANVAS_3D_SNAPSHOT_JS, &dl).unwrap_or(Value::Null);
+
+        let parse_rect = |val: &Value| -> Option<(u32, u32, u32, u32)> {
+            match (
+                val.get("left").and_then(Value::as_u64),
+                val.get("top").and_then(Value::as_u64),
+                val.get("w").and_then(Value::as_u64),
+                val.get("h").and_then(Value::as_u64),
+            ) {
+                (Some(l), Some(t), Some(w), Some(h)) if w > 0 && h > 0 => Some((l as u32, t as u32, w as u32, h as u32)),
+                _ => None,
+            }
+        };
+        // Subtle pointer move across the largest visible `<canvas>` to probe interactive shaders/cameras.
+        let target = eval(&mut client, FIND_LARGEST_CANVAS_JS, &dl).unwrap_or(Value::Null);
+        let canvas_rect = parse_rect(&target);
+        let (cx, cy, cw, ch) = match (
+            target.get("x").and_then(Value::as_f64),
+            target.get("y").and_then(Value::as_f64),
+            target.get("w").and_then(Value::as_f64),
+            target.get("h").and_then(Value::as_f64),
+        ) {
+            (Some(x), Some(y), Some(w), Some(h)) => (x, y, w, h),
+            _ => (f64::from(p.width) * 0.5, f64::from(p.height) * 0.5, f64::from(p.width), f64::from(p.height)),
+        };
+        let dx = (cw * 0.12).clamp(8.0, 96.0);
+        let dy = (ch * 0.08).clamp(6.0, 64.0);
+        let x1 = (cx - dx).clamp(1.0, f64::from(p.width).max(2.0) - 1.0);
+        let y1 = (cy - dy).clamp(1.0, f64::from(p.height).max(2.0) - 1.0);
+        let x2 = (cx + dx).clamp(1.0, f64::from(p.width).max(2.0) - 1.0);
+        let y2 = (cy + dy).clamp(1.0, f64::from(p.height).max(2.0) - 1.0);
+        let _ = client.call("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": x1, "y": y1}), None, &dl);
+        let _ = client.call("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": x2, "y": y2}), None, &dl);
+
+        ctx.report(Some(0.6), "Sampling live 3D frame telemetry…");
+        settle(&mut client, p.sample_ms)?;
+        let frame2 = capture_viewport_png(&mut client, &dl)?;
+        write_new_file(&out, &["canvas-frame-02.png".into()], &frame2).map_err(ToolError::invalid)?;
+        let snap2 = eval(&mut client, CANVAS_3D_SNAPSHOT_JS, &dl).unwrap_or(Value::Null);
+        let target2 = eval(&mut client, FIND_LARGEST_CANVAS_JS, &dl).unwrap_or(Value::Null);
+        let stable_rect = canvas_rect.filter(|r| Some(*r) == parse_rect(&target2));
+
+        let interval_delta = |k: &str| -> Option<u64> {
+            let a = snap1.get(k).and_then(Value::as_u64)?;
+            let b = snap2.get(k).and_then(Value::as_u64)?;
+            Some(b.saturating_sub(a))
+        };
+        let interval_draw_calls = interval_delta("draw_calls");
+        let interval_compute_dispatches = interval_delta("compute_dispatches");
+
+        let tiles = changed_tiles_in_rect(&frame1, &frame2, stable_rect);
+        let animating = tiles.map(|t| t > 0);
+        let mut payload = eval(&mut client, &collect_canvas_3d_js(visitor), &dl)?;
+        if let Value::Object(obj) = &mut payload {
+            obj.insert("width".into(), json!(p.width));
+            obj.insert("height".into(), json!(p.height));
+            obj.insert("sample_ms".into(), json!(p.sample_ms));
+            obj.insert("changed_tiles".into(), json!(tiles.unwrap_or(0)));
+            obj.insert("canvas_animating".into(), json!(animating));
+            obj.insert("interval_draw_calls".into(), json!(interval_draw_calls));
+            obj.insert("interval_compute_dispatches".into(), json!(interval_compute_dispatches));
+            obj.insert(
+                "frames".into(),
+                json!([
+                    {"file": "canvas-frame-01.png", "sha256": sha256_hex(&frame1)},
+                    {"file": "canvas-frame-02.png", "sha256": sha256_hex(&frame2)},
+                ]),
+            );
+            obj.insert("visitor_view".into(), json!(visitor));
+        }
+        Ok(payload)
+    })();
+    cleanup(&mut client, &dl);
+    let mut payload = match r {
+        Ok(payload) => payload,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&out);
+            return Err(e);
+        }
+    };
+    if site.signed_in.is_some()
+        && let Some(obj) = payload.as_object_mut()
+        && let Some(u) = obj.get("url").and_then(Value::as_str).map(shown_url)
+    {
+        obj.insert("url".into(), json!(u));
+    }
+    if visitor {
+        visitor_view_canvas3d(&mut payload);
+    }
+    let json_bytes = serde_json::to_vec_pretty(&payload).map_err(|e| ToolError::internal(e.to_string()))?;
+    if let Err(e) = write_new_file(&out, &["canvas3d.json".into()], &json_bytes).map_err(ToolError::invalid) {
+        let _ = std::fs::remove_dir_all(&out);
+        return Err(e);
+    }
+
+    let url = payload.get("url").and_then(Value::as_str).unwrap_or_default().to_string();
+    let shown = shown_url(&url);
+    let n_canvases = payload.get("canvases").and_then(Value::as_array).map_or(0, Vec::len);
+    let contexts: Vec<&str> = payload.get("contexts").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    let ctx_desc = if contexts.is_empty() { "no GPU context".to_string() } else { contexts.join(", ") };
+    let draw_calls = payload.get("draw_calls_per_frame").and_then(Value::as_f64).unwrap_or(0.0);
+    let compute = payload.get("compute_dispatches_per_frame").and_then(Value::as_f64).unwrap_or(0.0);
+    let fps = payload.get("fps").and_then(Value::as_f64).unwrap_or(0.0);
+    let animating = payload.get("canvas_animating").and_then(Value::as_bool).map_or("unmeasured", |v| if v { "true" } else { "false" });
+    let summary = format!(
+        "Inspected {n_canvases} canvas(es) on {shown} ({ctx_desc}, {draw_calls:.1} draw call(s)/frame, {compute:.1} compute dispatch(es)/frame, {fps:.1} fps, animating={animating}) → {}.",
+        out.display()
+    );
+    let browser = site.handle();
+    let ev = EvidenceBuilder::new(
+        "web_webgl_webgpu_probe",
+        Subject { kind: "website".into(), sha256: None, name: Some(shown.clone()) },
+        browser_env(visitor, &browser),
+    )
+    .params(json!({"width": p.width, "height": p.height, "sample_ms": p.sample_ms, "visitor_view": visitor}))
+    .result(json!({
+        "url": shown,
+        "folder": out.display().to_string(),
+        "file": "canvas3d.json",
+        "contexts": payload.get("contexts"),
+        "has_3d_context": payload.get("has_3d_context"),
+        "canvases": payload.get("canvases"),
+        "fps": payload.get("fps"),
+        "avg_frame_ms": payload.get("avg_frame_ms"),
+        "frames_sampled": payload.get("frames_sampled"),
+        "draw_calls_per_frame": payload.get("draw_calls_per_frame"),
+        "instanced_calls_per_frame": payload.get("instanced_calls_per_frame"),
+        "compute_dispatches_per_frame": payload.get("compute_dispatches_per_frame"),
+        "glsl_shader_count": payload.get("glsl_shader_count"),
+        "wgsl_shader_count": payload.get("wgsl_shader_count"),
+        "has_compute_shader": payload.get("has_compute_shader"),
+        "render_pipeline_count": payload.get("render_pipeline_count"),
+        "compute_pipeline_count": payload.get("compute_pipeline_count"),
+        "uniform_categories": payload.get("uniform_categories"),
+        "pointer_interactive": payload.get("pointer_interactive"),
+        "wheel_interactive": payload.get("wheel_interactive"),
+        "canvas_animating": payload.get("canvas_animating"),
+        "changed_tiles": payload.get("changed_tiles"),
+        "frames": payload.get("frames"),
+        "visitor_view": visitor,
+    }))
+    .summary(summary)
+    .confidence(Confidence::Observed)
+    .authority(Authority::OurRun)
+    .limitation(if visitor {
+        Limitation::new(
+            "visitor_view",
+            "Clean room: only observable 3D canvas metrics, semantic uniform categories and rendered frames were kept; raw GLSL/WGSL shader source code, uniform names, pipeline labels and Three.js scene identifiers were stripped.",
+        )
+    } else {
+        Limitation::new(
+            "headless_gpu",
+            "Sampled in a private headless browser; WebGPU availability and frame rates depend on the host graphics stack and software fallback.",
+        )
+    })
+    .coverage(Coverage::complete(2))
+    .location(Location::new("url", shown))
+    .location(Location::new("path", out.display().to_string()))
     .build()?;
     Ok(ToolOutput::evidence(ev))
 }
@@ -704,10 +2002,13 @@ const BLUEPRINT_JS: &str = r#"(() => {
   const tally = (m, k) => { if (k) m[k] = (m[k] || 0) + 1; };
   const top = (m, n) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, n).map(([value, count]) => ({value, count}));
   const fonts = {}, sizes = {}, weights = {}, colors = {}, backgrounds = {}, radii = {}, shadows = {}, bgImages = {}, spacing = {}, maxWidths = {};
+  const transitions = {}, animations = {}, animationTimings = {}, nonComposited = {};
+  let transforms = 0, backdropFilters = 0, willChange = 0;
+  const NON_COMP = new Set(['top','left','right','bottom','width','height','min-width','max-width','min-height','max-height','margin','margin-top','margin-right','margin-bottom','margin-left','padding','padding-top','padding-right','padding-bottom','padding-left','border-width','font-size','line-height','gap','box-shadow','background-position']);
   // Colours as #rrggbb(aa), whatever notation the CSS used. Computed rgb()/rgba() is read as numbers: a canvas read
   // can be off by one per channel (Brave adds noise to it, #154). Anything else (oklch, color()…) is painted on a 1×1
   // canvas and read back.
-  const cv = document.createElement('canvas'); cv.width = cv.height = 1; const g = cv.getContext('2d', {willReadFrequently: true}); const seenHex = {};
+  const cv = document.createElement('canvas'); cv.dataset.craftInternal = '1'; cv.width = cv.height = 1; const g = cv.getContext('2d', {willReadFrequently: true}); const seenHex = {};
   const hex = c => { if (!c) return c; if (c in seenHex) return seenHex[c]; const h2 = x => x.toString(16).padStart(2, '0'); const m = /^rgba?\((\d+), (\d+), (\d+)(?:, ([\d.]+))?\)$/.exec(c); if (m) { const a = m[4] === undefined ? 1 : +m[4]; return seenHex[c] = '#' + h2(+m[1]) + h2(+m[2]) + h2(+m[3]) + (a < 1 ? h2(Math.round(a * 255)) : ''); } if (!g) return c; g.clearRect(0, 0, 1, 1); g.fillStyle = '#000'; g.fillStyle = c; g.fillRect(0, 0, 1, 1); const d = g.getImageData(0, 0, 1, 1).data; return seenHex[c] = '#' + h2(d[0]) + h2(d[1]) + h2(d[2]) + (d[3] < 255 ? h2(d[3]) : ''); };
   const els = [document.documentElement, document.body, ...Array.from(document.querySelectorAll('body *')).slice(0, 12000)].filter(Boolean);
   for (const el of els) {
@@ -722,13 +2023,33 @@ const BLUEPRINT_JS: &str = r#"(() => {
     if (s.borderRadius && s.borderRadius !== '0px') tally(radii, s.borderRadius.replace(/[\d.]+(?:e\+?\d+)?px/g, n => parseFloat(n) > 9999 ? '9999px' : n));
     if (s.boxShadow && s.boxShadow !== 'none') tally(shadows, s.boxShadow);
     const bi = s.backgroundImage; if (bi && bi !== 'none') for (const m of bi.matchAll(/url\(["']?([^"')]+)["']?\)/g)) tally(bgImages, m[1]);
+    if (s.transitionProperty && s.transitionProperty !== 'none') {
+      const props = String(s.transitionProperty).split(',').map(p => p.trim().toLowerCase()).filter(Boolean);
+      const durs = String(s.transitionDuration || '').split(',').map(d => parseFloat(d) || 0);
+      if (props.length && durs.some(d => d > 0)) {
+        tally(transitions, cap(s.transitionProperty + ' ' + s.transitionDuration + ' ' + s.transitionTimingFunction, 100));
+        for (let i = 0; i < props.length; i++) {
+          const dur = durs.length ? durs[i % durs.length] : 0;
+          if (dur > 0 && NON_COMP.has(props[i])) tally(nonComposited, props[i]);
+        }
+      }
+    }
+    if (s.animationName && s.animationName !== 'none' && String(s.animationDuration || '').split(',').some(d => (parseFloat(d) || 0) > 0)) {
+      const animTiming = cap(s.animationDuration + ' ' + s.animationTimingFunction, 80);
+      tally(animations, cap(s.animationName + ' ' + animTiming, 100));
+      tally(animationTimings, animTiming);
+    }
+    if (s.transform && s.transform !== 'none') transforms++;
+    if ((s.backdropFilter && s.backdropFilter !== 'none') || (s.webkitBackdropFilter && s.webkitBackdropFilter !== 'none')) backdropFilters++;
+    if (s.willChange && s.willChange !== 'auto') willChange++;
   }
-  const vars = {}, bps = {}; let ruleCount = 0, unreadable = 0;
+  const vars = {}, bps = {}, keyframes = []; let ruleCount = 0, unreadable = 0;
   const bp = (side, n, unit) => tally(bps, side + '-width ' + Math.round(parseFloat(n) * (unit === 'px' ? 1 : 16)) + 'px');
   const walk = (rules, depth) => {
     if (!rules || depth > 6) return;
     for (const r of Array.from(rules)) {
       if (++ruleCount > 40000) return;
+      if (r.type === 7 && r.name && keyframes.length < 40 && !keyframes.includes(r.name)) keyframes.push(cap(r.name, 80));
       if (r.selectorText && r.selectorText.includes(':root') && r.style) for (const name of Array.from(r.style)) if (name.startsWith('--') && Object.keys(vars).length < 300) vars[name] = cap(r.style.getPropertyValue(name), 120);
       const media = r.media && r.media.mediaText ? r.media.mediaText : (r.conditionText || '');
       for (const m of media.matchAll(/(min|max)-width\s*:\s*([\d.]+)(px|r?em)/g)) bp(m[1], m[2], m[3]);
@@ -783,11 +2104,30 @@ const BLUEPRINT_JS: &str = r#"(() => {
     unnamed_examples: unnamed.slice(0, 5).map(el => el.tagName.toLowerCase() + (el.className && typeof el.className === 'string' ? '.' + cap(el.className, 40).split(' ')[0] : '')),
     images_without_alt: Array.from(document.images).filter(i => shown(i) && !i.hasAttribute('alt')).length};
   const fontFaces = []; try { document.fonts.forEach(f => { if (fontFaces.length < 80) fontFaces.push({family: f.family, weight: f.weight, style: f.style, status: f.status}); }); } catch (e) {}
+  const canvasContexts = Array.from(new Set([
+    ...((window.__craft3d && Array.isArray(window.__craft3d.contexts)) ? window.__craft3d.contexts : []),
+    ...Array.from(document.querySelectorAll('canvas[data-craft-canvas-kind]')).map(c => c.getAttribute('data-craft-canvas-kind')).filter(Boolean),
+  ]));
   return {
     url: location.href, title: document.title, lang: document.documentElement.lang || '',
     viewport: {w: innerWidth, h: innerHeight}, page: {w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight},
     meta: {description: meta('description'), theme_color: meta('theme-color'), og_title: meta('og:title'), og_image: meta('og:image'), icons},
     design: {fonts: top(fonts, 12), font_sizes: top(sizes, 16), font_weights: top(weights, 8), text_colors: top(colors, 16), backgrounds: top(backgrounds, 16), radii: top(radii, 10), shadows: top(shadows, 8), spacing: top(spacing, 24), max_widths: top(maxWidths, 8), css_variables: vars, font_faces: fontFaces},
+    motion: {
+      transitions: top(transitions, 12),
+      animations: top(animations, 12),
+      animation_timings: top(animationTimings, 12),
+      non_composited: top(nonComposited, 8),
+      keyframes,
+      transforms,
+      backdrop_filters: backdropFilters,
+      will_change: willChange,
+      scroll_behavior: getComputedStyle(document.documentElement).scrollBehavior || 'auto',
+      canvases: document.querySelectorAll('canvas').length,
+      canvas_contexts: canvasContexts,
+      videos: document.querySelectorAll('video').length,
+      svgs: document.querySelectorAll('svg').length,
+    },
     breakpoints, unreadable_stylesheets: unreadable, a11y,
     outline, forms, links,
     assets: {
@@ -834,7 +2174,7 @@ const LAYOUT_JS: &str = r#"(() => {
   const px = v => Math.round(parseFloat(v) || 0);
   const shown = el => { const r = el.getBoundingClientRect(); if (r.width < 1 || r.height < 1) return false; const s = getComputedStyle(el); return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0'; };
   const size = sel => { const el = Array.from(document.querySelectorAll(sel)).slice(0, 50).find(shown); return el ? px(getComputedStyle(el).fontSize) : 0; };
-  const cv = document.createElement('canvas'); cv.width = cv.height = 1; const g = cv.getContext('2d', {willReadFrequently: true});
+  const cv = document.createElement('canvas'); cv.dataset.craftInternal = '1'; cv.width = cv.height = 1; const g = cv.getContext('2d', {willReadFrequently: true});
   // Computed rgb()/rgba() is read as numbers; a canvas read can be off by one (#154).
   const hex = c => { const h2 = x => x.toString(16).padStart(2, '0'); const m = /^rgba?\((\d+), (\d+), (\d+)(?:, ([\d.]+))?\)$/.exec(c); if (m) { const a = m[4] === undefined ? 1 : +m[4]; return '#' + h2(+m[1]) + h2(+m[2]) + h2(+m[3]) + (a < 1 ? h2(Math.round(a * 255)) : ''); } if (!g) return c; g.clearRect(0, 0, 1, 1); g.fillStyle = '#000'; g.fillStyle = c; g.fillRect(0, 0, 1, 1); const d = g.getImageData(0, 0, 1, 1).data; return '#' + h2(d[0]) + h2(d[1]) + h2(d[2]) + (d[3] < 255 ? h2(d[3]) : ''); };
   // Items side by side: the most children of one box sharing a top edge, counting only children at
@@ -920,6 +2260,9 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     if visitor {
         visitor_view(&mut blueprint);
     } else if let (Value::Object(b), Ok(h)) = (&mut blueprint, site.health.lock()) {
+        if let Some(Value::Object(m)) = b.get_mut("motion") {
+            m.remove("animation_timings");
+        }
         b.insert("health".into(), h.clone());
     }
     let signed_in = site.signed_in.is_some();
@@ -1131,6 +2474,29 @@ fn visitor_view(blueprint: &mut Value) {
         d.remove("css_variables");
         d.remove("font_faces");
     }
+    if let Some(Value::Object(m)) = b.get_mut("motion") {
+        // @keyframes rule names and custom CSS property identifiers stay out of Clean room;
+        // observable transition/animation timing stays.
+        m.remove("keyframes");
+        if let Some(timings) = m.remove("animation_timings") {
+            m.insert("animations".into(), timings);
+        } else if let Some(Value::Array(anims)) = m.get_mut("animations") {
+            anims.retain_mut(|entry| {
+                let Some(item) = entry.as_object_mut() else { return false };
+                let Some(val) = item.get("value").and_then(Value::as_str) else { return false };
+                let Some(stripped) = strip_animation_names(val) else { return false };
+                item.insert("value".into(), Value::String(stripped));
+                true
+            });
+        }
+        if let Some(Value::Array(trans)) = m.get_mut("transitions") {
+            for item in trans.iter_mut().filter_map(Value::as_object_mut) {
+                if let Some(val) = item.get("value").and_then(Value::as_str) {
+                    item.insert("value".into(), Value::String(sanitize_transition_custom_props(val)));
+                }
+            }
+        }
+    }
     let images: Vec<Value> = b
         .get("assets")
         .and_then(|a| a.get("images"))
@@ -1138,6 +2504,25 @@ fn visitor_view(blueprint: &mut Value) {
         .map(|a| a.iter().map(|i| json!({"w": i.get("w"), "h": i.get("h")})).collect())
         .unwrap_or_default();
     b.insert("assets".into(), json!({"images": images}));
+}
+
+fn strip_animation_names(val: &str) -> Option<String> {
+    let tokens: Vec<&str> = val.split_whitespace().collect();
+    let idx = tokens.iter().position(|t| {
+        let clean = t.trim_end_matches(',');
+        clean.as_bytes().first().is_some_and(u8::is_ascii_digit) && (clean.ends_with('s') || clean.ends_with("ms"))
+    })?;
+    Some(tokens[idx..].join(" "))
+}
+
+fn sanitize_transition_custom_props(val: &str) -> String {
+    val.split_whitespace()
+        .map(|tok| {
+            let trimmed = tok.trim_end_matches(',');
+            if trimmed.starts_with("--") { if tok.ends_with(',') { "custom-property," } else { "custom-property" } } else { tok }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A short human/agent-readable summary of the capture folder.
@@ -1209,6 +2594,7 @@ fn readme(b: &Value, shots: &[Value], (html_bytes, html_total): (usize, usize), 
         md.push_str(&format!("- Font files: {}\n\n", b.pointer("/assets/fonts").and_then(Value::as_array).map_or(0, Vec::len)));
     }
     md.push_str(&layout_section(b, visitor));
+    md.push_str(&motion_section(b, visitor));
     if !visitor {
         md.push_str(&health_section(b));
     }
@@ -1217,6 +2603,78 @@ fn readme(b: &Value, shots: &[Value], (html_bytes, html_total): (usize, usize), 
         let level = h.get("level").and_then(Value::as_u64).unwrap_or(1) as usize;
         md.push_str(&format!("{}- {}\n", "  ".repeat(level.saturating_sub(1)), h.get("text").and_then(Value::as_str).unwrap_or_default()));
     }
+    md
+}
+
+/// What transitions, animations, visual effects and dynamic surfaces the page uses, for the README.
+fn motion_section(b: &Value, visitor: bool) -> String {
+    let Some(m) = b.get("motion").and_then(Value::as_object) else { return String::new() };
+    let top_vals = |k: &str, n: usize| -> String {
+        m.get(k)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().take(n).filter_map(|x| x.get("value").and_then(Value::as_str)).map(|v| format!("`{v}`")).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default()
+    };
+    let num = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let transitions = top_vals("transitions", 6);
+    let animations = top_vals("animations", 6);
+    let non_comp = top_vals("non_composited", 6);
+    let keyframes: Vec<&str> =
+        if visitor { Vec::new() } else { m.get("keyframes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).take(12).collect() };
+    let scroll_behavior = m.get("scroll_behavior").and_then(Value::as_str).unwrap_or("auto");
+    let canvas_contexts: Vec<&str> =
+        m.get("canvas_contexts").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter(|s| !s.is_empty()).collect();
+    let (transforms, backdrop, canvases, videos) = (num("transforms"), num("backdrop_filters"), num("canvases"), num("videos"));
+    if transitions.is_empty()
+        && animations.is_empty()
+        && keyframes.is_empty()
+        && transforms == 0
+        && backdrop == 0
+        && canvases == 0
+        && canvas_contexts.is_empty()
+        && videos == 0
+        && scroll_behavior == "auto"
+    {
+        return String::new();
+    }
+    let mut md = String::from("## Motion & animations\n\n");
+    if !transitions.is_empty() {
+        md.push_str(&format!("- Transitions: {transitions}\n"));
+    }
+    if !animations.is_empty() {
+        md.push_str(&format!("- Animations: {animations}\n"));
+    }
+    if !keyframes.is_empty() {
+        let names = keyframes.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+        md.push_str(&format!("- Keyframes: {names}\n"));
+    }
+    if !non_comp.is_empty() {
+        md.push_str(&format!("- Layout-triggering transitions observed on original (prefer GPU-composited `transform`/`opacity` in rebuild): {non_comp}\n"));
+    }
+    if !canvas_contexts.is_empty() {
+        let kinds = canvas_contexts.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+        md.push_str(&format!("- 3D / GPU canvas contexts: {kinds}\n"));
+    }
+    let mut extras = Vec::new();
+    if scroll_behavior != "auto" {
+        extras.push(format!("scroll-behavior: `{scroll_behavior}`"));
+    }
+    if transforms > 0 {
+        extras.push(format!("{transforms} transformed element(s)"));
+    }
+    if backdrop > 0 {
+        extras.push(format!("{backdrop} backdrop-filter element(s)"));
+    }
+    if canvases > 0 {
+        extras.push(format!("{canvases} canvas element(s)"));
+    }
+    if videos > 0 {
+        extras.push(format!("{videos} video element(s)"));
+    }
+    if !extras.is_empty() {
+        md.push_str(&format!("- Effects & surfaces: {}\n", extras.join(", ")));
+    }
+    md.push('\n');
     md
 }
 
@@ -1311,6 +2769,109 @@ fn block_line(blk: &Value) -> String {
         s.push_str(&format!(", background {bg}"));
     }
     s
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_pixel_diff_heatmap (pure computation)
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PixelDiffHeatmapParams {
+    /// Absolute path to the original (reference) screenshot (PNG, JPEG, WebP, or GIF).
+    pub original_image_path: String,
+    /// Absolute path to the rebuilt screenshot (PNG, JPEG, WebP, or GIF).
+    pub built_image_path: String,
+    /// Absolute path of a folder that does not exist yet; `heatmap.png` and `diff.json` are written there.
+    pub output_directory: String,
+    /// Perceptual CIE76 Delta-E threshold above which a pixel counts as differing (0.5..=50.0, default 2.5).
+    #[serde(default)]
+    pub delta_e_threshold: Option<f64>,
+}
+
+fn web_pixel_diff_heatmap(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: PixelDiffHeatmapParams = parse_params(params)?;
+    let threshold = p.delta_e_threshold.unwrap_or(web_common::DEFAULT_DELTA_E_THRESHOLD);
+    if !threshold.is_finite() || !(0.5..=50.0).contains(&threshold) {
+        return Err(ToolError::invalid("delta_e_threshold must be 0.5..=50.0"));
+    }
+    let out_check = abs_path(&p.output_directory, "output_directory")?;
+    if out_check.exists() {
+        return Err(ToolError::invalid(format!("output_directory already exists: {}", out_check.display())));
+    }
+    let orig_path = abs_path(&p.original_image_path, "original_image_path")?;
+    let built_path = abs_path(&p.built_image_path, "built_image_path")?;
+    let orig_bytes = read_capped(&orig_path, web_common::MAX_SCREENSHOT_BYTES as u64)?;
+    let built_bytes = read_capped(&built_path, web_common::MAX_SCREENSHOT_BYTES as u64)?;
+    let orig_img = web_common::decode_picture(&orig_bytes)?;
+    let built_img = web_common::decode_picture(&built_bytes)?;
+
+    let opts = web_common::DiffOptions { delta_e_threshold: threshold, ..web_common::DiffOptions::default() };
+    let report = web_common::compute_pixel_diff_heatmap(&orig_img, &built_img, opts)?;
+    let diff_bytes = serde_json::to_vec_pretty(&report.diff_json).map_err(|e| ToolError::internal(e.to_string()))?;
+
+    let out = create_absent_dir(&p.output_directory)?;
+    let write_res = (|| -> Result<(std::path::PathBuf, std::path::PathBuf), ToolError> {
+        let hm = write_new_file(&out, &["heatmap.png".into()], &report.heatmap_png).map_err(ToolError::invalid)?;
+        let dj = write_new_file(&out, &["diff.json".into()], &diff_bytes).map_err(ToolError::invalid)?;
+        Ok((hm, dj))
+    })();
+    let (heatmap_path, diff_path) = match write_res {
+        Ok(paths) => paths,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&out);
+            return Err(e);
+        }
+    };
+
+    let summary = format!(
+        "Visual diff ({}×{}): SSIM {:.3}, mean Delta-E {:.2}, {} differing pixel(s) ({:.1}%), {} divergence region(s) → {}.",
+        report.width,
+        report.height,
+        report.ssim,
+        report.mean_delta_e,
+        report.differing_pixels,
+        report.difference_fraction * 100.0,
+        report.regions.len(),
+        out.display(),
+    );
+    let ev = EvidenceBuilder::new(
+        "web_pixel_diff_heatmap",
+        Subject { kind: "comparison".into(), sha256: None, name: Some("visual_diff_heatmap".into()) },
+        super::artifact_tools::env(ctx),
+    )
+    .params(json!({
+        "original_image_path": orig_path.display().to_string(),
+        "built_image_path": built_path.display().to_string(),
+        "output_directory": out.display().to_string(),
+        "delta_e_threshold": threshold,
+        "original_sha256": sha256_hex(&orig_bytes),
+        "built_sha256": sha256_hex(&built_bytes),
+    }))
+    .result(json!({
+        "output_directory": out.display().to_string(),
+        "heatmap_path": heatmap_path.display().to_string(),
+        "diff_json_path": diff_path.display().to_string(),
+        "width": report.width,
+        "height": report.height,
+        "original_size": {"width": report.original_width, "height": report.original_height},
+        "built_size": {"width": report.built_width, "height": report.built_height},
+        "ssim": report.ssim,
+        "mean_delta_e": report.mean_delta_e,
+        "max_delta_e": report.max_delta_e,
+        "total_pixels": report.total_pixels,
+        "differing_pixels": report.differing_pixels,
+        "difference_fraction": report.difference_fraction,
+        "delta_e_threshold": report.delta_e_threshold,
+        "region_count": report.regions.len(),
+        "regions": report.regions,
+        "heatmap_sha256": sha256_hex(&report.heatmap_png),
+    }))
+    .summary(summary)
+    .confidence(Confidence::Derived)
+    .coverage(Coverage::complete(1))
+    .location(Location::new("path", out.display().to_string()))
+    .build()?;
+    Ok(ToolOutput::evidence(ev))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1555,6 +3116,244 @@ mod tests {
             "{md}"
         );
         assert!(md.contains("### 1440 px"), "{md}");
+    }
+
+    #[test]
+    fn motion_blueprint_is_summarised_and_keyframes_stay_out_of_clean_room() {
+        let mut b = json!({
+            "url": "https://ex.com/",
+            "title": "Motion",
+            "page": {"w": 1440, "h": 1800},
+            "motion": {
+                "transitions": [
+                    {"value": "transform 0.25s ease-out", "count": 12},
+                    {"value": "--panel-progress 0.2s linear", "count": 3}
+                ],
+                "animations": [
+                    {"value": "pulse 2s ease-in-out", "count": 2},
+                    {"value": "very_long_internal_keyframe_identifier_without_any_timing_token_left_after_truncation", "count": 1}
+                ],
+                "non_composited": [{"value": "height", "count": 1}],
+                "keyframes": ["pulse", "fadeUp"],
+                "transforms": 8,
+                "backdrop_filters": 3,
+                "scroll_behavior": "smooth",
+                "canvases": 1,
+                "videos": 0,
+                "svgs": 5
+            }
+        });
+        let deep_md = readme(&b, &[], (0, 0), false);
+        assert!(deep_md.contains("## Motion & animations") && deep_md.contains("`transform 0.25s ease-out`") && deep_md.contains("`fadeUp`"), "{deep_md}");
+        assert!(deep_md.contains("1 canvas element(s)") && deep_md.contains("3 backdrop-filter element(s)"), "{deep_md}");
+
+        visitor_view(&mut b);
+        assert!(b.pointer("/motion/keyframes").is_none(), "CSS @keyframes rules are stripped in Clean room");
+        assert!(b.pointer("/motion/transitions").is_some(), "observable computed transitions stay");
+        assert_eq!(b.pointer("/motion/transitions/1/value").and_then(Value::as_str), Some("custom-property 0.2s linear"));
+        assert_eq!(b.pointer("/motion/animations").and_then(Value::as_array).map(Vec::len), Some(1));
+        assert_eq!(b.pointer("/motion/animations/0/value").and_then(Value::as_str), Some("2s ease-in-out"));
+        let clean_md = readme(&b, &[], (0, 0), true);
+        assert!(
+            clean_md.contains("## Motion & animations")
+                && !clean_md.contains("fadeUp")
+                && !clean_md.contains("pulse")
+                && !clean_md.contains("--panel-progress")
+                && !clean_md.contains("very_long_internal_keyframe"),
+            "{clean_md}"
+        );
+    }
+
+    #[test]
+    fn motion_capture_validates_bounds_and_requires_open_site() {
+        let mut s = crate::testing::session();
+        s.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
+        let e = crate::Engine::new(s);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("motion");
+        let opts = || crate::CallOptions::new(crate::Caller::Mcp).with_consent(crate::Consent::Granted);
+        let bad = e.call("web_page_motion_capture", json!({"output_directory": out.display().to_string(), "burst_frames": 0}), opts()).unwrap_err();
+        assert!(bad.message.contains("burst_frames"), "{}", bad.message);
+        let bad_ms = e.call("web_page_motion_capture", json!({"output_directory": out.display().to_string(), "interval_ms": 10}), opts()).unwrap_err();
+        assert!(bad_ms.message.contains("interval_ms"), "{}", bad_ms.message);
+        let no_site = e.call("web_page_motion_capture", json!({"output_directory": out.display().to_string()}), opts()).unwrap_err();
+        assert!(no_site.message.contains("no website is open"), "{}", no_site.message);
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn visitor_view_canvas3d_strips_shaders_and_internals_while_keeping_observable_metrics() {
+        let mut payload = json!({
+            "url": "https://scene.example.test/",
+            "contexts": ["webgl2", "webgpu"],
+            "has_3d_context": true,
+            "canvases": [{"kind": "webgl2", "width": 1440, "height": 900, "css_width": 1440, "css_height": 900, "x": 0, "y": 0, "visible": true, "id": "hero-gl", "class": "scene-canvas"}],
+            "fps": 60.0,
+            "avg_frame_ms": 16.67,
+            "frames_sampled": 30,
+            "draw_calls_per_frame": 14.0,
+            "instanced_calls_per_frame": 2.0,
+            "compute_dispatches_per_frame": 3.0,
+            "glsl_shader_count": 2,
+            "glsl_vertex_count": 1,
+            "glsl_fragment_count": 1,
+            "glsl_shaders": [
+                {"stage": "vertex", "code": "void main(){ gl_Position = vec4(0.0); }", "length": 37, "truncated": false},
+                {"stage": "fragment", "code": "void main(){ gl_FragColor = vec4(1.0); }", "length": 38, "truncated": false}
+            ],
+            "wgsl_shader_count": 1,
+            "wgsl_shaders": [
+                {"label": "particle-sim", "code": "@compute @workgroup_size(64) fn main() {}", "length": 41, "truncated": false, "has_vertex": false, "has_fragment": false, "has_compute": true, "workgroup_sizes": ["64"]}
+            ],
+            "has_compute_shader": true,
+            "render_pipeline_count": 2,
+            "compute_pipeline_count": 1,
+            "pipelines": [{"kind": "compute", "label": "sim-pipe", "topology": null}],
+            "uniform_categories": {"time": 1, "camera": 2},
+            "uniforms": [{"name": "uTime", "category": "time"}, {"name": "uViewMatrix", "category": "camera"}],
+            "pointer_interactive": true,
+            "wheel_interactive": true,
+            "canvas_animating": true,
+            "changed_tiles": 42,
+            "three_scene": {"revision": "170", "renderers": 1, "scenes": [{"objects": 12, "object_names": ["HeroMesh"]}]},
+        });
+
+        visitor_view_canvas3d(&mut payload);
+
+        // Raw GLSL/WGSL source code, uniform names, pipeline labels, canvas id/class, and Three.js graph are stripped.
+        let serialized = payload.to_string();
+        for forbidden in
+            ["gl_Position", "gl_FragColor", "@workgroup_size(64)", "particle-sim", "sim-pipe", "uViewMatrix", "HeroMesh", "hero-gl", "scene-canvas"]
+        {
+            assert!(!serialized.contains(forbidden), "Clean room leaked `{forbidden}` in {serialized}");
+        }
+        assert!(payload["glsl_shaders"].as_array().unwrap().iter().all(|s| s.get("code").is_none()));
+        assert!(
+            payload["wgsl_shaders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s.get("code").is_none() && s.get("label").is_none() && s.get("workgroup_sizes").is_none())
+        );
+        assert!(payload.get("uniforms").is_none() && payload.get("pipelines").is_none() && payload.get("three_scene").is_none());
+
+        // Observable metrics remain intact.
+        assert_eq!(payload["contexts"], json!(["webgl2", "webgpu"]));
+        assert_eq!(payload["has_3d_context"], true);
+        assert_eq!(payload["glsl_shader_count"], 2);
+        assert_eq!(payload["wgsl_shader_count"], 1);
+        assert_eq!(payload["has_compute_shader"], true);
+        assert_eq!(payload["render_pipeline_count"], 2);
+        assert_eq!(payload["compute_pipeline_count"], 1);
+        assert_eq!(payload["uniform_categories"], json!({"time": 1, "camera": 2}));
+        assert_eq!(payload["draw_calls_per_frame"], 14.0);
+        assert_eq!(payload["instanced_calls_per_frame"], 2.0);
+        assert_eq!(payload["compute_dispatches_per_frame"], 3.0);
+        assert_eq!(payload["fps"], 60.0);
+        assert_eq!(payload["canvas_animating"], true);
+        assert_eq!(payload["pointer_interactive"], true);
+        assert_eq!(payload["wheel_interactive"], true);
+        assert_eq!(payload["visitor_view"], true);
+    }
+
+    #[test]
+    fn web_webgl_webgpu_probe_validates_params_and_requires_open_site() {
+        let mut s = crate::testing::session();
+        s.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
+        let e = crate::Engine::new(s);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("canvas3d");
+        let opts = || crate::CallOptions::new(crate::Caller::Mcp).with_consent(crate::Consent::Granted);
+
+        let bad_w = e.call("web_webgl_webgpu_probe", json!({"output_directory": out.display().to_string(), "width": 100}), opts()).unwrap_err();
+        assert!(bad_w.message.contains("width"), "{}", bad_w.message);
+        let bad_h = e.call("web_webgl_webgpu_probe", json!({"output_directory": out.display().to_string(), "height": 5000}), opts()).unwrap_err();
+        assert!(bad_h.message.contains("height"), "{}", bad_h.message);
+        let bad_ms = e.call("web_webgl_webgpu_probe", json!({"output_directory": out.display().to_string(), "sample_ms": 50}), opts()).unwrap_err();
+        assert!(bad_ms.message.contains("sample_ms"), "{}", bad_ms.message);
+        let bad_ms_hi = e.call("web_webgl_webgpu_probe", json!({"output_directory": out.display().to_string(), "sample_ms": 5000}), opts()).unwrap_err();
+        assert!(bad_ms_hi.message.contains("sample_ms"), "{}", bad_ms_hi.message);
+        let no_site = e.call("web_webgl_webgpu_probe", json!({"output_directory": out.display().to_string()}), opts()).unwrap_err();
+        assert!(no_site.message.contains("no website is open"), "{}", no_site.message);
+        assert!(!out.exists());
+
+        // README reports canvas_contexts under Motion & animations in both Deep and Clean room modes.
+        let mut b = json!({
+            "url": "https://scene.example.test/",
+            "title": "3D",
+            "page": {"w": 1440, "h": 900},
+            "motion": {"canvases": 1, "canvas_contexts": ["webgl2", "webgpu"], "keyframes": ["spin"]},
+        });
+        let deep_md = readme(&b, &[], (0, 0), false);
+        assert!(deep_md.contains("## Motion & animations") && deep_md.contains("`webgl2`, `webgpu`"), "{deep_md}");
+        visitor_view(&mut b);
+        let clean_md = readme(&b, &[], (0, 0), true);
+        assert!(clean_md.contains("`webgl2`, `webgpu`") && !clean_md.contains("spin"), "{clean_md}");
+    }
+
+    #[test]
+    fn web_pixel_diff_heatmap_runs_in_clean_room_writes_artifacts_and_validates_threshold() {
+        let mut s = crate::testing::session();
+        s.settings.deep_mode = false;
+        let e = crate::Engine::new(s);
+        let dir = tempfile::tempdir().unwrap();
+        let orig_path = dir.path().join("orig.png");
+        let built_path = dir.path().join("built.png");
+
+        let solid = |px: [u8; 4]| web_common::Image { width: 80, height: 60, rgba: (0..(80 * 60)).flat_map(|_| px).collect() };
+        let orig = solid([240, 240, 240, 255]);
+        let mut built = solid([240, 240, 240, 255]);
+        for y in 10..26 {
+            for x in 14..38 {
+                let o = ((y * 80 + x) * 4) as usize;
+                built.rgba[o..o + 4].copy_from_slice(&[30, 80, 230, 255]);
+            }
+        }
+        std::fs::write(&orig_path, web_common::encode_png(&orig).unwrap()).unwrap();
+        std::fs::write(&built_path, web_common::encode_png(&built).unwrap()).unwrap();
+
+        let opts = || crate::CallOptions::new(crate::Caller::Mcp);
+        let out_bad = dir.path().join("bad-threshold");
+        let err = e
+            .call(
+                "web_pixel_diff_heatmap",
+                json!({
+                    "original_image_path": orig_path.display().to_string(),
+                    "built_image_path": built_path.display().to_string(),
+                    "output_directory": out_bad.display().to_string(),
+                    "delta_e_threshold": 0.1,
+                }),
+                opts(),
+            )
+            .unwrap_err();
+        assert!(err.message.contains("delta_e_threshold"), "{}", err.message);
+        assert!(!out_bad.exists(), "invalid params must not create output_directory");
+
+        let out = dir.path().join("diff-out");
+        let v = e
+            .call(
+                "web_pixel_diff_heatmap",
+                json!({
+                    "original_image_path": orig_path.display().to_string(),
+                    "built_image_path": built_path.display().to_string(),
+                    "output_directory": out.display().to_string(),
+                }),
+                opts(),
+            )
+            .unwrap()
+            .to_json();
+        let res = &v["result"];
+        assert!(out.join("heatmap.png").is_file());
+        assert!(out.join("diff.json").is_file());
+        assert_eq!(res["region_count"], 1);
+        assert_eq!(res["regions"][0]["id"], 1);
+        assert_eq!(res["regions"][0]["x"], 14);
+        assert_eq!(res["regions"][0]["y"], 10);
+        assert_eq!(res["regions"][0]["width"], 24);
+        assert_eq!(res["regions"][0]["height"], 16);
+        assert_eq!(res["differing_pixels"], 24 * 16);
+        assert!(res["ssim"].as_f64().unwrap() < 1.0);
+        assert!(res["mean_delta_e"].as_f64().unwrap() > 0.0);
     }
 
     #[test]

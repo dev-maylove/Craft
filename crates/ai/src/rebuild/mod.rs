@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 pub mod activity;
 mod brief;
 mod check;
+pub mod critic;
 pub mod feed;
 mod kept_check;
 pub mod kinds;
@@ -311,6 +312,22 @@ impl RebuildRun {
             }
             _ => None,
         };
+        // A chosen reviewer (an API vision backend or a local agent CLI enforcing review_dir-bounded
+        // reads) acts as an independent blind visual critic after each check round, inspecting only
+        // screenshots and motion burst frames. CLI reviewer keychain lookup runs on the worker
+        // thread (like `load_asset_keys`) so starting a run never blocks the UI thread.
+        let mut cli_reviewer: Option<crate::BackendEntry> = None;
+        let critic = match cfg.roles.get(crate::config::role_key(Role::Reviewer)).and_then(|n| cfg.get(n).cloned()).filter(|r| r.config.enabled) {
+            Some(r) if r.config.kind == BackendKind::AgentCli => {
+                cli_reviewer = Some(r);
+                None
+            }
+            Some(r) => match hub.build_model(&r) {
+                Ok(slot) => Some(Arc::new(critic::VisualCritic::from_slot(slot, cfg.prices.clone()))),
+                Err(e) => Some(Arc::new(critic::VisualCritic::from_init_error(r.config.name.clone(), r.config.model.clone(), e.message))),
+            },
+            None => None,
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = CancelToken::default();
         let running = Arc::new(AtomicBool::new(true));
@@ -347,6 +364,7 @@ impl RebuildRun {
             reset_progress_after_notes: false,
             keys: hub.keys.clone(),
             kept_checks: Mutex::default(),
+            critic,
         };
         let r2 = running.clone();
         let key_store = hub.keys.clone();
@@ -360,6 +378,10 @@ impl RebuildRun {
                 let _here = self_check::BuildingHere::new(&ws.root);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     ctx.load_asset_keys(&key_store);
+                    if let Some(r) = cli_reviewer {
+                        let key = key_store.get(&r.config.name);
+                        ctx.critic = Some(Arc::new(critic::VisualCritic::from_cli(r, key, Some(ws.root.join("logs")))));
+                    }
                     ctx.run(&mut ws, entry, api, extractor, kept_without_api, &opts)
                 }));
                 let (ok, message, paused) = run_outcome(result, &mut ws);
@@ -557,6 +579,8 @@ struct Worker {
     keys: crate::keys::KeyStore,
     /// The last check round in which everything worked, kept while nothing it looks at changes.
     kept_checks: Mutex<kept_check::KeptChecks>,
+    /// Optional independent blind visual critic (`Role::Reviewer`).
+    critic: Option<Arc<critic::VisualCritic>>,
 }
 
 /// The project a run records its usage in, and when it last did.
@@ -642,6 +666,18 @@ impl Worker {
         });
         if let Err(e) = saved {
             log::warn!("Couldn't save the project's usage in {}: {}", clock.root.display(), e.message);
+        }
+    }
+
+    /// Record token and cost usage for an auxiliary check model (such as the blind visual critic).
+    fn record_model_usage(&self, usage: &crate::model::Usage, tokens_unknown: bool, cost_usd: Option<f64>, cost_is_estimate: bool) {
+        let Some(clock) = self.usage.as_ref() else { return };
+        let input = usage.input_tokens.saturating_add(usage.cache_read_tokens).saturating_add(usage.cache_write_tokens);
+        if let Err(e) = ProjectUsage::update(&clock.root, |u| {
+            u.tokens_incomplete |= tokens_unknown;
+            u.add_turn(input, usage.output_tokens, cost_usd, cost_is_estimate);
+        }) {
+            log::warn!("Couldn't save the critic's usage in {}: {}", clock.root.display(), e.message);
         }
     }
 

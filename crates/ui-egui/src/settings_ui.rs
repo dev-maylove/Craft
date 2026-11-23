@@ -375,7 +375,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     if app.backends.is_empty() {
         ui.label(RichText::new(tr("No AI is set up yet. The built-in engines still work; an AI adds plain-words answers.")).color(t.text_dim));
     }
-    let (mut pick, mut builds, mut extracts, mut toggle, mut remove) = (None, None, None, None, None);
+    let (mut pick, mut builds, mut extracts, mut reviews, mut toggle, mut remove) = (None, None, None, None, None, None);
     let (mut choose_program, mut usual_program, mut use_program) = (None, None, None);
     let mut check_agent = None;
     let mut save_folder = None;
@@ -753,6 +753,17 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                 } else if b.enabled && widgets::secondary(ui, None, "Build with this").clicked() {
                     builds = Some(Some(b.name.clone()));
                 }
+                // Who reviews screenshots and motion burst frames as an independent blind visual critic.
+                if app.reviewer.as_ref() == Some(&b.name) {
+                    if widgets::secondary(ui, Some("scan-search"), "Reviews")
+                        .on_hover_text(tr("After each check round this one reviews screenshots as a blind visual critic. Click to stop."))
+                        .clicked()
+                    {
+                        reviews = Some(None);
+                    }
+                } else if b.enabled && craft_anything_ai::supports_reviewer(b) && widgets::secondary(ui, None, "Review with this").clicked() {
+                    reviews = Some(Some(b.name.clone()));
+                }
                 // Who takes a game's files out in Deep mode (an API backend, e.g. Kimi K3).
                 if b.kind != BackendKind::AgentCli {
                     if app.extractor.as_ref() == Some(&b.name) {
@@ -886,6 +897,9 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     }
     if let Some(e) = extracts {
         app.set_role(craft_anything_ai::Role::Extractor, e);
+    }
+    if let Some(r) = reviews {
+        app.set_role(craft_anything_ai::Role::Reviewer, r);
     }
     ui.add_space(theme::space::SM);
     let detected = app.detected.clone().unwrap_or_default();

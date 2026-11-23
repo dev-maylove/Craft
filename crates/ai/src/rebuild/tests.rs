@@ -549,6 +549,7 @@ fn notes_added_while_it_works_reach_the_agent_at_its_next_step() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     assert!(w.added(&mut ws, true, true).is_none(), "nothing added, nothing to say");
     use craft_anything_engine::questions::{self, AskedQuestion};
@@ -1498,6 +1499,7 @@ fn an_api_backend_builds_with_the_build_tools() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     w.attach(&ws).unwrap();
     // The model writes a file with the Build tools, then answers.
@@ -1628,6 +1630,7 @@ fn the_mechanics_sheet_is_required_without_claiming_effective_behavior() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     let check = |round| w.run_checks(&ws, &SheetKind, round).unwrap().remove(0);
 
@@ -2944,6 +2947,7 @@ pub(crate) fn check_worker(ws: &Workspace, deep: bool) -> Worker {
         reset_progress_after_notes: false,
         keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         kept_checks: Mutex::default(),
+        critic: None,
     }
 }
 
@@ -3544,6 +3548,7 @@ fn preparing_the_builders_agent_does_not_lock_up() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     let entry = crate::BackendEntry {
         config: crate::BackendConfig {
@@ -3587,6 +3592,7 @@ fn the_run_answers_the_builders_own_check_during_its_turn() {
         usage: None,
         self_check: Some((Arc::new(SheetKind), 90.0)),
         reset_progress_after_notes: false,
+        critic: None,
     };
     let mut builder = ChecksItsWork { root: ws.root.clone(), asked: None, reply: None };
     let reply = w.turn(&mut ws, &mut builder, "Build it.", true, None).unwrap();
@@ -3626,6 +3632,7 @@ fn a_stopped_build_answers_the_check_it_took() {
         usage: None,
         self_check: Some((Arc::new(SheetKind), 90.0)),
         reset_progress_after_notes: false,
+        critic: None,
     };
     let asks = Inbox::new(self_check::asks_dir(&ws.root));
     let id = asks.post(craft_anything_engine::inbox::RequestKind::Question, "Check the build", "", Vec::new(), false, None).unwrap();
@@ -3687,6 +3694,7 @@ fn decompiling_once_is_remembered_by_the_project() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     let mut builder = Decompiles { events: Vec::new() };
     w.turn(&mut ws, &mut builder, "Build it.", true, None).unwrap();
@@ -3752,6 +3760,7 @@ fn a_build_says_why_it_refused_a_tool_that_needs_consent() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     let mut builder = AsksConsent::default();
     w.turn(&mut ws, &mut builder, "Build it.", true, None).unwrap();
@@ -3965,6 +3974,7 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     let dir = notes::notes_dir(&ws.inbox_dir());
     notes::hand_over(&dir, 1, "make the header blue", None).unwrap();
@@ -4413,6 +4423,7 @@ fn a_session_left_on_another_computer_starts_a_new_one_from_the_project() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     let first = resumed_elsewhere("THE BRIEF", &ws.manifest.last_reply, None);
     let reply = w.turn(&mut ws, &mut agent, "The person asks: make it blue", true, Some(first)).unwrap();
@@ -4469,6 +4480,7 @@ fn a_missing_session_with_nothing_to_start_from_is_said_plainly() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     let e = w
         .turn_with_wait(&mut ws, &mut agent, "Carry on.", true, None, |_, _| panic!("a missing session without a fresh start must not be retried"))
@@ -4536,6 +4548,7 @@ fn the_builders_conversation_travels_with_the_project() {
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
     let adapter = KeepsSessions(store.path().to_path_buf());
     // No session yet, or one this computer doesn't have: nothing to keep, nothing said.
@@ -4614,6 +4627,7 @@ fn waiting_for_another_analysis(d: &Path, limit_secs: u64) -> (Worker, std::sync
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
+        critic: None,
     };
 
     // Another process is already analysing this program: a fresh lock beside its project.
@@ -4695,6 +4709,7 @@ fn a_later_run_opens_the_projects_program_again_for_the_builder() {
             usage: None,
             self_check: None,
             reset_progress_after_notes: false,
+            critic: None,
         };
         w.reopen_target(&mut ws, app.as_ref(), true, deep).unwrap();
         assert!(w.engine.session().shared_targets().is_empty(), "a builder over SSH isn't handed this computer's targets");
@@ -4736,6 +4751,179 @@ fn the_brief_says_signed_in_only_when_the_capture_was() {
     }
     std::fs::write(&capture, b"garbage").unwrap();
     assert!(!brief(&ws, "website", false, false, None, false, None).contains(super::brief::SIGNED_IN_NOTE));
+}
+
+#[test]
+fn website_brief_includes_engineering_contract_and_blind_safe_motion_guidance() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Motion", "Clone it", TargetRef::Website { url: "https://motion.example.com/".into() }).unwrap();
+    std::fs::create_dir_all(ws.capture_dir().join(kinds::website::MOTION_DIR)).unwrap();
+    std::fs::write(
+        ws.capture_dir().join(kinds::website::MOTION_DIR).join("motion.json"),
+        serde_json::to_vec(&json!({
+            "scroll_frames": [{"file": "burst-scroll-01.png"}],
+            "hover_frames": [{"file": "burst-hover-01.png"}],
+            "telemetry": {"cls": 0.01, "avg_frame_ms": 16.4}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(ws.capture_dir().join(kinds::website::CANVAS3D_DIR)).unwrap();
+    std::fs::write(
+        ws.capture_dir().join(kinds::website::CANVAS3D_DIR).join("canvas3d.json"),
+        serde_json::to_vec(&json!({
+            "contexts": ["webgl2"],
+            "has_3d_context": true,
+            "draw_calls_per_frame": 10.0,
+            "compute_dispatches_per_frame": 0.0,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for deep in [false, true] {
+        let sighted = super::brief(
+            &kinds::WebsiteKind,
+            &BriefCx { ws: &ws, deep, ghidra: false, editor: None, assets: false, image_model: None, sees_pictures: true },
+            None,
+        );
+        let blind = super::brief(
+            &kinds::WebsiteKind,
+            &BriefCx { ws: &ws, deep, ghidra: false, editor: None, assets: false, image_model: None, sees_pictures: false },
+            None,
+        );
+        assert!(sighted.contains("Engineering contract") && sighted.contains("burst-scroll-01.png"), "{sighted}");
+        assert!(sighted.contains("3D / WebGL / WebGPU canvas fidelity") && sighted.contains("capture/canvas3d/canvas3d.json"), "{sighted}");
+        assert!(sighted.contains("webgl2") && sighted.contains("10.0 draw call(s)/frame"), "{sighted}");
+        assert!(blind.contains("Engineering contract") && blind.contains("capture/motion/motion.json"), "{blind}");
+        assert!(blind.contains("capture/canvas3d/canvas3d.json") && blind.contains("webgl2") && blind.contains("10.0 draw call(s)/frame"), "{blind}");
+        assert_eq!(said_to_look(&blind), None, "blind website motion brief must never tell the builder to look at pictures:\n{blind}");
+    }
+}
+
+#[test]
+fn blind_visual_critic_gates_round_and_routes_refinement_without_blaming_critic_outages() {
+    use crate::agent::ModelSlot;
+    use crate::model::{Block, ChatModel, Msg, Speaker, StopReason, TurnRequest, TurnResult, Usage};
+    use craft_anything_engine::tools::web_common::{Image, encode_png};
+
+    struct FixedCritic(Result<String, ToolError>);
+    impl ChatModel for FixedCritic {
+        fn turn(
+            &mut self,
+            _req: &TurnRequest<'_>,
+            _on_delta: &mut dyn FnMut(crate::model::Delta),
+            _stop: &crate::model::Stop,
+        ) -> Result<TurnResult, ToolError> {
+            let reply = self.0.clone()?;
+            Ok(TurnResult {
+                message: Msg { role: Speaker::Assistant, blocks: vec![Block::Text { text: reply }] },
+                stop: StopReason::EndTurn,
+                usage: Usage { input_tokens: 500, output_tokens: 100, cache_read_tokens: 0, cache_write_tokens: 0 },
+                model: "claude-sonnet-5-5".into(),
+                follow_up: None,
+            })
+        }
+        fn model(&self) -> String {
+            "claude-sonnet-5-5".into()
+        }
+    }
+
+    struct PassCheck(Vec<u8>);
+    impl Check for PassCheck {
+        fn id(&self) -> &'static str {
+            "pass-base"
+        }
+        fn run(&self, cx: &mut CheckCx) -> Result<CheckResult, ToolError> {
+            // Simulates WebVisualCheck / ScreenshotCheck writing round screenshots during the
+            // check round itself: `checks/round-N/` does not exist yet when `applies()` runs.
+            let dir = cx.ws.checks_dir().join(format!("round-{}", cx.round));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("screenshot-1440.png"), &self.0).unwrap();
+            Ok(CheckResult::new(self.id(), cx.round, true, "ok"))
+        }
+    }
+    struct PassKind(Vec<u8>);
+    impl TargetKind for PassKind {
+        fn id(&self) -> &'static str {
+            "website"
+        }
+        fn words(&self) -> KindWords {
+            kinds::WebsiteKind.words()
+        }
+        fn detect(&self, _cx: &DetectCx) -> Option<u32> {
+            None
+        }
+        fn default_stack(&self, _cx: &DetectCx) -> &'static str {
+            "Vite"
+        }
+        fn goal(&self) -> &'static str {
+            "a site"
+        }
+        fn checks(&self, _ws: &Workspace) -> Vec<Box<dyn Check>> {
+            vec![Box::new(PassCheck(self.0.clone()))]
+        }
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Site", "Clone it", TargetRef::Website { url: "https://example.com".into() }).unwrap();
+    let png = encode_png(&Image { width: 16, height: 16, rgba: vec![120; 16 * 16 * 4] }).unwrap();
+    std::fs::create_dir_all(ws.capture_dir()).unwrap();
+    std::fs::write(ws.capture_dir().join("screenshot-1440.png"), &png).unwrap();
+    assert!(!ws.checks_dir().join("round-1").exists(), "round directory must not exist before run_checks");
+    let kind = PassKind(png);
+
+    let make_worker = |reply: Result<String, ToolError>| {
+        let mut w = check_worker(&ws, false);
+        let slot = ModelSlot {
+            name: "Reviewer".into(),
+            model: Box::new(FixedCritic(reply)),
+            local: false,
+            effort: None,
+            max_turns: 1,
+            context_tokens: 0,
+            tools: Default::default(),
+        };
+        w.critic = Some(Arc::new(critic::VisualCritic::from_slot(slot, std::collections::BTreeMap::new())));
+        w
+    };
+
+    // 1. Severe defect fails claim (triggers refinement) while keeping check.passed == true.
+    let w_fail = make_worker(Ok(
+        r#"{"summary":"Header overlaps hero.","defects":[{"severity":"severe","area":"header","summary":"nav collides with h1","fix":"add top padding"}]}"#
+            .into(),
+    ));
+    let res = w_fail.run_checks(&ws, &kind, 1).unwrap();
+    assert_eq!(res.len(), 2);
+    let critic_res = &res[1];
+    assert_eq!(critic_res.check, critic::CHECK_ID);
+    assert!(critic_res.passed, "a usable build with visual defects stays passed so max_rounds still delivers it");
+    assert!(!critic_res.good(90.0), "a failed blind critic claim prevents passing");
+    assert!(kinds::can_refine(&kind.checks(&ws), critic_res));
+    assert!(ws.checks_dir().join("round-1").join(critic::REPORT_FILE).is_file());
+    assert!(ws.checks_dir().join("round-1").join("pair-01-heatmap.png").is_file());
+    assert!(ws.checks_dir().join("round-1").join("pair-01-diff.json").is_file());
+    let refine_sighted = kinds::WebsiteKind.refine(critic_res, true);
+    let refine_blind = kinds::WebsiteKind.refine(critic_res, false);
+    assert!(refine_sighted.contains("[SEVERE]") && refine_sighted.contains("nav collides with h1"), "{refine_sighted}");
+    assert_eq!(said_to_look(&refine_blind), None, "{refine_blind}");
+
+    // 2. Minor-only verdict passes the claim on a fresh round with no pre-existing round-2 directory.
+    let w_pass = make_worker(Ok(r#"{"summary":"Spot on.","defects":[{"severity":"minor","area":"footer","summary":"1px variance","fix":"optional"}]}"#.into()));
+    let res_ok = w_pass.run_checks(&ws, &kind, 2).unwrap();
+    assert_eq!(res_ok.len(), 2);
+    assert!(res_ok[1].good(90.0), "{:?}", res_ok[1]);
+
+    // 3. Critic API outage (or init failure) stays unverified and is not sent back to the builder as a code bug.
+    let w_err = make_worker(Err(ToolError::unavailable("reviewer timeout")));
+    let res_err = w_err.run_checks(&ws, &kind, 3).unwrap();
+    assert_eq!(res_err.len(), 2);
+    assert!(!res_err[1].good(90.0) && !res_err[1].unknowns.is_empty());
+    assert!(!kinds::can_refine(&kind.checks(&ws), &res_err[1]));
+
+    // 4. Round 0 (builder self-check) skips VisualCriticCheck to keep self-checks fast and local.
+    let res_self = w_fail.run_checks(&ws, &kind, self_check::SELF_CHECK_ROUND).unwrap();
+    assert_eq!(res_self.len(), 1);
+    assert_eq!(res_self[0].check, "pass-base");
 }
 
 #[test]

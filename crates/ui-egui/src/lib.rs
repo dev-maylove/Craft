@@ -159,11 +159,12 @@ pub enum Done {
     /// What a scan found, and why an expected coding agent may be missing.
     Detected(Vec<Detected>, Vec<craft_anything_ai::detect::DetectHint>),
     AgentConnection(String, Result<String, String>),
-    /// The configured backends, the ones chosen to build with and to extract with, and each one's
-    /// options. The first field is when the snapshot was read (see [`backends`]).
+    /// The configured backends, the ones chosen to build with, to extract with, and to review
+    /// screenshots with, and each one's options. The first field is when the snapshot was read (see [`backends`]).
     Backends(
         u64,
         Vec<BackendConfig>,
+        Option<String>,
         Option<String>,
         Option<String>,
         std::collections::BTreeMap<String, craft_anything_ai::BackendOptions>,
@@ -495,6 +496,8 @@ pub struct CraftApp {
     pub builder: Option<String>,
     /// The backend chosen to take a game's files out in Deep mode, if any.
     pub extractor: Option<String>,
+    /// The backend chosen to review screenshots as a blind visual critic after each check round, if any.
+    pub reviewer: Option<String>,
     pub detected: Option<Vec<Detected>>,
     /// Why an expected coding agent may be missing, from the last scan.
     pub detect_hints: Vec<craft_anything_ai::detect::DetectHint>,
@@ -647,6 +650,7 @@ impl CraftApp {
             folder_inputs: Default::default(),
             builder: None,
             extractor: None,
+            reviewer: None,
             detected: None,
             detect_hints: Vec::new(),
             detecting: false,
@@ -1689,7 +1693,7 @@ impl CraftApp {
             Done::AgentConnection(name, result) => {
                 self.agent_connections.insert(name, Some(result));
             }
-            Done::Backends(read, b, builder, extractor, options, replaced) => {
+            Done::Backends(read, b, builder, extractor, reviewer, options, replaced) => {
                 if read < self.backends_read {
                     return;
                 }
@@ -1700,6 +1704,7 @@ impl CraftApp {
                 self.backends = b;
                 self.builder = builder;
                 self.extractor = extractor;
+                self.reviewer = reviewer;
                 self.backend_options = options;
                 self.program_replaced = replaced;
                 self.model_tuning.retain(|name, state| {
@@ -2259,7 +2264,7 @@ pub fn app_icon(size: f32) -> egui::Image<'static> {
 }
 
 /// Run an action; a panic is logged and swallowed so one bad action never takes the app down.
-/// The configured backends and the ones chosen to build and to extract (read off the UI thread).
+/// The configured backends and the ones chosen to build, to extract, and to review (read off the UI thread).
 pub(crate) fn backends(hub: &AiHub) -> Done {
     // Numbered before reading: a snapshot read after a save always outnumbers one read before it.
     static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -2268,6 +2273,7 @@ pub(crate) fn backends(hub: &AiHub) -> Done {
         hub.backends(),
         hub.chosen(craft_anything_ai::Role::Builder),
         hub.chosen(craft_anything_ai::Role::Extractor),
+        hub.chosen(craft_anything_ai::Role::Reviewer),
         hub.options(),
         hub.replaced_programs(),
     )
@@ -2430,7 +2436,7 @@ mod backend_snapshot_tests {
                 ssh_host: None,
                 enabled: true,
             };
-            Done::Backends(read, vec![backend], None, None, Default::default(), Default::default())
+            Done::Backends(read, vec![backend], None, None, None, Default::default(), Default::default())
         };
         app.handle_done(jobs::Finished { job: 1, result: Ok(snapshot(10, "New")) });
         app.handle_done(jobs::Finished { job: 2, result: Ok(snapshot(5, "Old")) });

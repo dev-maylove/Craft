@@ -134,7 +134,10 @@ pub trait TargetKind: Send + Sync {
     fn checks(&self, ws: &Workspace) -> Vec<Box<dyn Check>>;
     /// The next round's message after a check that wasn't good enough, for a builder that can
     /// look at pictures or one that can't ([`BriefCx::sees_pictures`]).
-    fn refine(&self, check: &CheckResult, _sees_pictures: bool) -> String {
+    fn refine(&self, check: &CheckResult, sees_pictures: bool) -> String {
+        if check.check == super::critic::CHECK_ID {
+            return super::critic::refine_prompt(check, sees_pictures);
+        }
         format!(
             "Check {}: {}\n\nFix this in app/, build again until it succeeds, and reply with 1-2 plain sentences on what you changed.",
             check.round, check.note
@@ -237,6 +240,16 @@ impl CheckCx<'_> {
         CheckStop { stop: self.worker.stop.clone(), until: self.until }
     }
 
+    /// Raw cancellation token for auxiliary model calls (such as the blind visual critic).
+    pub fn cancel_token(&self) -> CancelToken {
+        self.worker.stop.clone()
+    }
+
+    /// Record token and cost usage from an auxiliary check model into the project's usage log.
+    pub fn record_model_usage(&self, usage: &crate::model::Usage, tokens_unknown: bool, cost_usd: Option<f64>, cost_is_estimate: bool) {
+        self.worker.record_model_usage(usage, tokens_unknown, cost_usd, cost_is_estimate);
+    }
+
     /// How builds are judged (`[build]` in settings).
     pub fn build_settings(&self) -> craft_anything_engine::settings::BuildSettings {
         self.worker.engine.session().settings.build.clone()
@@ -286,8 +299,11 @@ impl Worker {
             .filter(|c| c.kinds.is_empty() || c.kinds.iter().any(|k| k == kind.id()))
             .map(|check| Box::new(plugin_check::PluginJudge { check, kind: kind.id() }) as Box<dyn Check>);
         let all: Vec<Box<dyn Check>> = if ws.manifest.own_project() { own::checks() } else { kind.checks(ws) };
+        let critic_check = (round != self_check::SELF_CHECK_ROUND)
+            .then(|| self.critic.as_ref().map(|c| Box::new(super::critic::VisualCriticCheck::new(c.clone())) as Box<dyn Check>))
+            .flatten();
         // A check that doesn't run in this run leaves no result, and isn't numbered or named.
-        let checks: Vec<Box<dyn Check>> = all.into_iter().chain(plugin_checks).filter(|c| c.applies(&cx)).collect();
+        let checks: Vec<Box<dyn Check>> = all.into_iter().chain(critic_check).chain(plugin_checks).filter(|c| c.applies(&cx)).collect();
         let mut out = Vec::new();
         for (i, c) in checks.iter().enumerate() {
             // Pause, or a round past its limit, stops before this check starts. A check that
@@ -333,6 +349,9 @@ pub trait Check: Send + Sync {
 
 /// A plugin check absent from the kind's own list retains the default refinement behavior.
 pub(super) fn can_refine(checks: &[Box<dyn Check>], result: &CheckResult) -> bool {
+    if result.check == super::critic::CHECK_ID {
+        return super::critic::can_refine_result(result);
+    }
     checks.iter().find(|check| check.id() == result.check).is_none_or(|check| check.can_refine(result))
 }
 

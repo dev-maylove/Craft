@@ -194,6 +194,15 @@ pub trait AgentAdapter: Send + Sync {
     fn answers_questions(&self) -> bool {
         false
     }
+    /// It can run an isolated, code-blind visual review (`CliSpec::blind_review`) without MCP
+    /// tools, without writes, and with file reads bounded to the staged review directory.
+    fn supports_blind_review(&self) -> bool {
+        false
+    }
+    /// Arguments for a blind visual review run in the staged review directory.
+    fn blind_review_args(&self, cx: &ArgsCx) -> Vec<String> {
+        self.args(cx)
+    }
     /// The message goes in on stdin, not in argv: a long one passes Windows' command-line limit
     /// ("The filename or extension is too long", os error 206, #402).
     fn prompt_on_stdin(&self) -> bool {
@@ -452,6 +461,32 @@ impl AgentAdapter for ClaudeCode {
 
     fn answers_questions(&self) -> bool {
         true
+    }
+
+    fn supports_blind_review(&self) -> bool {
+        true
+    }
+
+    fn blind_review_args(&self, cx: &ArgsCx) -> Vec<String> {
+        let mut a = cx.options.args.clone();
+        a.extend(["-p".into(), "--output-format".into(), "stream-json".into(), "--verbose".into(), "--append-system-prompt".into(), cx.preamble.to_string()]);
+        if let Some(model) = cx.options.cli_model.as_deref().filter(|m| !m.trim().is_empty()) {
+            a.extend(["--model".into(), model.to_string()]);
+        }
+        // Code-blind review inside the isolated staging folder (process cwd): no MCP server, no
+        // session persistence, only `Read` enabled and auto-allowed strictly for relative paths
+        // within `./**`, so reads outside the review folder are refused in headless `-p` mode.
+        a.extend([
+            "--no-session-persistence".into(),
+            "--strict-mcp-config".into(),
+            "--tools".into(),
+            "Read".into(),
+            "--allowedTools".into(),
+            "Read(./**)".into(),
+            "--disallowedTools".into(),
+        ]);
+        a.extend(CHANGING_TOOLS.iter().chain(["Glob", "Grep", "LS", "NotebookRead"].iter()).map(|t| t.to_string()));
+        a
     }
 
     fn prompt_on_stdin(&self) -> bool {
@@ -968,21 +1003,25 @@ impl AgentAdapter for Codex {
         }
         if cx.builder {
             v.extend(["--sandbox".into(), "workspace-write".into()]);
+        } else if cx.question {
+            v.extend(["--sandbox".into(), "read-only".into(), "-c".into(), "mcp_servers={}".into()]);
         }
-        v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.command={}", toml_string(&cx.mcp.command))]);
-        // Codex doesn't refresh its callable tools after enable_toolset (#538), so list every
-        // permitted tool from startup. The server still applies Clean room's restrictions.
-        let mut mcp_args = cx.mcp.args.clone();
-        if !mcp_args.iter().any(|a| a == "--all-tools") {
-            mcp_args.push("--all-tools".into());
-        }
-        let args_toml = format!("[{}]", mcp_args.iter().map(|s| toml_string(s)).collect::<Vec<_>>().join(", "));
-        v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.args={args_toml}")]);
-        // `codex exec` can't ask, so without this it refuses a tool not marked read-only, such as
-        // rebuild_start, before our server sees the call (#540). Only tools we limit ourselves
-        // (consent, or the asset budget: #1464) are approved; the rest keep the person's policy.
-        for tool in craft_anything_engine::AGENT_APP_PREAPPROVED_TOOLS {
-            v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.tools.{tool}.approval_mode=\"approve\"")]);
+        if !cx.question {
+            v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.command={}", toml_string(&cx.mcp.command))]);
+            // Codex doesn't refresh its callable tools after enable_toolset (#538), so list every
+            // permitted tool from startup. The server still applies Clean room's restrictions.
+            let mut mcp_args = cx.mcp.args.clone();
+            if !mcp_args.iter().any(|a| a == "--all-tools") {
+                mcp_args.push("--all-tools".into());
+            }
+            let args_toml = format!("[{}]", mcp_args.iter().map(|s| toml_string(s)).collect::<Vec<_>>().join(", "));
+            v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.args={args_toml}")]);
+            // `codex exec` can't ask, so without this it refuses a tool not marked read-only, such as
+            // rebuild_start, before our server sees the call (#540). Only tools we limit ourselves
+            // (consent, or the asset budget: #1464) are approved; the rest keep the person's policy.
+            for tool in craft_anything_engine::AGENT_APP_PREAPPROVED_TOOLS {
+                v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.tools.{tool}.approval_mode=\"approve\"")]);
+            }
         }
         if let Some(m) = &cx.options.cli_model {
             v.extend(["-m".into(), m.clone()]);

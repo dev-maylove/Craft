@@ -381,6 +381,33 @@ fn args_for(
     adapter.args(&ArgsCx { options: opts, prompt: &prompt, preamble, mcp, resume, builder, reads_checked, question, message_file })
 }
 
+/// Arguments for a code-blind visual review run inside the isolated staging folder.
+pub fn build_blind_review_args(adapter: &dyn AgentAdapter, opts: &BackendOptions, prompt: &str, preamble: &str, mcp: &McpCommand) -> Vec<String> {
+    blind_review_args_for(adapter, opts, prompt, preamble, mcp, None)
+}
+
+fn blind_review_args_for(
+    adapter: &dyn AgentAdapter,
+    opts: &BackendOptions,
+    prompt: &str,
+    preamble: &str,
+    mcp: &McpCommand,
+    message_file: Option<&Path>,
+) -> Vec<String> {
+    let prompt = if prompt.starts_with('-') { format!(" {prompt}") } else { prompt.to_string() };
+    adapter.blind_review_args(&ArgsCx {
+        options: opts,
+        prompt: &prompt,
+        preamble,
+        mcp,
+        resume: None,
+        builder: false,
+        reads_checked: true,
+        question: true,
+        message_file,
+    })
+}
+
 /// The message written to a private file for one run, removed when the run is over.
 struct MessageFile(PathBuf);
 
@@ -683,6 +710,9 @@ pub struct CliSpec {
     /// builder's own session is never changed. Only adapters that
     /// [answer questions](adapters::AgentAdapter::answers_questions) take it.
     pub question: bool,
+    /// Isolated blind visual review: runs inside a disposable folder holding only images, with no
+    /// Craft Anything MCP server attached and read-only sandboxing where the CLI supports it.
+    pub blind_review: bool,
     /// Where a failed run writes what's known about it ([`crate::failure_log`]). None writes no log.
     pub logs: Option<PathBuf>,
     /// The backend's stored API key, for an ACP agent that asks the host to authenticate before a
@@ -739,6 +769,7 @@ impl CliSpec {
             cost_totals: None,
             adapters: AgentAdapters::built_in(),
             question: false,
+            blind_review: false,
             key: None,
         }
     }
@@ -767,12 +798,17 @@ pub fn builder_conversation(spec: CliSpec, approver: acp::Approver) -> Box<dyn C
 }
 
 /// An ACP conversation for a local backend that enables or requires ACP. The adapter chooses
-/// the tool restrictions for this access mode; questions omit MCP startup flags and never load
-/// the builder's session. Unsupported routes return to the CLI runner, which refuses ACP-only agents.
+/// the tool restrictions for this access mode; questions and blind reviews omit MCP startup flags
+/// and never load the builder's session. Unsupported routes return to the CLI runner, which refuses
+/// ACP-only agents.
 fn acp_for(spec: &CliSpec) -> Option<AcpConversation> {
     let agent = spec.config.model.clone();
     let adapter = spec.adapters.for_agent(&agent);
+    let read_only = spec.question || spec.blind_review;
     if spec.question && !adapter.answers_questions() {
+        return None;
+    }
+    if spec.blind_review && !adapter.supports_blind_review() {
         return None;
     }
     let local = spec.config.ssh_host.as_deref().is_none_or(|h| h.trim().is_empty());
@@ -780,7 +816,7 @@ fn acp_for(spec: &CliSpec) -> Option<AcpConversation> {
     // No program to start: the plain run reports why.
     let program = program_of(&spec.config, &spec.options).ok()?;
     // Same modes as the plain runner, including Clean room chat (no builder, not deep).
-    let access = access_for(spec.builder.is_some(), spec.deep, spec.question);
+    let access = access_for(spec.builder.is_some(), spec.deep, read_only);
     let mut args = adapter.acp_options(&spec.options, access);
     args.extend(acp_args.iter().map(|a| a.to_string()));
     args.extend(acp::model_args(&agent, spec.options.cli_model.as_deref()));
@@ -788,7 +824,7 @@ fn acp_for(spec: &CliSpec) -> Option<AcpConversation> {
     args.extend(adapter.acp_mode_options(&spec.options, access));
     let cwd = spec.project.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_else(std::env::temp_dir);
     let mcp = mcp_for(spec, false);
-    if !spec.question {
+    if !read_only {
         args.extend(adapter.acp_mcp_options(&mcp));
     }
     args.extend(adapter.acp_trailing().iter().map(|word| (*word).to_string()));
@@ -796,11 +832,11 @@ fn acp_for(spec: &CliSpec) -> Option<AcpConversation> {
     let session_config = adapter.acp_session_config(&spec.options);
     let auth = acp::key_auth_method(&agent).map(str::to_string).zip(spec.key.clone());
     Some(
-        AcpConversation::new(&spec.config.name, &agent, program, args, cwd, mcp, if spec.question { None } else { spec.resume.clone() })
+        AcpConversation::new(&spec.config.name, &agent, program, args, cwd, mcp, if read_only { None } else { spec.resume.clone() })
             .with_validation(adapter.validate_options(&spec.options))
             .with_access_limit(adapter.validate_access(access))
             .with_adapter(adapter)
-            .with_question(spec.question)
+            .with_question(read_only)
             .with_session_config(session_config)
             .with_preamble(preamble)
             .with_logs(spec.logs.clone())
@@ -1017,7 +1053,8 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     }
     // An access mode this agent can't hold (Clean room, for one whose reads we can't check) is
     // refused before anything else starts.
-    if let Err(e) = adapter.validate_access(access_for(spec.builder.is_some(), spec.deep, spec.question)) {
+    let read_only = spec.question || spec.blind_review;
+    if let Err(e) = adapter.validate_access(access_for(spec.builder.is_some(), spec.deep, read_only)) {
         let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
         return nothing_done(&name);
     }
@@ -1094,12 +1131,25 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         });
         return nothing_done(&name);
     }
-    let access = access_for(spec.builder.is_some(), spec.deep, spec.question);
+    // A blind visual review goes only to an agent whose adapter enforces staging-folder-bounded reads.
+    if spec.blind_review && !adapter.supports_blind_review() {
+        let _ = tx.send(AgentEvent::Error {
+            message: format!("{name} can't enforce code-blind, read-only review scoped to the staged screenshot folder."),
+            remediation: Some("Choose an API vision backend or a local Claude Code backend as the reviewer.".into()),
+            log: None,
+        });
+        return nothing_done(&name);
+    }
+    let access = access_for(spec.builder.is_some(), spec.deep, read_only);
     // Kept until the run is over; over SSH the file would be on the wrong computer.
     let message_file =
         (remote.is_none() && adapter.reads_message_file()).then(|| MessageFile::write(&std::env::temp_dir(), &format!("{preamble}{text}"))).flatten();
-    let resume_arg = if adapter.resumes() { resume.as_deref() } else { None };
-    let args = args_for(adapter.as_ref(), &spec.options, text, &preamble, &mcp, resume_arg, access, message_file.as_ref().map(|f| f.0.as_path()));
+    let resume_arg = if adapter.resumes() && !spec.blind_review { resume.as_deref() } else { None };
+    let args = if spec.blind_review {
+        blind_review_args_for(adapter.as_ref(), &spec.options, text, &preamble, &mcp, message_file.as_ref().map(|f| f.0.as_path()))
+    } else {
+        args_for(adapter.as_ref(), &spec.options, text, &preamble, &mcp, resume_arg, access, message_file.as_ref().map(|f| f.0.as_path()))
+    };
     let shown = FailureContext::new(&program, &args, text, remote.as_deref(), spec);
     // A builder turn may take hours and sit silent for long stretches: Ghidra's first look at a big
     // game, an engine build, or the person answering a question. Claude Code's own limits are
@@ -1107,9 +1157,13 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     // 30 minutes and a background build at 10).
     let (turn, quiet) = if builder { (24 * 3600, 8 * 3600) } else { (30 * 60, 15 * 60) };
     let mut env = agent_env(builder, spec.options.effort);
-    let tool_env = match &remote {
-        None => adapter.mcp_env(&mcp, access),
-        Some(host) => adapter.remote_tool_server(host, &mcp, access),
+    let tool_env = if spec.blind_review {
+        Ok(None)
+    } else {
+        match &remote {
+            None => adapter.mcp_env(&mcp, access),
+            Some(host) => adapter.remote_tool_server(host, &mcp, access),
+        }
     };
     match tool_env {
         Ok(var) => env.extend(var),
