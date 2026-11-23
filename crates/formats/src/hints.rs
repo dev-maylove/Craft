@@ -132,7 +132,9 @@ pub fn detect(b: &Binary, data: &[u8]) -> Vec<Hint> {
         push(&mut out, hint("node", "runtime", "Node.js runtime", "weak", "Node.js symbols or library"));
     }
     // Flutter / Dart
-    if lib("libflutter").is_some() || lib("Flutter.framework").is_some() {
+    // The engine is a library of its own on every desktop platform: a shared object on Linux, a
+    // framework on macOS, a DLL on Windows (#2227).
+    if lib("libflutter").is_some() || lib("Flutter.framework").is_some() || lib("flutter_windows.dll").is_some() {
         push(&mut out, hint("flutter", "framework", "Flutter (Dart)", "strong", "links the Flutter engine"));
     } else if sym("kDartVmSnapshotData") || sym("_kDartVmSnapshotData") || sym("kDartIsolateSnapshotInstructions") {
         push(&mut out, hint("flutter", "framework", "Flutter (Dart AOT snapshot)", "strong", "Dart snapshot symbols"));
@@ -294,5 +296,22 @@ mod tests {
         let pe = craft_anything_testkit::pe64();
         let b = crate::parse_binary(&pe).unwrap();
         let _ = detect(&b, &pe);
+    }
+
+    #[test]
+    fn a_flutter_app_is_named_on_every_desktop_platform() {
+        // The Flutter engine is a library of its own on each desktop platform: a shared object on
+        // Linux, a framework on macOS, a DLL on Windows. A Windows app links `flutter_windows.dll`,
+        // which is neither `libflutter` nor `Flutter.framework`, so it used to go unnamed (#2227).
+        for engine in ["libflutter_linux_gtk.so", "Flutter.framework", "flutter_windows.dll"] {
+            let mut b = Binary::raw(crate::binary::Arch::X86_64, 0, 0, 0);
+            b.libraries = vec![engine.into()];
+            let hints = detect(&b, &[]);
+            let f = hints.iter().find(|h| h.id == "flutter").unwrap_or_else(|| panic!("{engine} is not named as Flutter"));
+            assert_eq!(f.strength, "strong", "{f:?}");
+        }
+        // A program that links no Flutter engine is not called Flutter.
+        let b = Binary::raw(crate::binary::Arch::X86_64, 0, 0, 0);
+        assert!(detect(&b, &[]).iter().all(|h| h.id != "flutter"));
     }
 }
