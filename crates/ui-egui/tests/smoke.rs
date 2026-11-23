@@ -219,7 +219,12 @@ fn ghidra_is_looked_up_once_and_again_only_when_asked() {
         // An empty engine store, and nowhere else looked in: a lookup finds no Ghidra here.
         a.settings.engines.store_dir = Some(store);
         a.settings.engines.only_configured = true;
-        a.ghidra.found = Some(Some(found));
+        use craft_anything_engines::ghidra::get::{GhidraInstall, GhidraJava, GhidraSource, GhidraState};
+        a.ghidra.status = Some(craft_anything_engines::ghidra::get::GhidraStatus {
+            state: GhidraState::Ready,
+            install: Some(GhidraInstall { launcher: found, source: GhidraSource::UserFolder, version_hint: None }),
+            java: GhidraJava::Missing,
+        });
         a
     });
     h.run_steps(3);
@@ -227,9 +232,42 @@ fn ghidra_is_looked_up_once_and_again_only_when_asked() {
     assert_eq!(h.state_mut().ghidra_found(), Some(remembered.as_path()));
     assert!(h.state_mut().ghidra_ready());
     // After a settings change or an install it is looked up again.
-    h.state_mut().ghidra.found = None;
+    h.state_mut().ghidra.status = None;
     assert_eq!(h.state_mut().ghidra_found(), None);
     assert!(!h.state_mut().ghidra_ready());
+}
+
+/// Confirming an upgrade makes the release just set up the one Deep mode uses: a Settings folder
+/// still naming the kept older install would win the search otherwise. The older copy stays.
+#[test]
+fn confirming_an_upgrade_stops_selecting_the_kept_older_install() {
+    let d = tempfile::tempdir().unwrap();
+    let store = d.path().join("engines");
+    let kept = d.path().join("ghidra").join("ghidra_12.1.4_PUBLIC");
+    let exe = if cfg!(windows) { "analyzeHeadless.bat" } else { "analyzeHeadless" };
+    let launcher = |root: &std::path::Path| {
+        std::fs::create_dir_all(root.join("support")).unwrap();
+        std::fs::write(root.join("support").join(exe), b"").unwrap();
+        root.join("support").join(exe)
+    };
+    let old = launcher(&kept);
+    let new = launcher(&store.join("ghidra").join("ghidra_12.2_PUBLIC"));
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.settings.deep_mode = true;
+        a.settings.engines.store_dir = Some(store);
+        a.settings.engines.only_configured = true;
+        a.settings.engines.ghidra.install_dir = Some(kept);
+        a.ghidra.upgrade = true;
+        a
+    });
+    h.run_steps(2);
+    assert_eq!(h.state_mut().ghidra_found(), Some(old.as_path()), "before the upgrade, the folder in Settings wins");
+    h.state_mut().ghidra_got();
+    h.run_steps(2);
+    assert_eq!(h.state().settings.engines.ghidra.install_dir, None, "the kept install is no longer selected");
+    assert_eq!(h.state_mut().ghidra_found(), Some(new.as_path()), "the release just set up is found instead");
+    assert!(old.is_file(), "the older install stays on disk");
 }
 
 #[test]
@@ -244,8 +282,10 @@ fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
     let mut h = harness_sized(egui::vec2(1280.0, 1120.0), move || {
         let mut a = demo::app(demo::engine(Mode::Beginner, true));
         demo::fill_projects(&mut a);
-        // An empty engine store: no Ghidra here.
+        // An empty engine store, and nowhere else looked in: no Ghidra here, whatever this
+        // computer has installed otherwise (a Homebrew copy on the developer's Mac, say).
         a.settings.engines.store_dir = Some(store);
+        a.settings.engines.only_configured = true;
         a.state.make.target = TargetRef::Local { path: game };
         a.state.make.game = true;
         a.state.make.request = "Recreate this game".into();
@@ -1137,6 +1177,7 @@ fn mode_switch_and_deep_toggle() {
     let mut h = harness(move || {
         let mut a = demo::app(demo::engine(Mode::Beginner, true));
         a.settings.engines.store_dir = Some(empty);
+        a.settings.engines.only_configured = true;
         a
     });
     h.run_steps(3);
