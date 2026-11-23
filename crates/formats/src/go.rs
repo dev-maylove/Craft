@@ -23,7 +23,8 @@ pub const MAX_FUNCTIONS: usize = 500_000;
 /// Longest function name.
 const MAX_NAME: usize = 4096;
 
-const MAGIC: &[u8; 14] = b"\xff Go buildinf:";
+/// The marker that opens a Go build information block.
+pub const MAGIC: &[u8; 14] = b"\xff Go buildinf:";
 const SENTINEL_START: [u8; 16] = [0x30, 0x77, 0xaf, 0x0c, 0x92, 0x74, 0x08, 0x02, 0x41, 0xe1, 0xc1, 0x07, 0xe6, 0xd6, 0x18, 0xe6];
 const SENTINEL_END: [u8; 16] = [0xf9, 0x32, 0x43, 0x31, 0x86, 0x18, 0x20, 0x72, 0x00, 0x82, 0x42, 0x10, 0x41, 0x16, 0xd8, 0xf2];
 
@@ -66,6 +67,9 @@ pub struct GoBuildInfo {
     /// True when the module text was present and every line was understood.
     pub complete: bool,
     pub warnings: Vec<String>,
+    /// The header's flags byte as read (bit 0: big-endian, bit 1: inline strings).
+    #[serde(skip)]
+    pub flags: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -442,6 +446,7 @@ fn decode_buildinfo(m: &Mapped<'_>, off: usize, warnings: &mut Vec<String>) -> O
         unparsed_lines: Vec::new(),
         complete: false,
         warnings: local_warnings,
+        flags,
     };
     parse_module_text(text, &mut b);
     b.complete = !text.is_empty() && b.unparsed_lines.is_empty() && b.warnings.is_empty();
