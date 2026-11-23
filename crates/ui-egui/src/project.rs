@@ -12,6 +12,7 @@ use craft_anything_ai::AgentEvent;
 use craft_anything_ai::rebuild::activity::{Action, ActivityNow, LineKind};
 use craft_anything_ai::rebuild::feed::{self, apply};
 use craft_anything_ai::rebuild::{self, AppKind, KindRegistry, KindWords, Note, RebuildRun, RunEvent, RunOptions, Started, Step, Stopped, TargetKind};
+use craft_anything_engine::evidence::ToolError;
 use craft_anything_engine::inbox::{Answer, Inbox, Request, RequestKind};
 use craft_anything_engine::workspace::{CheckResult, Status, TargetRef, Workspace, suggest_name};
 use egui::{Color32, RichText, Ui, Vec2};
@@ -251,7 +252,7 @@ impl CraftApp {
             self.state.feed.push(FeedItem::User(UserItem::Text(t.clone())));
         }
         let shown = text.clone();
-        self.resume(text, shown, Vec::new());
+        self.resume(text, shown, Vec::new(), Vec::new(), Vec::new());
     }
 
     /// Carry on where the open project's last run stopped (paused, or the app or the computer
@@ -357,6 +358,8 @@ impl CraftApp {
             let join = |part: fn(&Note) -> &str| left.iter().map(part).collect::<Vec<_>>().join("\n\n");
             let (message, shown) = (join(|n| &n.text), join(|n| &n.shown));
             let pictures: Vec<PathBuf> = left.iter().flat_map(|n| n.pictures.clone()).collect();
+            let carried_note_ids = left.iter().map(|note| note.id).collect();
+            let request_parts = left.clone();
             if open.as_ref() == Some(&root) {
                 if let Some(ws) = self.workspace.as_mut() {
                     let _ = ws.reload();
@@ -366,13 +369,15 @@ impl CraftApp {
                         self.state.feed.pop();
                     }
                     self.state.feed.push(FeedItem::User(UserItem::new(shown.clone(), pictures.clone())));
-                    self.resume(Some(message), Some(shown), pictures);
+                    self.resume(Some(message), Some(shown), pictures, carried_note_ids, request_parts);
                 }
             } else if !left.is_empty() {
                 // Another project's notes start its next run in the background.
                 let Ok(ws) = Workspace::open(&root) else { continue };
                 let Some(backend) = self.builder_backend(ws.manifest.builder.as_deref()) else { continue };
-                let opts = self.run_options(Some(backend), Some(message), Some(shown), pictures);
+                let mut opts = self.run_options(Some(backend), Some(message), Some(shown), pictures);
+                opts.carried_note_ids = carried_note_ids;
+                opts.request_parts = request_parts;
                 if let Err(e) = self.launch(ws, opts) {
                     self.toast(e.message, true);
                 }
@@ -2191,8 +2196,7 @@ impl CraftApp {
         let files = match files {
             Ok(f) => f,
             Err(e) => {
-                self.state.project_input = text;
-                self.state.project_attachments = attachments;
+                self.restore_draft(text, attachments);
                 return self.toast(format!("{} {}", tr("Couldn't attach the pictures:"), e), true);
             }
         };
@@ -2201,12 +2205,27 @@ impl CraftApp {
         match self.open_run() {
             Some(run) if run.is_running() => {
                 // It joins the feed when the builder reads it; until then it can be taken back.
-                let id = run.add_note(message, shown, files.clone());
-                self.drafts.insert(id, Draft { root: ws.root.clone(), text, attachments });
+                let result = run.add_note(message, shown, files.clone());
+                self.note_added(ws.root.clone(), text, attachments, result);
             }
             _ => {
                 self.state.feed.push(FeedItem::User(UserItem::new(shown.clone(), files.clone())));
-                self.resume(Some(message), Some(shown), files);
+                self.resume(Some(message), Some(shown), files, Vec::new(), Vec::new());
+            }
+        }
+    }
+
+    fn note_added(&mut self, root: PathBuf, text: String, attachments: Vec<PathBuf>, result: Result<rebuild::AddedNote, ToolError>) {
+        match result {
+            Ok(added) => {
+                self.drafts.insert(added.id, Draft { root, text, attachments });
+                if let Some(warning) = added.persistence_warning {
+                    self.toast(format!("{} {}", tr("Your message was sent, but saving it could not be confirmed."), warning.for_people()), true);
+                }
+            }
+            Err(error) => {
+                self.restore_draft(text, attachments);
+                self.toast(error.for_people(), true);
             }
         }
     }
@@ -2216,20 +2235,25 @@ impl CraftApp {
     pub fn unsend(&mut self, id: u64) {
         let Some(note) = self.open_run().and_then(|r| r.unsend(id)) else { return };
         let (text, attachments) = self.drafts.remove(&id).map_or((note.shown, Vec::new()), |d| (d.text, d.attachments));
+        self.restore_draft(text, attachments);
+    }
+
+    fn restore_draft(&mut self, text: String, attachments: Vec<PathBuf>) {
         let input = &mut self.state.project_input;
         *input = if input.trim().is_empty() { text } else { format!("{text}\n{input}") };
-        // These were saved with the note, so put them back as they were. Size is checked again
-        // only when the message is sent.
         self.restore_attachments(attachments);
     }
 
     /// Start another run on the open project: with a message (already shown in the app's feed;
     /// `shown` puts it in the saved one, with `pictures`), or none to try again.
-    fn resume(&mut self, message: Option<String>, shown: Option<String>, pictures: Vec<PathBuf>) {
+    fn resume(&mut self, message: Option<String>, shown: Option<String>, pictures: Vec<PathBuf>, carried_note_ids: Vec<u64>, request_parts: Vec<Note>) {
         let Some(ws) = self.workspace.clone() else { return };
         let ws = Workspace::open(&ws.root).unwrap_or(ws);
         let Some(backend) = self.builder_backend(ws.manifest.builder.as_deref()) else { return self.need_builder(false) };
-        self.start_run(ws, Some(backend), message, shown, pictures);
+        let mut opts = self.run_options(Some(backend), message, shown, pictures);
+        opts.carried_note_ids = carried_note_ids;
+        opts.request_parts = request_parts;
+        self.start_run_with(ws, opts);
     }
 }
 
@@ -2237,6 +2261,78 @@ impl CraftApp {
 mod tests {
     use super::*;
     use craft_anything_ai::AgentEvent;
+
+    #[test]
+    fn a_refused_note_id_keeps_the_persons_text_and_attachments() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        let runs = rebuild::StandIns::new();
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        app.runs = rebuild::RunSet::new(1).with_starter(runs.starter());
+        app.open_workspace(ws.clone());
+        app.runs.start(&app.hub, ws.clone(), RunOptions::default()).unwrap();
+        let dir = rebuild::notes::notes_dir(&ws.inbox_dir());
+        std::fs::create_dir_all(&dir).unwrap();
+        let occupied = dir.join("18446744073709551615.json");
+        std::fs::write(&occupied, b"Keep this unrecognized record").unwrap();
+        let attachments = vec![d.path().join("chosen-picture.png")];
+        let files = vec![ws.root.join("pictures/copied-picture.png")];
+        app.deliver(ws.root.clone(), "Keep my message".into(), attachments.clone(), Ok(files));
+        assert_eq!(app.state.project_input, "Keep my message");
+        assert_eq!(app.state.project_attachments, attachments);
+        assert!(app.open_run().unwrap().waiting().is_empty());
+        assert!(app.state.toasts.iter().any(|(message, error)| *error && message.contains("no space for a later note")));
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"Keep this unrecognized record");
+    }
+
+    #[test]
+    fn failed_async_delivery_restores_the_old_draft_ahead_of_the_new_one() {
+        for copy_failed in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+            let runs = rebuild::StandIns::new();
+            let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+            app.runs = rebuild::RunSet::new(1).with_starter(runs.starter());
+            app.open_workspace(ws.clone());
+            app.runs.start(&app.hub, ws.clone(), RunOptions::default()).unwrap();
+            let dir = rebuild::notes::notes_dir(&ws.inbox_dir());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("18446744073709551615.json"), b"reserved").unwrap();
+            let old = d.path().join("old.png");
+            let new = d.path().join("new.png");
+            app.state.project_input = "The newer draft".into();
+            app.state.project_attachments = vec![new.clone(), old.clone()];
+            let result = if copy_failed { Err("the copy failed".into()) } else { Ok(vec![ws.root.join("copied.png")]) };
+            app.deliver(ws.root.clone(), "The earlier draft".into(), vec![old.clone()], result);
+            assert_eq!(app.state.project_input, "The earlier draft\nThe newer draft");
+            assert_eq!(app.state.project_attachments, [new, old]);
+            assert!(app.open_run().unwrap().waiting().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_accepted_note_with_a_save_warning_does_not_restore_the_draft() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        app.open_workspace(ws.clone());
+        let old = d.path().join("accepted.png");
+        let new = d.path().join("new-draft.png");
+        app.state.project_input = "The newer draft".into();
+        app.state.project_attachments = vec![new.clone()];
+        let id = 71;
+        let warning = ToolError::io("notes", std::io::Error::other("the final directory sync failed"));
+        app.note_added(ws.root.clone(), "Already accepted".into(), vec![old.clone()], Ok(rebuild::AddedNote { id, persistence_warning: Some(warning) }));
+
+        assert_eq!(app.state.project_input, "The newer draft", "an accepted request is not offered for accidental resubmission");
+        assert_eq!(app.state.project_attachments, [new]);
+        assert_eq!(app.drafts.len(), 1);
+        let accepted = app.drafts.get(&id).unwrap();
+        assert_eq!(accepted.root, ws.root);
+        assert_eq!(accepted.text, "Already accepted");
+        assert_eq!(accepted.attachments, [old], "the accepted id still retains its take-back draft");
+        assert!(app.state.toasts.iter().any(|(message, error)| *error && message.contains("the final directory sync failed")));
+    }
 
     #[test]
     fn the_app_starts_with_the_persons_settings_while_the_engine_is_busy() {

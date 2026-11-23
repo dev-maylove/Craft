@@ -1345,6 +1345,7 @@ dependencies = [
  "craft-anything-platform",
  "craft-anything-testkit",
  "dirs",
+ "icu_locale_core",
  "keyring",
  "log",
  "regex",

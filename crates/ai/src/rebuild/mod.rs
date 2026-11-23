@@ -96,6 +96,14 @@ pub enum RunEvent {
     },
 }
 
+/// An accepted note. A warning means it was published and may already have been read, but the
+/// final directory sync failed. Keep its id and show the warning instead of submitting it again.
+#[derive(Debug)]
+pub struct AddedNote {
+    pub id: u64,
+    pub persistence_warning: Option<ToolError>,
+}
+
 /// Called after each event a run sends, so a window draws it at once instead of checking on a
 /// timer.
 #[derive(Clone, Default)]
@@ -132,6 +140,12 @@ pub struct RunOptions {
     /// The pictures attached to `shown` (their copies in the project), so the feed keeps them
     /// with the message for Up to bring back.
     pub shown_pictures: Vec<PathBuf>,
+    /// Persistent note ids the caller explicitly included in `message` (the desktop's
+    /// finished-run handoff). A different follow-up message does not acknowledge old notes.
+    pub carried_note_ids: Vec<u64>,
+    /// Original requests, including their ids and words, when a caller joins several notes.
+    /// Empty keeps the ordinary single `shown`/`message` request.
+    pub request_parts: Vec<Note>,
     /// Pick up a build whose last run stopped part-way (paused, the app closed, the computer
     /// stopped): Study isn't repeated when it was done, and an agent with a saved session is
     /// told to carry on rather than given the brief again. A run with no message on a project
@@ -161,6 +175,8 @@ impl Default for RunOptions {
             message: None,
             shown: None,
             shown_pictures: Vec::new(),
+            carried_note_ids: Vec::new(),
+            request_parts: Vec::new(),
             continuing: false,
             max_rounds: 6,
             good_enough: 90.0,
@@ -176,7 +192,7 @@ impl Default for RunOptions {
 /// Something the person added while a run works, until the agent reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
-    /// Unique in this process, so the app can take a note back.
+    /// Reserved across this process and recovered files, so the app can take a note back.
     pub id: u64,
     /// What the agent reads.
     pub text: String,
@@ -188,6 +204,14 @@ pub struct Note {
     /// they're marked told when the builder reads the note or when the after-turn path sends it.
     /// The raw note text stays in [`text`](Self::text), so a later run filters them by its mode.
     pub questions: Vec<AskedQuestion>,
+}
+
+/// A prepared follow-up and the records kept until its builder turn succeeds.
+#[derive(Debug)]
+struct NotePrompt {
+    prompt: String,
+    questions: Vec<AskedQuestion>,
+    note_ids: Vec<u64>,
 }
 
 /// The note text with the latest Just-ask answers this mode may show. `skip` holds answers an
@@ -266,7 +290,7 @@ pub struct RebuildRun {
 
 impl RebuildRun {
     /// Start a run on a worker thread. Fails fast (before any work) when no coding agent is set up.
-    pub fn start(hub: &AiHub, ws: Workspace, opts: RunOptions) -> Result<RebuildRun, ToolError> {
+    pub fn start(hub: &AiHub, ws: Workspace, mut opts: RunOptions) -> Result<RebuildRun, ToolError> {
         // The project as it is now. A run that waited in the queue, or one started as the project's
         // last run was ending, holds a copy from before that run's last saves (its session), and
         // everything below, the worker's saves included, works from this copy.
@@ -315,11 +339,36 @@ impl RebuildRun {
         let stop = CancelToken::default();
         let running = Arc::new(AtomicBool::new(true));
         let preview: Arc<Mutex<Option<StaticServer>>> = Arc::default();
-        let notes: Arc<Mutex<Vec<Note>>> = Arc::default();
         let inbox = Inbox::new(ws.inbox_dir());
-        // Notes an earlier run never handed over (the app closed while they waited, #1620) wait for
-        // this run's builder; their old files go before the app can add any to this one.
-        let left = notes::take_left(&notes::notes_dir(&ws.inbox_dir()), opts.message.is_none());
+        let dir = notes::notes_dir(&ws.inbox_dir());
+        let left = notes::take_left(&dir)?;
+        if let Some(id) = ws.manifest.website_language_request_id {
+            notes::reserve_after(id)?;
+        }
+        prepend_older_notes(&mut opts, &left)?;
+        let mut waiting: Vec<Note> = Vec::new();
+        let mut carried = Vec::new();
+        // Install every durable takeover and its queue entry before the worker can finish or
+        // observe old .read files as a claim made by this run. A failed startup keeps all notes.
+        for note in &left {
+            let in_message = opts.message.as_deref().is_some_and(|message| !message.trim().is_empty()) && opts.carried_note_ids.contains(&note.id);
+            let skip: Vec<_> = waiting.iter().flat_map(|note| note.questions.iter().cloned()).collect();
+            let (text, questions) = note_with_just_asked(note.left.text.clone(), &ws, clean_room, &skip);
+            notes::restore(&dir, note, &text, in_message)?;
+            if in_message {
+                carried.push(note.id);
+            } else {
+                waiting.push(Note {
+                    id: note.id,
+                    text: note.left.text.clone(),
+                    shown: note.left.shown.clone(),
+                    pictures: note.left.pictures.clone(),
+                    questions,
+                });
+            }
+        }
+        opts.carried_note_ids = carried;
+        let notes = Arc::new(Mutex::new(waiting));
         craft_anything_engine::inbox::clear_activity(&ws.inbox_dir());
         if !left.is_empty() {
             left_notes_are_a_request(&mut ws);
@@ -373,25 +422,35 @@ impl RebuildRun {
             .map_err(|e| ToolError::internal(e.to_string()))?;
         let activity = feed.lock().unwrap_or_else(PoisonError::into_inner).activity();
         let run = RebuildRun { rx, stop, inbox, running, preview, notes, clean_room, feed, root, started: Instant::now(), activity };
-        // Waiting again with files of their own: the builder takes them at its next step or after
-        // its turn, and a run that ends first hands them to the next one, as with any note.
-        for n in left {
-            run.add_note(n.text, n.shown, n.pictures);
-        }
         Ok(run)
     }
 
     /// Add something while it works; the agent reads it at its next step, and only then does it
     /// join the feed (as `shown`, with `pictures`). Returns its id, to take it back with `unsend`
-    /// until then.
+    /// until then, and any persistence warning for an already published note.
     ///
     /// The hand-over file also carries the latest Just-ask answers this mode may show, so a
     /// hand-over that bypasses the next message (Claude Code's tool hook) still has the context.
     /// The in-memory text stays raw, and the answers are marked told only when the note is read or
     /// sent.
-    pub fn add_note(&self, text: String, shown: String, pictures: Vec<PathBuf>) -> u64 {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    pub fn add_note(&self, text: String, shown: String, pictures: Vec<PathBuf>) -> Result<AddedNote, ToolError> {
+        self.add_note_syncing(text, shown, pictures, notes::sync_directory)
+    }
+
+    fn add_note_syncing(
+        &self,
+        text: String,
+        shown: String,
+        pictures: Vec<PathBuf>,
+        sync: impl Fn(&Path) -> Result<(), ToolError>,
+    ) -> Result<AddedNote, ToolError> {
+        let dir = notes::notes_dir(self.inbox.dir());
+        notes::reserve_ids(&dir)?;
+        let ws = Workspace::open(&self.root)?;
+        if let Some(id) = ws.manifest.website_language_request_id {
+            notes::reserve_after(id)?;
+        }
+        let id = notes::new_id()?;
         let mut file_text = text.clone();
         let mut questions = Vec::new();
         if !text.trim().is_empty() {
@@ -400,19 +459,19 @@ impl RebuildRun {
                 let notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
                 notes.iter().flat_map(|n| n.questions.iter().cloned()).collect()
             };
-            if let Ok(ws) = Workspace::open(&self.root) {
-                (file_text, questions) = note_with_just_asked(file_text, &ws, self.clean_room, &waiting);
-            }
+            (file_text, questions) = note_with_just_asked(file_text, &ws, self.clean_room, &waiting);
         }
-        // Also left for an agent that takes notes at its next step; without it, after the turn.
+        // Reject failures before publication, so the caller can restore the draft. Once visible
+        // to the independent hook, keep the accepted id even if the final sync reports a warning.
         // The in-memory note keeps the raw text: if a later run takes it, that run filters the
         // answers by its own mode instead of inheriting this run's.
         let left = notes::Left { text: text.clone(), shown: shown.clone(), pictures: pictures.clone() };
-        if let Err(e) = notes::hand_over(&notes::notes_dir(self.inbox.dir()), id, &file_text, Some(&left)) {
-            log::warn!("A note waits for the builder's turn to end: {}", e.message);
-        }
+        let published = notes::publish(&dir, id, &file_text, Some(&left), sync)?;
         self.notes.lock().unwrap_or_else(PoisonError::into_inner).push(Note { id, text, shown, pictures, questions });
-        id
+        let persistence_warning = published.persistence_warning.map(|error| {
+            error.with_remediation("The note was accepted and may already have been read. Do not resend it; saving it across a restart could not be confirmed.")
+        });
+        Ok(AddedNote { id, persistence_warning })
     }
 
     /// The notes still waiting for the agent, oldest first.
@@ -696,19 +755,30 @@ impl Worker {
 
     /// The prompt for notes the person added while the agent worked, if there are any, and the
     /// Just-ask answers it carries so they're marked told once the turn finishes.
-    fn added(&self, ws: &mut Workspace, deep: bool, sees_pictures: bool) -> Option<(String, Vec<AskedQuestion>)> {
+    fn added(&self, ws: &mut Workspace, deep: bool, sees_pictures: bool) -> Result<Option<NotePrompt>, ToolError> {
         let mut notes = std::mem::take(&mut *self.notes.lock().unwrap_or_else(PoisonError::into_inner));
         if notes.is_empty() {
-            return None;
+            return Ok(None);
         }
-        // They go in this message, so no hook hands them over again.
+        notes.sort_by_key(|note| note.id);
         let dir = notes::notes_dir(&ws.inbox_dir());
-        for n in &notes {
-            notes::forget(&dir, n.id);
+        let mut prepare = || {
+            self.record_request_texts(ws, &notes)?;
+            for note in notes.iter().filter(|note| !note.text.trim().is_empty()) {
+                let left = notes::Left { text: note.text.clone(), shown: note.shown.clone(), pictures: note.pictures.clone() };
+                notes::carry_for_prompt(&dir, note.id, &left)?;
+            }
+            Ok(())
+        };
+        if let Err(error) = prepare() {
+            let mut waiting = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+            notes.append(&mut *waiting);
+            *waiting = notes;
+            return Err(error);
         }
         notes.retain(|n| !n.text.trim().is_empty());
         if notes.is_empty() {
-            return None;
+            return Ok(None);
         }
         for n in &notes {
             self.emit(RunEvent::Note { shown: n.shown.clone(), pictures: n.pictures.clone() });
@@ -723,8 +793,9 @@ impl Worker {
         let mut questions = attached;
         questions.extend(extra);
         let context = just_asked(&questions);
+        let note_ids = notes.iter().map(|note| note.id).collect();
         let texts: Vec<String> = notes.into_iter().map(|n| n.text).collect();
-        Some((context + &added_prompt(&texts) + &pictures_reminder(ws, sees_pictures), questions))
+        Ok(Some(NotePrompt { prompt: context + &added_prompt(&texts) + &pictures_reminder(ws, sees_pictures), questions, note_ids }))
     }
 
     /// Decides an ACP builder's permission requests with the same policy Claude Code's approval
@@ -855,6 +926,9 @@ impl Worker {
         let kind = opts.kinds.detect(&ws.manifest.request, &ws.manifest.target, &ws.manifest.stack).ok_or_else(no_kind)?;
         self.self_check = Some((kind.clone(), opts.good_enough));
         let kind = kind.as_ref();
+        // Attachment paths added to the builder's message aren't instructions from the person.
+        let requests: Vec<_> = opts.request_parts.iter().map(|note| (note.id, note.shown.as_str())).collect();
+        kind.record_ordered_requests(ws, &requests)?;
         self.editor = self.find_editor(&ws.manifest.stack)?;
         // A new build whose stack's program is missing would learn so only at its first check,
         // after a whole turn (#1837). A project already in app/ isn't stopped: the person may
@@ -959,6 +1033,7 @@ impl Worker {
         }
         let mut refinements = 0;
         let mut reminded = false;
+        let mut carried_note_ids = opts.carried_note_ids.clone();
         // The builder finished and only the check didn't: the build is there to check.
         let mut only_check = carrying_on && !first && opts.message.is_none() && ws.manifest.awaiting_check;
         loop {
@@ -984,7 +1059,19 @@ impl Worker {
                     self.keep_session(ws, a.as_ref());
                 }
                 let reply = match reply {
-                    Ok(reply) => reply,
+                    Ok(reply) => {
+                        // These notes were explicitly carried in this prompt. Keep their read
+                        // records through startup and failed turns; only a successful delivery
+                        // and the request-state save above allow completion acknowledgement.
+                        let dir = notes::notes_dir(&ws.inbox_dir());
+                        for id in &carried_note_ids {
+                            notes::mark_recorded(&dir, *id)?;
+                        }
+                        for id in carried_note_ids.drain(..) {
+                            notes::forget(&dir, id)?;
+                        }
+                        reply
+                    }
                     Err(error) => {
                         // Consumed instructions start a fresh attempt even if this turn fails
                         // or is cancelled. The provider retry loop has ended; stop any remaining
@@ -1032,12 +1119,13 @@ impl Worker {
                     progress.save(&ws.root)?;
                 }
                 // What the person added while the agent worked goes in before anything else.
-                if let Some((p, more)) = self.added(ws, deep, sees_pictures) {
-                    asked.extend(more);
+                if let Some(added) = self.added(ws, deep, sees_pictures)? {
+                    carried_note_ids.extend(added.note_ids);
+                    asked.extend(added.questions);
                     progress.reset();
                     progress.save(&ws.root)?;
                     ws.manifest.not_working_checks = 0;
-                    prompt = p;
+                    prompt = added.prompt;
                     continue;
                 }
                 if !reminded && needs_decompile_reminder(deep, &ws.manifest) {
@@ -1062,12 +1150,13 @@ impl Worker {
             for c in &checks {
                 self.emit(RunEvent::Checked(c.clone()));
             }
-            if let Some((p, more)) = self.added(ws, deep, sees_pictures) {
-                asked.extend(more);
+            if let Some(added) = self.added(ws, deep, sees_pictures)? {
+                carried_note_ids.extend(added.note_ids);
+                asked.extend(added.questions);
                 progress.reset();
                 progress.save(&ws.root)?;
                 ws.manifest.not_working_checks = 0;
-                prompt = p;
+                prompt = added.prompt;
                 continue;
             }
             let kind_checks = kind.checks(ws);
@@ -1194,7 +1283,7 @@ impl Worker {
     /// an error couldn't look at all (a browser that went away), which says nothing about the
     /// build, so it gets a second go before the run stops, and the run says what is really wrong.
     fn checks_with_a_retry(&self, ws: &Workspace, kind: &dyn kinds::TargetKind, round: u32) -> Result<Vec<CheckResult>, ToolError> {
-        self.checks_unless_unchanged(ws, kind, round, || self.checks_with_a_retry_now(ws, kind, round))
+        self.checks_unless_unchanged(ws, kind, round, |current| self.checks_with_a_retry_now(current, kind, round))
     }
 
     fn checks_with_a_retry_now(&self, ws: &Workspace, kind: &dyn kinds::TargetKind, round: u32) -> Result<Vec<CheckResult>, ToolError> {
@@ -1385,7 +1474,7 @@ impl Worker {
                     self.emit(RunEvent::Agent(e));
                 }
                 if done {
-                    self.relay_read_notes(ws);
+                    self.relay_read_notes(ws)?;
                     for line in newly_said(&ws.inbox_dir(), &mut said) {
                         self.emit(RunEvent::Step { step: Step::Build, text: line });
                     }
@@ -1403,7 +1492,7 @@ impl Worker {
                 refresh = false;
             }
             self.relay_inbox();
-            self.relay_read_notes(ws);
+            self.relay_read_notes(ws)?;
             for line in newly_said(&ws.inbox_dir(), &mut said) {
                 self.emit(RunEvent::Step { step: Step::Build, text: line });
             }
@@ -1417,15 +1506,33 @@ impl Worker {
 
     /// Notes the builder took at a step of this turn (its hook claimed them): they join the feed
     /// now and aren't sent again after the turn.
-    fn relay_read_notes(&mut self, ws: &Workspace) {
+    fn relay_read_notes(&mut self, ws: &mut Workspace) -> Result<(), ToolError> {
+        self.relay_read_notes_using(ws, notes::was_read)
+    }
+
+    fn relay_read_notes_using(&mut self, ws: &mut Workspace, mut was_read: impl FnMut(&Path, u64) -> bool) -> Result<(), ToolError> {
         let dir = notes::notes_dir(&ws.inbox_dir());
-        let read: Vec<Note> = {
+        let mut read: Vec<Note> = {
             let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
-            let (read, waiting) = std::mem::take(&mut *notes).into_iter().partition(|n| notes::was_read(&dir, n.id));
-            *notes = waiting;
-            read
+            notes.sort_by_key(|note| note.id);
+            // Claims happen in another process, outside this mutex. Stop at the first
+            // unread note so a later claim cannot leapfrog its earlier request state.
+            let count = notes.iter().take_while(|note| was_read(&dir, note.id)).count();
+            notes.drain(..count).collect()
         };
-        let new_request = read.iter().any(|n| !n.text.trim().is_empty());
+        if read.is_empty() {
+            return Ok(());
+        }
+        // The hook has already delivered these instructions. Even a request-state or
+        // completion-mark failure must leave the next attempt a fresh progress allowance.
+        self.reset_progress_after_notes |= read.iter().any(|n| !n.text.trim().is_empty());
+        if let Err(error) = self.record_note_requests(ws, &read) {
+            let mut waiting = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+            read.append(&mut *waiting);
+            *waiting = read;
+            return Err(error);
+        }
+        let mut cleanup_error = None;
         for n in read {
             // The agent's hook took the note, so the Just-ask answers in its text were told.
             if !n.questions.is_empty()
@@ -1433,10 +1540,29 @@ impl Worker {
             {
                 log::warn!("couldn't record which questions the builder was told: {}", e.message);
             }
-            notes::forget(&dir, n.id);
+            if let Err(error) = notes::forget(&dir, n.id) {
+                cleanup_error.get_or_insert(error);
+            }
             self.emit(RunEvent::Note { shown: n.shown, pictures: n.pictures });
         }
-        self.reset_progress_after_notes |= new_request;
+        cleanup_error.map_or(Ok(()), Err)
+    }
+
+    fn record_request_texts(&self, ws: &mut Workspace, notes: &[Note]) -> Result<(), ToolError> {
+        if let Some((kind, _)) = &self.self_check {
+            let requests: Vec<_> = notes.iter().filter(|note| !note.text.trim().is_empty()).map(|note| (note.id, note.shown.as_str())).collect();
+            kind.record_ordered_requests(ws, &requests)?;
+        }
+        Ok(())
+    }
+
+    fn record_note_requests(&self, ws: &mut Workspace, notes: &[Note]) -> Result<(), ToolError> {
+        self.record_request_texts(ws, notes)?;
+        let dir = notes::notes_dir(&ws.inbox_dir());
+        for note in notes {
+            notes::mark_recorded(&dir, note.id)?;
+        }
+        Ok(())
     }
 
     fn relay_inbox(&mut self) {
@@ -1448,10 +1574,61 @@ impl Worker {
     }
 }
 
+/// Keep each original request's position when recovered notes join a carried initial message.
+fn prepend_older_notes(opts: &mut RunOptions, left: &[notes::LeftNote]) -> Result<(), ToolError> {
+    let Some(message) = opts.message.as_deref().filter(|message| !message.trim().is_empty()) else { return Ok(()) };
+    let show = opts.shown.is_some() || !left.is_empty() || !opts.request_parts.is_empty();
+    let last_carried = opts.carried_note_ids.iter().copied().max();
+    if let Some(id) = last_carried {
+        notes::reserve_after(id)?;
+    }
+    let mut parts = std::collections::BTreeMap::new();
+    for note in &opts.request_parts {
+        if !opts.carried_note_ids.contains(&note.id) || parts.insert(note.id, note.clone()).is_some() {
+            return Err(ToolError::invalid("The carried requests have inconsistent note identities; their records were kept."));
+        }
+    }
+    for note in left.iter().filter(|note| last_carried.is_none_or(|last| note.id <= last)) {
+        if let Some(part) = parts.get(&note.id) {
+            if part.text != note.left.text || part.shown != note.left.shown || part.pictures != note.left.pictures {
+                return Err(ToolError::invalid("A carried request changed before the build started; its records were kept."));
+            }
+        } else {
+            parts.insert(
+                note.id,
+                Note { id: note.id, text: note.left.text.clone(), shown: note.left.shown.clone(), pictures: note.left.pictures.clone(), questions: Vec::new() },
+            );
+        }
+    }
+    if opts.carried_note_ids.iter().any(|id| !parts.contains_key(id)) {
+        return Err(ToolError::invalid("A carried request's original words are missing; its records were kept."));
+    }
+    opts.carried_note_ids = parts.keys().copied().collect();
+    if last_carried.is_none() {
+        let id = notes::new_id()?;
+        parts.insert(
+            id,
+            Note {
+                id,
+                text: message.into(),
+                shown: opts.shown.as_deref().unwrap_or(message).into(),
+                pictures: opts.shown_pictures.clone(),
+                questions: Vec::new(),
+            },
+        );
+    }
+    let parts: Vec<_> = parts.into_values().collect();
+    opts.message = Some(parts.iter().map(|note| note.text.as_str()).collect::<Vec<_>>().join("\n\n"));
+    opts.shown = show.then(|| parts.iter().map(|note| note.shown.as_str()).collect::<Vec<_>>().join("\n\n"));
+    opts.shown_pictures = parts.iter().flat_map(|note| note.pictures.iter().cloned()).collect();
+    opts.request_parts = parts;
+    Ok(())
+}
+
 /// Notes an earlier run left are a request the person made, as a message is: they start the counts
 /// of unchanged turns and of checks that found no working build again, or a run carrying on from a
-/// build that reached either limit would stop before its builder reads them. Their files are gone
-/// by now, so a count that can't be saved is logged and the run starts anyway. The count is saved
+/// build that reached either limit would stop before its builder reads them. Their durable files
+/// remain recoverable; a count that can't be saved is logged. The count is saved
 /// on the project as it is on disk: a run that waited in the queue holds a copy from before the
 /// run ahead of it finished, and saving that would undo what that run recorded (its session).
 fn left_notes_are_a_request(ws: &mut Workspace) {
