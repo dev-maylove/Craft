@@ -22,12 +22,21 @@ const USUAL_HOME_DIRS: &[&str] =
 #[cfg(unix)]
 const USUAL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 // Claude Code's installer, npm (without a custom prefix), WinGet's portable packages (Claude
-// Code's WinGet install), bun, cargo, Hermes Agent's installer (`%LOCALAPPDATA%\hermes\bin`, #116)
-// and Grok Build (`%USERPROFILE%\.grok\bin`). PATH may not have them yet in an app started before
-// the install.
+// Code's WinGet install), bun, cargo, Hermes Agent's installer (`%LOCALAPPDATA%\hermes\bin`, #116),
+// Grok Build (`%USERPROFILE%\.grok\bin`) and the DeepSeek Harness desktop app, whose `dsh.cmd` is
+// on PATH only once its command is turned on (#2348). PATH may not have them yet in an app started
+// before the install.
 #[cfg(windows)]
-const USUAL_HOME_DIRS: &[&str] =
-    &[r".local\bin", r"AppData\Roaming\npm", r"AppData\Local\Microsoft\WinGet\Links", r".bun\bin", r".cargo\bin", r"AppData\Local\hermes\bin", r".grok\bin"];
+const USUAL_HOME_DIRS: &[&str] = &[
+    r".local\bin",
+    r"AppData\Roaming\npm",
+    r"AppData\Local\Microsoft\WinGet\Links",
+    r".bun\bin",
+    r".cargo\bin",
+    r"AppData\Local\hermes\bin",
+    r".grok\bin",
+    r"AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin",
+];
 #[cfg(not(any(unix, windows)))]
 const USUAL_HOME_DIRS: &[&str] = &[];
 // WinGet's portable packages installed for every user (`--scope machine`).
