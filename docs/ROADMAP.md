@@ -3652,6 +3652,9 @@ Owner: open · Status: in progress
       or manifest, ASAR, text). Fat Mach-O files that start 0xCAFEBABF are now recognized.
       — claimed: FredApps, branch refactor/target-kind-craft-sniff
 
+
+- [x] Swift parameter pack and value pack types decode: `Qp` becomes `repeat …`, a pack-element list becomes `Pack{…}` (including `Pack{}`), and pack element types pass through. Before, all of these were rejected as “unsupported associated type”.
+      — claimed: Chr0mium24, branch bugfix/r3.12-swift-demangle-packs
 ### R3.13 Web inspection correctness
 Owner: open · Status: in progress
 - [x] Decode character references in HTML page titles before returning their displayed text.
