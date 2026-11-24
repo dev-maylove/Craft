@@ -1103,7 +1103,16 @@ impl AcpConversation {
         *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let text = format!("{}{text}", self.preamble);
         let continuation = retry.then(|| format!("{}{}", self.preamble, crate::failure::CONTINUE_TURN));
-        let running = self.proc.lock().unwrap_or_else(PoisonError::into_inner).as_mut().is_some_and(|p| !p.is_finished());
+        // A finished handle left in the slot is the previous agent, not this turn. `poll`
+        // would treat it as a crash while the replacement is still starting, end the turn,
+        // and let another start begin. Take it out under the same lock and release it first.
+        let (running, retired) = {
+            let mut slot = self.proc.lock().unwrap_or_else(PoisonError::into_inner);
+            let running = slot.as_mut().is_some_and(|p| !p.is_finished());
+            let retired = if running { None } else { slot.take() };
+            (running, retired)
+        };
+        drop(retired);
         if !running {
             self.start_cancelled.store(false, Ordering::SeqCst);
             let _ = self.tx.send(AgentEvent::Status { text: format!("Starting {}…", display_for(&self.agent)) });
@@ -2136,5 +2145,68 @@ exit 1
         }
         assert!(!c.is_busy());
         assert!(all.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("is Grok Build"))));
+    }
+
+    /// The previous agent has exited, but its handle is still in the slot. Starting again must
+    /// release that handle before the replacement is published, or `poll` reports a crash of the
+    /// new turn and a second message can start another worker.
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_agent_is_retired_before_the_next_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("agent");
+        let script = r#"#!/bin/sh
+if [ "$1" = --version ]; then sleep 1; echo '2026.10.22-27dcf5f'; exit 0; fi
+sleep 30
+"#;
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A live child stays in the slot: only an exited one is retired.
+        let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
+        let mut live = AcpConversation::new("Fake", "cursor-agent", program.display().to_string(), vec!["acp".into()], dir.path().into(), mcp.clone(), None);
+        let sleeper = craft_anything_platform::Process::new("sleep").arg("30").timeout(Duration::from_secs(60)).spawn().unwrap();
+        let pid = sleeper.pid();
+        *live.proc.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sleeper);
+        live.send("still going");
+        {
+            let mut slot = live.proc.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let child = slot.as_mut().expect("a running agent stays in the slot");
+            assert!(!child.is_finished());
+            assert_eq!(child.pid(), pid);
+        }
+        assert!(live.poll().iter().all(|e| !matches!(e, AgentEvent::Error { message, .. } if message.contains("stopped unexpectedly"))));
+        drop(live);
+
+        let mut exited = craft_anything_platform::Process::new("true").timeout(Duration::from_secs(5)).spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !exited.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "the stand-in child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut c = AcpConversation::new("Fake", "cursor-agent", program.display().to_string(), vec!["acp".into()], dir.path().into(), mcp, None);
+        *c.proc.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(exited);
+        c.send("Hello again");
+        assert!(
+            !c.proc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut().is_some_and(|child| child.is_finished()),
+            "the exited handle is still in the slot"
+        );
+        let during_start = c.poll();
+        assert!(during_start.iter().all(|e| !matches!(e, AgentEvent::Error { message, .. } if message.contains("stopped unexpectedly"))), "{during_start:?}");
+        assert!(c.is_busy(), "the replacement start is still the current turn");
+        c.send("one more");
+        let second = c.poll();
+        assert!(
+            second.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("Still working"))),
+            "a second message during startup must not start another worker: {second:?}"
+        );
+        c.stop();
+        let done = std::time::Instant::now() + Duration::from_secs(10);
+        while c.is_busy() && std::time::Instant::now() < done {
+            let _ = c.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!c.is_busy(), "stop should end the replacement once the version probe returns");
     }
 }
