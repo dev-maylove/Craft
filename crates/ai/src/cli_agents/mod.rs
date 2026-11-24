@@ -495,6 +495,29 @@ pub fn claude_code_failure(why: &str) -> (String, Option<String>) {
 
 /// [`claude_code_failure`] for Claude Code in a folder chosen for it (`folder`), whose sign-in is
 /// its own.
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// What to do about a used-up plan limit (`kind` as Claude Code names it), `resets_at` being
+/// Unix seconds and `now` the time it's said.
+pub(crate) fn plan_limit_fix(kind: &str, resets_at: Option<u64>, now: u64) -> String {
+    let which = match kind {
+        "five_hour" => "5-hour",
+        k if k.starts_with("seven_day") => "weekly",
+        _ => "usage",
+    };
+    let when = match resets_at.map(|at| at.saturating_sub(now)) {
+        Some(s) if s >= 2 * 3600 => format!(" It resets in about {} hours.", s.div_ceil(3600)),
+        Some(s) if s > 60 => format!(" It resets in about {} minutes.", s.div_ceil(60)),
+        Some(_) => " It resets in a minute or so.".to_string(),
+        None => String::new(),
+    };
+    format!(
+        "Your Claude plan's {which} limit is used up, so the build stopped instead of trying again.{when} Press Try again once it has reset, or choose another AI to build in Settings → AI."
+    )
+}
+
 pub(crate) fn claude_code_failure_in(why: &str, folder: Option<&Path>) -> (String, Option<String>) {
     if why.to_ascii_lowercase().contains(TOO_OLD_FOR_MODEL) {
         return (
@@ -547,11 +570,15 @@ pub struct StreamParser {
     /// A missing or invalid per-step cost cannot become a complete turn total later.
     cost_incomplete: bool,
     pub saw_result: bool,
-    /// The run was asked to continue a saved session the agent doesn't have (it lives on another
-    /// computer, or under another folder), so it did nothing.
+    /// The run was asked to continue a saved session the agent can't continue: it doesn't have it
+    /// (it lives on another computer, or under another folder), or the session has grown too long
+    /// to take another message. Either way it did nothing, and the next message starts a new one.
     pub session_missing: bool,
     /// A protocol fact about the failed turn, independent of the text shown to the person.
     pub failure: Option<TurnFailure>,
+    /// Claude Code said the plan's limit refused this turn: which limit (`five_hour`,
+    /// `seven_day`…) and when it resets, in Unix seconds.
+    pub plan_limit: Option<(String, Option<u64>)>,
 }
 
 fn short_tool(name: &str) -> String {
@@ -598,6 +625,7 @@ impl StreamParser {
             saw_result: false,
             session_missing: false,
             failure: None,
+            plan_limit: None,
         }
     }
 
@@ -995,8 +1023,17 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     }
     // The folder the agent's process starts in below.
     let cwd = remote.is_none().then(|| spec.project.clone().or_else(|| std::env::current_dir().ok())).flatten();
-    if let Err(e) = adapter.check_native_options(&spec.options, cwd.as_deref()) {
-        let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
+    let checked = match remote.as_deref() {
+        Some(host) => adapter.check_remote_options(&spec.options, host, stop),
+        None => adapter.check_native_options(&spec.options, cwd.as_deref()),
+    };
+    if let Err(e) = checked {
+        let event = if e.code == ErrorCode::Cancelled {
+            AgentEvent::Status { text: "Stopped.".into() }
+        } else {
+            AgentEvent::Error { message: e.message, remediation: e.remediation, log: None }
+        };
+        let _ = tx.send(event);
         return nothing_done(&name);
     }
     if let Err(e) = adapter.validate_model(&spec.config, &spec.options, spec.project.as_deref(), stop) {
@@ -1087,6 +1124,9 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         && let (Some(var), Some(dir)) = (adapter.folder_var(), spec.options.config_dir_text())
     {
         env.push((var, dir.to_string()));
+    }
+    if remote.is_some() {
+        env.extend(adapter.remote_run_env());
     }
     let (prog, argv) = match &remote {
         Some(host) => ("ssh".to_string(), crate::ssh::ssh_line_args(host, remote_command(&program, args, &env))),
@@ -1616,6 +1656,42 @@ mod tests {
         assert_eq!(p.failure, Some(TurnFailure::new(FailureKind::ToolsUnavailable)));
     }
 
+    /// #1919: a used-up weekly limit was retried as a per-minute rate limit, failing each time.
+    #[test]
+    fn a_used_up_claude_plan_limit_is_not_retried_and_says_when_it_resets() {
+        let error = json!({"type":"assistant","error":"rate_limit","message":{"content":[{"type":"text","text":"You've hit your weekly limit · resets 6pm"}]}});
+        let event =
+            |status: &str| json!({"type":"rate_limit_event","rate_limit_info":{"status":status,"resetsAt":4_102_444_800u64,"rateLimitType":"seven_day"}});
+        let mut p = StreamParser::new(adapter_for("claude-code"));
+        assert!(p.line(&event("rejected").to_string()).is_empty(), "nothing to show by itself");
+        let events = p.line(&error.to_string());
+        assert_eq!(p.failure, Some(TurnFailure::new(FailureKind::UsageLimit)));
+        assert!(!p.failure.unwrap().retryable());
+        let [AgentEvent::Error { message, remediation: Some(fix), .. }] = events.as_slice() else { panic!("{events:?}") };
+        assert!(message.contains("weekly limit") && fix.contains("weekly limit is used up") && fix.contains("resets in about"), "{fix}");
+        // The turn's closing result is the error the run keeps (#1931 review).
+        let events = p.line(r#"{"type":"result","is_error":true,"result":"You've hit your weekly limit · resets 6pm"}"#);
+        let [AgentEvent::Error { remediation: Some(fix), .. }] = events.as_slice() else { panic!("{events:?}") };
+        assert!(fix.contains("weekly limit is used up"), "{fix}");
+        assert_eq!(p.failure, Some(TurnFailure::new(FailureKind::UsageLimit)));
+
+        // A turn its limits allowed, then a rate limit: a per-minute one, waited for and tried again.
+        let mut p = StreamParser::new(adapter_for("claude-code"));
+        p.line(&event("allowed").to_string());
+        p.line(&error.to_string());
+        assert_eq!(p.failure, Some(TurnFailure::new(FailureKind::RateLimited)));
+    }
+
+    #[test]
+    fn plan_limit_fix_names_the_limit_and_how_long() {
+        assert!(plan_limit_fix("five_hour", Some(10_000 + 3 * 3600), 10_000).contains("5-hour limit is used up"));
+        assert!(plan_limit_fix("five_hour", Some(10_000 + 3 * 3600), 10_000).contains("about 3 hours"));
+        assert!(plan_limit_fix("seven_day_opus", Some(10_000 + 90 * 60), 10_000).contains("weekly limit"));
+        assert!(plan_limit_fix("seven_day_opus", Some(10_000 + 90 * 60), 10_000).contains("about 90 minutes"));
+        assert!(plan_limit_fix("x", Some(5), 10_000).contains("a minute or so"), "a reset already past");
+        assert!(!plan_limit_fix("x", None, 10_000).contains("resets in"));
+    }
+
     #[test]
     fn claude_assistant_error_codes_survive_localized_display_messages() {
         for (code, kind) in [
@@ -2004,23 +2080,39 @@ mod tests {
         }
         assert_eq!(a[pos("--resume") + 1], "sess-1");
         assert_eq!(a[pos("--allowedTools") + 1], "mcp__craft-anything__*");
-        assert_eq!(a[pos("--model") + 1], "claude-opus-5-5", "Opus 5.5 unless configured otherwise");
+        assert!(!a.iter().any(|x| x == "--model"), "no --model by default: respect the user's Claude Code config");
         let o = BackendOptions { cli_model: Some("opus".into()), ..Default::default() };
         let b = build_args(adapter_for("claude-code").as_ref(), &o, "q", "PRE", &mcp(), None, Access::Analyse);
         assert_eq!(b[b.iter().position(|x| x == "--model").unwrap() + 1], "opus");
+        // Any model string the user configured (including custom aliases) is passed through.
+        let custom = BackendOptions { cli_model: Some("my-custom-model".into()), ..Default::default() };
+        let c = build_args(adapter_for("claude-code").as_ref(), &custom, "q", "PRE", &mcp(), None, Access::Analyse);
+        assert_eq!(c[c.iter().position(|x| x == "--model").unwrap() + 1], "my-custom-model");
+        // A question (forked read-only session) also respects the configured/default model.
+        let q = build_args(adapter_for("claude-code").as_ref(), &BackendOptions::default(), "q", "PRE", &mcp(), Some("s1"), Access::Question);
+        assert!(!q.iter().any(|x| x == "--model"), "question: no --model by default");
+        let q2 = build_args(adapter_for("claude-code").as_ref(), &custom, "q", "PRE", &mcp(), Some("s1"), Access::Question);
+        assert_eq!(q2[q2.iter().position(|x| x == "--model").unwrap() + 1], "my-custom-model");
         let cfg: Value = serde_json::from_str(&a[pos("--mcp-config") + 1]).unwrap();
         assert_eq!(cfg["mcpServers"]["craft-anything"]["args"][0], "mcp");
         // variadic flags come last: nothing after them is read as one of their values
         assert!(pos("--mcp-config") > pos("--resume"));
     }
 
-    /// #540: only tools that ask the person themselves are approved on Codex's side.
+    /// #540, #1464: only tools we limit ourselves are approved on Codex's side: one that asks for
+    /// consent, or one that spends only within the project's asset budget.
     #[test]
-    fn every_tool_approved_for_codex_is_registered_and_asks_for_consent() {
+    fn every_tool_approved_for_codex_is_registered_and_limited_by_us() {
         let e = craft_anything_engine::Engine::shared(craft_anything_engine::testing::session(), crate::rebuild::tools::specs());
         for id in craft_anything_engine::AGENT_APP_PREAPPROVED_TOOLS {
             let spec = e.registry().get(id).unwrap_or_else(|| panic!("{id} isn't registered"));
-            assert!(spec.effects.needs_consent(), "{id} must ask for consent itself");
+            assert!(
+                spec.effects.needs_consent() || craft_anything_engine::ASSETS_SPENDING_TOOLS.contains(id),
+                "{id} must ask for consent itself or stay within the asset budget"
+            );
+        }
+        for id in craft_anything_engine::ASSETS_SPENDING_TOOLS {
+            assert!(craft_anything_engine::AGENT_APP_PREAPPROVED_TOOLS.contains(&id), "#1464: Codex refused {id}");
         }
     }
 
@@ -2038,8 +2130,10 @@ mod tests {
         let other = line.replace("rebuild_start", "build_command_run");
         let events = adapter_for("codex").parse(&mut p, &serde_json::from_str::<Value>(&other).unwrap());
         let text = format!("{events:?}");
-        assert!(text.contains("[mcp_servers.craft-anything.tools.build_command_run]") && !text.contains("setup --client codex"), "{text}");
+        assert!(text.contains("inside `tools`") && !text.contains("setup --client codex"), "{text}");
         let hint = adapters::codex_tool_text(&serde_json::from_str::<Value>(&other).unwrap()["item"], "build_command_run", true);
+        assert!(hint.contains("build_command_run = { approval_mode = \"approve\" }"), "{hint}");
+        assert!(!hint.contains("[mcp_servers.craft-anything.tools.build_command_run]"), "{hint}");
         assert!(hint.len() <= 200, "the feed keeps 200 characters: {} in {hint}", hint.len());
         // Another server's refusal keeps Codex's words: our setup can't fix it.
         let mut p = StreamParser::new(adapter_for("codex"));
@@ -2057,6 +2151,39 @@ mod tests {
             r#"{"type":"item.completed","item":{"id":"i2","type":"mcp_tool_call","tool":"x","status":"failed","result":null,"error":{"message":"boom"}}}"#;
         let text = format!("{:?}", adapter_for("codex").parse(&mut p, &serde_json::from_str::<Value>(other).unwrap()));
         assert!(text.contains("boom") && !text.contains("null"), "{text}");
+    }
+
+    /// #1867: setup writes `tools` as one inline table, so the old dotted-table guidance failed
+    /// with "cannot extend value of type inline table with a dotted key". The hinted inline key
+    /// extends it, and a standard tools table takes the same key.
+    #[test]
+    fn the_codex_approval_hint_extends_the_inline_tools_table() {
+        let generated =
+            "[mcp_servers.craft-anything]\ncommand = \"craft-anything-cli\"\nargs = [\"mcp\"]\ntools = { rebuild_start = { approval_mode = \"approve\" } }\n";
+        let dotted = format!("{generated}\n[mcp_servers.craft-anything.tools.build_command_run]\napproval_mode = \"approve\"\n");
+        assert!(toml::from_str::<toml::Value>(&dotted).is_err(), "the old guidance cannot extend an inline table");
+
+        let item: Value = serde_json::from_str(r#"{"error":{"message":"tool build_command_run requires approval, but approval policy is never"}}"#).unwrap();
+        let hint = adapters::codex_tool_text(&item, "build_command_run", true);
+        assert!(hint.contains("build_command_run = { approval_mode = \"approve\" }"), "{hint}");
+
+        let inline = "[mcp_servers.craft-anything]\ncommand = \"craft-anything-cli\"\nargs = [\"mcp\"]\ntools = { rebuild_start = { approval_mode = \"approve\" }, build_command_run = { approval_mode = \"approve\" } }\n";
+        let doc: toml::Value = toml::from_str(inline).unwrap();
+        let approved = |doc: &toml::Value| {
+            doc.get("mcp_servers")
+                .and_then(|v| v.get("craft-anything"))
+                .and_then(|v| v.get("tools"))
+                .and_then(|v| v.get("build_command_run"))
+                .and_then(|v| v.get("approval_mode"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+        };
+        assert_eq!(approved(&doc).as_deref(), Some("approve"), "the inline tools table takes the key");
+
+        let table =
+            "[mcp_servers.craft-anything.tools]\nrebuild_start = { approval_mode = \"approve\" }\nbuild_command_run = { approval_mode = \"approve\" }\n";
+        let doc: toml::Value = toml::from_str(table).unwrap();
+        assert_eq!(approved(&doc).as_deref(), Some("approve"), "a standard tools table takes the same key");
     }
 
     #[test]
@@ -2083,6 +2210,7 @@ mod tests {
         // #540: `codex exec` can't ask, so the tools that ask for themselves are approved in the
         // same -c list, and nothing wider.
         assert!(a.contains(&"mcp_servers.craft-anything.tools.rebuild_start.approval_mode=\"approve\"".to_string()));
+        assert!(a.contains(&"mcp_servers.craft-anything.tools.assets_image_generate.approval_mode=\"approve\"".to_string()), "#1464");
         assert!(!a.iter().any(|x| x.contains("default_tools_approval_mode")));
         let g = build_args(adapter_for("gemini-cli").as_ref(), &BackendOptions::default(), "q", "", &mcp(), None, Access::Analyse);
         assert!(g.windows(2).any(|w| w[0] == "--output-format" && w[1] == "stream-json"));
@@ -2436,6 +2564,23 @@ mod tests {
         let events = p.line(&other.to_string());
         assert!(!p.session_missing);
         assert!(matches!(events.as_slice(), [AgentEvent::Error { message, .. }] if message.contains("error_during_execution")), "{events:?}");
+    }
+
+    /// #2042: a conversation too long to take another message is refused the same way however
+    /// often it's resumed, so it is left behind like one that isn't here.
+    #[test]
+    fn a_session_that_has_grown_too_long_is_left_behind() {
+        let full = json!({"type":"result","subtype":"success","is_error":true,"num_turns":1,"session_id":"39b5b312-5678-1234-961c-32112666ffab","total_cost_usd":0,"result":"Prompt is too long"});
+        let mut p = StreamParser::new(adapter_for("claude-code"));
+        let events = p.line(&full.to_string());
+        assert!(p.session_missing);
+        let [AgentEvent::Error { message, remediation: Some(fix), .. }] = events.as_slice() else { panic!("{events:?}") };
+        assert!(message.contains("grown too long") && fix.contains("Ask again"), "{message} / {fix}");
+        // The words inside another failure's text aren't that refusal.
+        let other = json!({"type":"result","subtype":"success","is_error":true,"num_turns":3,"result":"The tool said: Prompt is too long"});
+        let mut p = StreamParser::new(adapter_for("claude-code"));
+        p.line(&other.to_string());
+        assert!(!p.session_missing);
     }
 
     /// #451: Claude Code's session is found wherever it ran, and only by a real id.

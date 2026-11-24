@@ -18,19 +18,29 @@ const SECRET: &str = "tok-SECRET-123";
 
 /// Start a fake CDP endpoint. Returns (endpoint url, a flag set true once a WS connection closed).
 fn fake_cdp() -> (String, Arc<AtomicBool>) {
+    let (url, ws_seen, _) = fake_cdp_with_dialogs(false);
+    (url, ws_seen)
+}
+
+/// Like [`fake_cdp`], with an optional `Page.javascriptDialogOpening` on Page.enable.
+/// The third flag is set when the client answers it with `Page.handleJavaScriptDialog`.
+fn fake_cdp_with_dialogs(dialog: bool) -> (String, Arc<AtomicBool>, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let url = format!("http://127.0.0.1:{port}");
     let ws_seen = Arc::new(AtomicBool::new(false));
     let ws_seen2 = ws_seen.clone();
+    let dialog_answered = Arc::new(AtomicBool::new(false));
+    let dialog_answered2 = dialog_answered.clone();
     std::thread::spawn(move || {
         for s in listener.incoming() {
             let Ok(stream) = s else { break };
             let seen = ws_seen2.clone();
-            std::thread::spawn(move || serve(stream, port, seen));
+            let answered = dialog_answered2.clone();
+            std::thread::spawn(move || serve(stream, port, seen, answered, dialog));
         }
     });
-    (url, ws_seen)
+    (url, ws_seen, dialog_answered)
 }
 
 fn read_headers(stream: &mut TcpStream) -> (String, Vec<(String, String)>) {
@@ -59,7 +69,7 @@ fn http_json(stream: &mut TcpStream, body: &str) {
     let _ = stream.write_all(resp.as_bytes());
 }
 
-fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>) {
+fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, dialog_answered: Arc<AtomicBool>, dialog: bool) {
     let (request_line, headers) = read_headers(&mut stream);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     if path.starts_with("/json/version") {
@@ -87,7 +97,7 @@ fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>) {
         let accept = ws_accept(&key);
         let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
         let _ = stream.write_all(resp.as_bytes());
-        serve_ws(&mut stream);
+        serve_ws(&mut stream, dialog_answered, dialog);
         ws_seen.store(true, Ordering::Relaxed);
         return;
     }
@@ -154,8 +164,9 @@ fn ws_write(stream: &mut TcpStream, text: &str) {
     let _ = stream.write_all(&frame);
 }
 
-fn serve_ws(stream: &mut TcpStream) {
+fn serve_ws(stream: &mut TcpStream, dialog_answered: Arc<AtomicBool>, dialog: bool) {
     let bundle = craft_anything_testkit::electron::WEBPACK_BUNDLE;
+    let mut dialog_sent = false;
     while let Some(msg) = ws_read(stream) {
         let req: Value = match serde_json::from_str(&msg) {
             Ok(v) => v,
@@ -163,6 +174,9 @@ fn serve_ws(stream: &mut TcpStream) {
         };
         let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
         let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        if method == "Page.handleJavaScriptDialog" {
+            dialog_answered.store(true, Ordering::Relaxed);
+        }
         // Reply to the command.
         let result = match method.as_str() {
             "DOM.getDocument" => json!({"root": {"nodeId": 1, "nodeType": 9, "nodeName": "#document", "children": [
@@ -205,6 +219,11 @@ fn serve_ws(stream: &mut TcpStream) {
             _ => json!({}),
         };
         ws_write(stream, &json!({"id": id, "result": result}).to_string());
+        // One page-opened confirm after Page.enable, which is what delivers the dialog event.
+        if dialog && !dialog_sent && method == "Page.enable" {
+            dialog_sent = true;
+            ws_write(stream, &json!({"method": "Page.javascriptDialogOpening", "params": {"type": "confirm", "message": "Delete everything?"}}).to_string());
+        }
         // A navigation brings one event of every family the walkthrough can record, and a request.
         if method == "Page.navigate" {
             for ev in [
@@ -244,6 +263,117 @@ fn serve_ws(stream: &mut TcpStream) {
             }}).to_string());
         }
     }
+}
+
+/// Wait briefly for the fake server to read the answer the client sent.
+fn wait_answered(flag: &AtomicBool) -> bool {
+    for _ in 0..100 {
+        if flag.load(Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
+#[test]
+fn web_page_show_answers_a_page_dialog_and_reports_it() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = call(&e, "web_page_show", json!({"cdp_endpoint": url, "watch_ms": 100})).unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
+}
+
+#[test]
+fn a_walkthrough_answers_a_page_dialog_and_reports_it() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = e
+        .call(
+            "web_walkthrough_record",
+            json!({"cdp_endpoint": url, "actions": [{"kind": "wait", "ms": 1}]}),
+            CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted),
+        )
+        .map(|o| o.to_json())
+        .unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
+}
+
+#[test]
+fn coverage_answers_a_page_dialog_and_reports_it() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = e
+        .call("web_coverage_measure", json!({"cdp_endpoint": url, "watch_ms": 1}), CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted))
+        .map(|o| o.to_json())
+        .unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
+}
+
+#[test]
+fn listeners_report_a_page_dialog() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = call(&e, "web_listeners_list", json!({"cdp_endpoint": url, "selector": "button"})).unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
+}
+
+#[test]
+fn module_trace_reports_a_page_dialog() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = call(&e, "web_modules_trace", json!({"cdp_endpoint": url, "watch_ms": 50})).unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
+}
+
+#[test]
+fn bundle_analysis_answers_a_page_dialog_and_reports_it() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = call(&e, "web_page_js_analyze", json!({"cdp_endpoint": url, "watch_ms": 100})).unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
+}
+
+#[test]
+fn page_watch_answers_a_page_dialog_and_reports_it() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = call(&e, "web_page_watch", json!({"cdp_endpoint": url, "watch_ms": 100})).unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
+}
+
+#[test]
+fn webmcp_discovery_answers_a_page_dialog_and_reports_it() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = call(&e, "web_mcp_tools_list", json!({"cdp_endpoint": url, "watch_ms": 10})).unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
+}
+
+#[test]
+fn screenshot_answers_a_page_dialog_and_reports_it() {
+    let (url, _ws_seen, answered) = fake_cdp_with_dialogs(true);
+    let e = Engine::new(crate::testing::session());
+    let v = call(&e, "web_page_screenshot_take", json!({"cdp_endpoint": url})).unwrap();
+    assert_eq!(v["result"]["dialogs"], json!([{"type": "confirm", "message": "Delete everything?", "answered": "dismissed"}]));
+    assert!(v["summary"].as_str().unwrap().contains("confirm question"), "{}", v["summary"]);
+    assert!(wait_answered(&answered), "the page's confirm must be answered so the page can go on");
 }
 
 /// A 1×1 transparent PNG, base64 (for screenshot tests).
@@ -343,6 +473,10 @@ fn walkthrough_keeps_requested_network_content_redacted() {
     assert_eq!(req["response_header_values"]["set-cookie"], "«redacted»");
     assert_eq!(req["response_body"]["text"], "{\"id\":1,\"secret\":\"x\"}");
     assert_eq!(req["response_body"]["sha256"].as_str().unwrap().len(), 64);
+    let bodies = &v["result"]["network"]["response_bodies"];
+    assert_eq!(bodies["kept"], bodies["requests"], "{bodies}");
+    assert_eq!((bodies["past_cap"].as_u64(), bodies["after_deadline"].as_u64(), bodies["unreadable"].as_u64()), (Some(0), Some(0), Some(0)), "{bodies}");
+    assert!(!v["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "response_bodies_partial"));
 
     let err = run(json!({"capture_network": false, "keep_bodies": {"response_body": true}})).unwrap_err();
     assert!(err.message.contains("capture_network"), "{}", err.message);
@@ -526,6 +660,24 @@ fn inspect_page_minimises_and_redacts() {
     // The response Set-Cookie header is reported only by presence, never by value.
     assert!(reqs.iter().any(|r| r["response_headers"]["credentials_present"].as_array().map(|a| a.iter().any(|c| c == "set-cookie")).unwrap_or(false)));
     assert_eq!(v["authority"], "earlier-record");
+}
+
+#[test]
+fn skipped_kept_bodies_become_a_limitation() {
+    use super::kept_body_limitation;
+    let tally = |kept: u64, past_cap: u64, after_deadline: u64, unreadable: u64| {
+        json!({"response_bodies": {"requests": kept + past_cap + after_deadline + unreadable, "kept": kept,
+            "past_cap": past_cap, "after_deadline": after_deadline, "unreadable": unreadable}})
+    };
+    let l = kept_body_limitation(&tally(200, 48, 0, 0)).unwrap();
+    assert_eq!(l.code, "response_bodies_partial");
+    assert!(l.message.contains("200 of 248 requests kept a response body"), "{}", l.message);
+    assert!(l.message.contains("48 past the first 200 requests"), "{}", l.message);
+    let l = kept_body_limitation(&tally(10, 0, 3, 2)).unwrap();
+    assert!(l.message.contains("3 after the run's deadline and 2 whose body the browser couldn't return"), "{}", l.message);
+    assert!(kept_body_limitation(&tally(2, 0, 0, 0)).is_none());
+    assert!(kept_body_limitation(&json!({})).is_none(), "no tally when bodies weren't asked for");
+    assert!(kept_body_limitation(&Value::Null).is_none());
 }
 
 #[test]

@@ -82,13 +82,14 @@ fn without_message(args: &[String]) -> Vec<String> {
         } else if arg.starts_with("--message=") || arg.starts_with("--msg=") || arg.starts_with("--ms=") {
             // Joined to its message: nothing of it is kept.
         } else if let Some(group) = arg.strip_prefix('-').filter(|g| !g.starts_with('-')) {
-            let rest = group.trim_start_matches(['v', 'h']);
+            let (flags, after) = group.split_at(group.len() - group.trim_start_matches(['v', 'h']).len());
+            // Python 3.10's argparse also reads `-v=m` as `-v -m` (3.11 on refuses it).
+            let rest = after.strip_prefix('=').filter(|_| flags.len() == 1).unwrap_or(after);
             match rest.strip_prefix('m') {
                 Some(joined) => {
                     if joined.is_empty() {
                         it.next();
                     }
-                    let flags = &group[..group.len() - rest.len()];
                     if !flags.is_empty() {
                         kept.push(format!("-{flags}"));
                     }
@@ -169,9 +170,177 @@ impl AgentAdapter for Aider {
         )
     }
 
+    fn check_remote_options(&self, options: &BackendOptions, host: &str, stop: &Stop) -> Result<(), ToolError> {
+        stop.check()?;
+        let stop = stop.clone();
+        let args = crate::ssh::ssh_line_args(host, remote_setup_line(options));
+        let out =
+            match Process::new("ssh").args(&args).timeout(std::time::Duration::from_secs(15)).stdout_cap(1024).cancel_when(move || stop.is_stopped()).run() {
+                Ok(out) => out,
+                Err(e) if e.code == ErrorCode::Cancelled => return Err(e),
+                Err(e) => {
+                    // A check that can't run says nothing about Aider: let the run fail with ssh's
+                    // own error, as it did before this check existed.
+                    log::warn!("couldn't check Aider's setup on {host}: {}; starting the run anyway", e.message);
+                    return Ok(());
+                }
+            };
+        remote_setup_status(host, &out)
+    }
+
+    fn remote_run_env(&self) -> Option<(&'static str, String)> {
+        Some(("BROWSER", "true".into()))
+    }
+
     /// Nothing Aider offers to open is worth a page during a run, offline or not.
     fn process(&self, program: &str) -> Process {
         Process::new(program).env("BROWSER", "true")
+    }
+}
+
+/// Determine only whether the SSH account can start Aider without browser sign-in. Shell
+/// arguments contain booleans and the optional dotenv path, never the model or credential values.
+/// The remote scan reads regular files only and reports its decision by exit status.
+fn remote_setup_line(options: &BackendOptions) -> String {
+    let model = configured_model(options, &|_| None, &Files::for_run(None, None, None));
+    let mode = match model.as_deref() {
+        Some(model) if model.starts_with("openrouter/") => "openrouter",
+        Some(_) => "configured",
+        None => "discover",
+    };
+    let openrouter = key_in_args(&options.args, "OPENROUTER_API_KEY");
+    let any_key = DEFAULT_MODEL_KEYS.iter().any(|key| key_in_args(&options.args, key));
+    let args = [
+        mode,
+        if openrouter { "1" } else { "0" },
+        if any_key { "1" } else { "0" },
+        &flag_value(&options.args, "--env-file").unwrap_or_default(),
+        &SETTINGS_FILE_CAP.to_string(),
+        &DEFAULT_MODEL_KEYS.join(" "),
+    ];
+    let script = crate::ssh::shell_quote(REMOTE_SETUP);
+    let args = args.into_iter().map(crate::ssh::shell_quote).collect::<Vec<_>>().join(" ");
+    format!("sh -c {script} aider-setup {args} </dev/null >/dev/null 2>&1")
+}
+
+const REMOTE_SETUP: &str = r#"
+command -v awk >/dev/null && command -v wc >/dev/null || exit 12
+# The SSH runner starts Aider in the login folder; ~/.env is also the default dotenv.
+small_file() {
+    [ -n "$1" ] || return 1
+    [ -e "$1" ] || return 1
+    [ -f "$1" ] || return 1
+    # An existing settings file that can't be read or measured is an error, not "absent".
+    [ -r "$1" ] || exit 13
+    bytes=$(wc -c < "$1") || exit 13
+    [ "$bytes" -le "$2" ]
+}
+# Keep the selected dotenv path literal, even if it begins with a dash.
+file=$4
+case "$file" in ""|/*) ;; *) file="./$file";; esac
+env_file=/dev/null
+home_env=/dev/null
+oauth=/dev/null
+conf=/dev/null
+if small_file "$file" "$5"; then env_file=$file; fi
+if small_file "$HOME/.env" "$5"; then home_env=$HOME/.env; fi
+if small_file "$HOME/.aider/oauth-keys.env" "$5"; then oauth=$HOME/.aider/oauth-keys.env; fi
+if small_file "$HOME/.aider.conf.yml" "$5"; then conf=$HOME/.aider.conf.yml; fi
+awk -v mode="$1" -v router="$2" -v any="$3" -v keys="$6" '
+function trim(s) {
+    sub(/^[[:space:]]+/, "", s)
+    sub(/[[:space:]]+$/, "", s)
+    return s
+}
+function value(s) {
+    s=trim(s)
+    if (s ~ /^#/) return ""
+    if (s !~ /^["\047]/) sub(/ #.*/, "", s)
+    s=trim(s)
+    gsub(/^["\047]+|["\047]+$/, "", s)
+    return s
+}
+function dotenv(file,    line, key, v, eq, r) {
+    while ((r = (getline line < file)) > 0) {
+        line=trim(line)
+        sub(/^export /, "", line)
+        eq=index(line, "=")
+        if (!eq) continue
+        key=trim(substr(line, 1, eq-1))
+        v=value(substr(line, eq+1))
+        if (v != "") dot[key]=v
+    }
+    if (r < 0) failed=1
+    close(file)
+}
+function config(file,    line, key, eq, r, items, n, i, p, parts) {
+    while ((r = (getline line < file)) > 0) {
+        if (line ~ /^model:/ && conf_model == "") conf_model=value(substr(line, 7))
+        if (line ~ /^(api-key|set-env):[[:space:]]*\[/) {
+            items=line
+            sub(/^(api-key|set-env):[[:space:]]*\[/, "", items)
+            sub(/\][[:space:]]*(#.*)?$/, "", items)
+            n=split(items, parts, ",")
+            for (i=1; i<=n; i++) {
+                p=value(parts[i])
+                eq=index(p, "=")
+                if (eq && trim(substr(p, eq+1)) != "") configured[substr(p, 1, eq-1)]=1
+            }
+            continue
+        }
+        line=trim(line)
+        sub(/^-+/, "", line)
+        line=value(line)
+        eq=index(line, "=")
+        if (eq && trim(substr(line, eq+1)) != "") configured[substr(line, 1, eq-1)]=1
+    }
+    if (r < 0) failed=1
+    close(file)
+}
+function has_key(key,    provider) {
+    provider=key
+    sub(/_API_KEY$/, "", provider)
+    return dot[key] != "" || dot["AIDER_" key] != "" || trim(ENVIRON[key]) != "" ||
+        trim(ENVIRON["AIDER_" key]) != "" || configured[key] || configured[tolower(provider)]
+}
+BEGIN {
+    # Later files win, as Aider loads them: saved sign-in keys, the home .env, then --env-file.
+    # Within one file the last assignment wins, as python-dotenv reads it.
+    dotenv(ARGV[3]); dotenv(ARGV[2]); dotenv(ARGV[1]); config(ARGV[4])
+    model=dot["AIDER_MODEL"]
+    if (model == "") model=trim(ENVIRON["AIDER_MODEL"])
+    if (model == "") model=conf_model
+    if (mode == "openrouter" || (mode == "discover" && model ~ /^openrouter\//))
+        exit (router || has_key("OPENROUTER_API_KEY")) ? 0 : 11
+    if (mode == "configured" || model != "" || any) exit 0
+    split(keys, defaults, " ")
+    for (i in defaults) if (has_key(defaults[i])) exit 0
+    exit 10
+}' "$env_file" "$home_env" "$oauth" "$conf"
+"#;
+
+fn remote_setup_status(host: &str, out: &craft_anything_platform::Output) -> Result<(), ToolError> {
+    if out.success {
+        return Ok(());
+    }
+    // Only the two definite answers refuse. Anything else (missing awk or wc, an unreadable file,
+    // no POSIX sh, a login shell that fails) says nothing about whether Aider would wait at a
+    // sign-in, so the run goes ahead and fails later with ssh's or Aider's own error.
+    match out.code {
+        Some(10) => Err(ToolError::new(ErrorCode::BadSettings, format!("On {host}, Aider has no model or API key set up."))
+            .with_remediation("Set a model or API key in Aider's ~/.env, ~/.aider.conf.yml or ~/.aider/oauth-keys.env on that computer.")),
+        Some(11) => Err(ToolError::new(ErrorCode::BadSettings, format!("On {host}, Aider needs an OpenRouter API key for its selected model."))
+            .with_remediation("Set OPENROUTER_API_KEY in ~/.env or ~/.aider/oauth-keys.env on that computer, or select another model.")),
+        other => {
+            let reason = match other {
+                Some(12) => "awk or wc isn't available".to_string(),
+                Some(13) => "a settings file couldn't be read".to_string(),
+                Some(code) => format!("the check exited with code {code}"),
+                None => "the check ended without an exit code".to_string(),
+            };
+            log::warn!("couldn't check Aider's setup on {host}: {reason}; starting the run anyway");
+            Ok(())
+        }
     }
 }
 
@@ -265,6 +434,15 @@ fn model_in_conf(text: &str) -> Option<String> {
 /// Whether `name` is set by Aider's own `--api-key provider=KEY` or `--set-env NAME=VALUE`.
 fn key_in_args(args: &[String], name: &str) -> bool {
     args.iter().enumerate().any(|(i, arg)| {
+        // Aider's dedicated flags carry the key itself: --openai-api-key KEY or --openai-api-key=KEY.
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        if let Some(provider) = flag.strip_prefix("--").and_then(|f| f.strip_suffix("-api-key")).filter(|p| !p.is_empty()) {
+            let key = match arg.split_once('=') {
+                Some((_, key)) => key,
+                None => args.get(i + 1).map(String::as_str).unwrap_or_default(),
+            };
+            return format!("{}_API_KEY", provider.to_ascii_uppercase()) == name && !key.trim().is_empty();
+        }
         let (flag, value) = if let Some(v) = arg.strip_prefix("--api-key=") {
             ("--api-key", v)
         } else if let Some(v) = arg.strip_prefix("--set-env=") {
@@ -306,9 +484,18 @@ fn env_file_value(text: &str, name: &str) -> Option<String> {
 /// A `provider=KEY` or `NAME=VALUE` list item in Aider's config (`api-key:` / `set-env:`).
 fn conf_sets_key(text: &str, name: &str) -> bool {
     let provider = name.strip_suffix("_API_KEY").unwrap_or(name).to_ascii_lowercase();
+    let sets = |item: &str| {
+        let item = item.trim().trim_matches(['"', '\'']);
+        [name, provider.as_str()].iter().any(|n| item.strip_prefix(*n).and_then(|rest| rest.strip_prefix('=')).is_some_and(|v| !v.trim().is_empty()))
+    };
     text.lines().any(|line| {
-        let line = line.trim().trim_start_matches('-').trim().trim_matches(['"', '\'']);
-        [name, provider.as_str()].iter().any(|n| line.strip_prefix(*n).and_then(|rest| rest.strip_prefix('=')).is_some_and(|v| !v.trim().is_empty()))
+        let line = line.trim();
+        if let Some(list) = line.strip_prefix("api-key:").or_else(|| line.strip_prefix("set-env:")) {
+            let list = list.trim().strip_prefix('[').unwrap_or(list.trim());
+            let list = list.split(']').next().unwrap_or(list);
+            return list.split(',').any(sets);
+        }
+        sets(line.trim_start_matches('-').trim())
     })
 }
 
@@ -380,7 +567,10 @@ mod tests {
             assert_eq!(&a[a.len() - 2..], ["--message-file".to_string(), file.display().to_string()]);
         }
         // In a group after flags that take no value: the message goes, the flags stay.
-        for group in [&["-vm", "old task", "--architect"][..], &["-vhmold task", "--architect"]] {
+        // Python 3.10 also reads `-v=m` as `-v -m`.
+        for group in
+            [&["-vm", "old task", "--architect"][..], &["-vhmold task", "--architect"], &["-v=m", "old task", "--architect"], &["-v=mold task", "--architect"]]
+        {
             let a = args_with(true, &saved(group), Some(file));
             assert!(!a.iter().any(|x| x.contains("old task") || x.contains('m') && x.starts_with('-') && !x.starts_with("--")), "{group:?}: {a:?}");
             assert!(a.contains(&"--architect".to_string()), "{a:?}");
@@ -411,6 +601,140 @@ mod tests {
     /// The files of a run outside any project, with this home folder.
     fn at_home(home: Option<&Path>) -> Files {
         Files::for_run(None, home, None)
+    }
+
+    /// Run the on-host setup script exactly as `check_remote_options` does, with a fixture home
+    /// and only the environment a remote shell would see.
+    #[cfg(unix)]
+    fn run_remote_setup(home: &Path, options: &BackendOptions, env: &[(&str, &str)]) -> craft_anything_platform::Output {
+        let mut proc = Process::new("sh")
+            .args(["-c", &remote_setup_line(options)])
+            .cwd(home)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", home.as_os_str())
+            .timeout(std::time::Duration::from_secs(5));
+        for (key, value) in env {
+            proc = proc.env(key, value);
+        }
+        proc.run().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_remote_setup_check_uses_host_settings_and_keeps_credentials_there() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let bare = BackendOptions::default();
+        let result = run_remote_setup(home, &bare, &[]);
+        assert_eq!(result.code, Some(10));
+        let error = remote_setup_status("fixture", &result).unwrap_err();
+        assert!(error.message.contains("On fixture"));
+        assert!(result.stdout.is_empty() && result.stderr.is_empty(), "only the exit status crosses");
+
+        std::fs::write(home.join(".aider.conf.yml"), "model: openrouter/fixture\n").unwrap();
+        assert_eq!(run_remote_setup(home, &bare, &[]).code, Some(11));
+        std::fs::write(home.join(".aider.conf.yml"), "model: openrouter/fixture\napi-key: [\"openrouter=sk-test\"] # mine\n").unwrap();
+        assert!(run_remote_setup(home, &bare, &[]).success, "a flow-style api-key list on the host counts");
+        std::fs::write(home.join(".aider.conf.yml"), "model: openrouter/fixture\n").unwrap();
+
+        let oauth = home.join(".aider");
+        std::fs::create_dir(&oauth).unwrap();
+        std::fs::write(oauth.join("oauth-keys.env"), "OPENROUTER_API_KEY=sk-test\n").unwrap();
+        assert!(run_remote_setup(home, &bare, &[]).success);
+        std::fs::remove_file(oauth.join("oauth-keys.env")).unwrap();
+
+        std::fs::write(home.join(".env"), "OPENROUTER_API_KEY=sk-test # fixture\n").unwrap();
+        assert!(run_remote_setup(home, &bare, &[]).success);
+        std::fs::remove_file(home.join(".env")).unwrap();
+        std::fs::remove_file(home.join(".aider.conf.yml")).unwrap();
+
+        // The host's exported environment counts, not only the files.
+        assert!(run_remote_setup(home, &bare, &[("OPENAI_API_KEY", "sk-test")]).success);
+        assert!(run_remote_setup(home, &bare, &[("AIDER_MODEL", "ollama/fixture")]).success);
+        assert_eq!(run_remote_setup(home, &bare, &[("AIDER_MODEL", "openrouter/fixture")]).code, Some(11));
+        assert!(run_remote_setup(home, &bare, &[("AIDER_MODEL", "openrouter/fixture"), ("OPENROUTER_API_KEY", "sk-test")]).success);
+
+        let path = "-override 'name'.env";
+        std::fs::write(home.join(path), "AIDER_MODEL=ollama/fixture\n").unwrap();
+        let explicit_file = BackendOptions { args: vec!["--env-file".into(), path.into()], ..Default::default() };
+        assert!(run_remote_setup(home, &explicit_file, &[]).success);
+
+        let explicit_key = BackendOptions { args: vec!["--api-key".into(), "openrouter=sk-test".into()], ..Default::default() };
+        assert!(!remote_setup_line(&explicit_key).contains("sk-test"));
+        assert!(run_remote_setup(home, &explicit_key, &[]).success);
+        let dedicated = BackendOptions { args: vec!["--openrouter-api-key".into(), "sk-test".into()], ..Default::default() };
+        assert!(!remote_setup_line(&dedicated).contains("sk-test"));
+        assert!(run_remote_setup(home, &dedicated, &[]).success, "Aider's dedicated provider flag counts on the host");
+        assert_eq!(Aider.remote_run_env(), Some(("BROWSER", "true".into())));
+    }
+
+    /// python-dotenv keeps the last assignment in one file, and a named `--env-file` loads after
+    /// the home `.env`; both decide the remote status.
+    #[cfg(unix)]
+    #[test]
+    fn the_remote_setup_check_keeps_the_last_dotenv_assignment_and_the_named_file_last() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let bare = BackendOptions::default();
+        std::fs::write(home.join(".env"), "AIDER_MODEL=openrouter/fixture\nAIDER_MODEL=ollama/fixture\n").unwrap();
+        assert!(run_remote_setup(home, &bare, &[]).success, "the last assignment decides");
+
+        let path = "override.env";
+        std::fs::write(home.join(path), "AIDER_MODEL=gpt-4o\n").unwrap();
+        let named = BackendOptions { args: vec!["--env-file".into(), path.into()], ..Default::default() };
+        assert!(run_remote_setup(home, &named, &[]).success, "the named file loads after the home .env");
+        std::fs::write(home.join(path), "AIDER_MODEL=openrouter/fixture\n").unwrap();
+        assert_eq!(run_remote_setup(home, &named, &[]).code, Some(11), "the named file's OpenRouter model needs its key");
+    }
+
+    #[test]
+    fn a_stopped_run_does_not_start_the_remote_check() {
+        let stop = Stop::default();
+        stop.stop();
+        let err = Aider.check_remote_options(&BackendOptions::default(), "fixture.invalid", &stop).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Cancelled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_settings_file_does_not_block_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let settings = home.join(".env");
+        std::fs::write(&settings, "OPENAI_API_KEY=sk-test\n").unwrap();
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&settings).is_ok() {
+            // Root can read a 000 file; the check can't be exercised there.
+            return;
+        }
+        let result = run_remote_setup(home, &BackendOptions::default(), &[]);
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(result.code, Some(13), "a present file that can't be read isn't absent");
+        assert!(remote_setup_status("fixture", &result).is_ok(), "a check that can't read a file lets the run start");
+    }
+
+    /// A check that couldn't run says nothing about a sign-in, so only 10 and 11 refuse.
+    #[test]
+    fn only_the_two_definite_setup_answers_refuse() {
+        let output = |code: i32| craft_anything_platform::Output {
+            code: Some(code),
+            success: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration: std::time::Duration::ZERO,
+        };
+        for code in [10, 11] {
+            assert_eq!(remote_setup_status("fixture", &output(code)).unwrap_err().code, ErrorCode::BadSettings, "code {code}");
+        }
+        for code in [12, 13, 1, 255] {
+            assert!(remote_setup_status("fixture", &output(code)).is_ok(), "code {code} must not refuse");
+        }
     }
 
     #[test]
@@ -494,6 +818,15 @@ mod tests {
         let options = BackendOptions { args: vec!["--api-key".into(), "openrouter=sk-test".into()], ..Default::default() };
         assert!(key_in_args(&options.args, "OPENROUTER_API_KEY"));
         assert!(check_setup(&options, &|_| None, &at_home(None)).is_ok(), "a key in the arguments is enough for Aider to pick a model");
+        let options = BackendOptions { args: vec!["--openai-api-key".into(), "sk-test".into()], ..Default::default() };
+        assert!(key_in_args(&options.args, "OPENAI_API_KEY"), "a dedicated provider flag counts");
+        assert!(check_setup(&options, &|_| None, &at_home(None)).is_ok());
+        let options =
+            BackendOptions { args: vec!["--openrouter-api-key=sk-test".into(), "--model=openrouter/anthropic/claude-sonnet-4".into()], ..Default::default() };
+        assert!(key_in_args(&options.args, "OPENROUTER_API_KEY"), "a joined dedicated flag counts");
+        assert!(check_setup(&options, &|_| None, &at_home(None)).is_ok(), "a dedicated key covers an OpenRouter model");
+        let options = BackendOptions { args: vec!["--openai-api-key=".into()], ..Default::default() };
+        assert!(!key_in_args(&options.args, "OPENAI_API_KEY"), "an empty dedicated value doesn't count");
         let options = BackendOptions { args: vec!["--model=anthropic/claude-sonnet-4".into()], ..Default::default() };
         assert_eq!(model_in_args(&options.args).as_deref(), Some("anthropic/claude-sonnet-4"));
         assert!(check_setup(&options, &|_| None, &at_home(None)).is_ok());
@@ -520,6 +853,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".aider.conf.yml"), "api-key:\n  - openai=sk-test\n").unwrap();
         assert!(check_setup(&BackendOptions::default(), &|_| None, &at_home(Some(dir.path()))).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".aider.conf.yml"), "api-key: [openai=sk-test, anthropic=sk-test]\n").unwrap();
+        assert!(check_setup(&BackendOptions::default(), &|_| None, &at_home(Some(dir.path()))).is_ok(), "a flow-style api-key list counts");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".aider.conf.yml"), "model: openrouter/fixture\napi-key: [\"openrouter=sk-test\"] # mine\n").unwrap();
+        let openrouter = BackendOptions { cli_model: Some("openrouter/fixture".into()), ..Default::default() };
+        assert!(check_setup(&openrouter, &|_| None, &at_home(Some(dir.path()))).is_ok(), "a quoted flow item and its comment count");
     }
 
     /// A project's own settings count, where Aider itself reads them: the folder it runs in and the
