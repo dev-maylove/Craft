@@ -618,6 +618,9 @@ const USAGE_FLUSH: Duration = Duration::from_secs(60);
 /// How long a turn that ends early waits for the session to show what its finished tools wrote.
 const LEAVING_REFRESH_WAIT: Duration = Duration::from_secs(2);
 
+/// The longest wait, in seconds, between tries at a rate limit that gave no wait of its own (#2379).
+const RATE_LIMIT_WAIT: u64 = 5 * 60;
+
 /// Record `e` in the feed, send it and wake the window, under one lock.
 fn emit_event(feed: &Mutex<feed::FeedLog>, tx: &Sender<RunEvent>, wake: &Wake, e: RunEvent) {
     let mut feed = feed.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1346,7 +1349,7 @@ impl Worker {
         mut wait_for: impl FnMut(&CancelToken, u64) -> Result<(), ToolError>,
     ) -> Result<String, ToolError> {
         let mut prompt = prompt.to_string();
-        let mut tries = 0u64;
+        let (mut tries, mut limited) = (0u64, 0u64);
         let mut retry = false;
         // Kept across retries and the fresh start: whichever conversation is lost, every note
         // taken in this turn so far is one the feed already shows as delivered.
@@ -1377,8 +1380,21 @@ impl Worker {
                 // A missing session can only start fresh above, never resume. Only backend
                 // Error events become ProgramFailed here; a simultaneous backend failure must
                 // not make an inbox or workspace write failure retryable.
-                Err(e) if !lost && e.code == ErrorCode::ProgramFailed && tries < 3 && agent.last_failure().is_some_and(crate::TurnFailure::retryable) => {
-                    tries += 1;
+                // A rate limit lifts by itself, so it is waited out until the person stops (#2379);
+                // other retryable failures get three tries.
+                Err(e)
+                    if !lost
+                        && e.code == ErrorCode::ProgramFailed
+                        && let Some(failure) = agent.last_failure().filter(|f| f.retryable())
+                        && (tries < 3 || failure.kind == crate::FailureKind::RateLimited) =>
+                {
+                    let n = if failure.kind == crate::FailureKind::RateLimited {
+                        limited += 1;
+                        limited
+                    } else {
+                        tries += 1;
+                        tries
+                    };
                     let why = e.message.chars().take(160).collect::<String>();
                     // Typed status decides whether to retry. A display-only wait remains a
                     // compatibility hint, and never overrides a structured provider delay.
@@ -1391,7 +1407,7 @@ impl Worker {
                         }
                         None => {
                             self.step(ws, Step::Build, Status::Building, &format!("The builder stopped ({why}). Picking up where it left off…"))?;
-                            30 * tries
+                            (30 * n).min(RATE_LIMIT_WAIT)
                         }
                     };
                     wait_for(&self.stop, seconds)?;

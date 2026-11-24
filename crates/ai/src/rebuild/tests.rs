@@ -985,6 +985,26 @@ mod typed_retries {
         assert_eq!(agent.sent.len(), 1);
     }
 
+    /// #2379: a rate limit is waited out past the three tries, with capped waits, and a failure
+    /// after it still gets its own three.
+    #[test]
+    fn a_rate_limit_is_retried_until_it_lifts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "x", "Build a thing", TargetRef::None).unwrap();
+        let mut worker = check_worker(&ws, false);
+        let limited = Some(TurnFailure::new(FailureKind::RateLimited));
+        let busy = Some(TurnFailure::new(FailureKind::Transient));
+        let mut agent = FailingConversation::new([limited; 12].into_iter().chain([busy, busy, None]), false);
+        let mut waits = Vec::new();
+        let result = worker.turn_with_wait(&mut ws, &mut agent, "Build it", true, None, |_, seconds| {
+            waits.push(seconds);
+            Ok(())
+        });
+        assert_eq!(result.unwrap(), "Done");
+        assert_eq!(agent.sent.len(), 15, "every rate limit and both busy answers were tried again");
+        assert!(waits[..12].windows(2).all(|w| w[0] <= w[1]) && waits[0] < waits[11] && waits[10] == waits[11], "waits grow, then stop growing: {waits:?}");
+    }
+
     #[test]
     fn a_local_self_check_write_error_is_not_retried_as_a_backend_rate_limit() {
         #[derive(Clone)]
