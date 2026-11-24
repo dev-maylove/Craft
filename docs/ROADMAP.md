@@ -1493,6 +1493,15 @@ Owner: open · Status: in progress
       — claimed: gtxy27, branch `bugfix/r2.2-dsh-stdin`
 - [ ] DeepSeek Harness: no resume (its headless profile keeps no session), and a build on the harness's
       desktop profile is untried
+- [x] DeepSeek Harness: offer the models the person already set up in the desktop app, so Settings → AI
+      can choose one instead of only the harness's own default. The list comes from the desktop
+      profile's provider patch layer (`$DSH_HOME/profiles/desktop/cordis.patch.yml`) plus the models
+      every harness ships with; a chosen model travels in the same generated `--patch` overlay as our
+      tool server, which also brings those provider settings along and turns the key store back on
+      (the headless bundle leaves it off, so a key saved in the app was never seen: that is the
+      `MISSING_CREDENTIAL` a desktop-profile model run used to stop with). The harness has no
+      `--model` flag, so the overlay is the only route. Verified with adapter, model-list and overlay
+      tests and live turns on the desktop profile's own providers.
 - [x] Apply repeated client selections and aliases once, preserving their first selection order.
       — claimed: Plastic-time, branch rrfz/bugfix-r2.2-deduplicate-clients
 - [ ] `setup` writes the plain `mcp` command, so it drops an `--all-tools` an entry already has, and

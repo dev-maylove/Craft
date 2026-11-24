@@ -12,6 +12,12 @@
 //! folder can't be used to reach it.
 //! Its headless profile keeps no session to continue, so a build that stops starts again from the
 //! brief (as it does with the plain adapter).
+//!
+//! A model is chosen here too, though the headless profile takes no `--model`: the list is what the
+//! person set up in their desktop Harness profile (`profiles/desktop/cordis.patch.yml` under
+//! `$DSH_HOME`), and a chosen model travels in the same overlay, which also turns the saved-key
+//! store back on (the headless bundle leaves it off, so a key saved in the app is never seen) and
+//! borrows those providers' settings, so a run uses what the desktop app already uses.
 
 use super::*;
 
@@ -46,9 +52,18 @@ impl AgentAdapter for DeepSeekHarness {
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
         let mut v = cx.options.args.clone();
         v.extend(["--profile".into(), "headless".into()]);
-        // A question about a build may only read the project's files, so it gets no tool server.
-        if !cx.question {
-            v.extend(["--patch".into(), tool_server_patch(cx.mcp)]);
+        // A question about a build may only read the project's files, so it gets no tool server, and
+        // no model overlay either: the overlay is a file on this computer, and this adapter can't
+        // tell from here whether the run is on another one (an SSH backend's `ssh_host` isn't in
+        // `ArgsCx`). A question therefore behaves exactly as before a model could be chosen. It
+        // costs nothing today: questions go only to adapters that say they `answers_questions`, and
+        // this one doesn't, so the runner stops before it builds these arguments.
+        let mcp = (!cx.question).then_some(cx.mcp);
+        let model =
+            (!cx.question).then_some(cx.options.cli_model.as_deref()).flatten().filter(|m| !m.trim().is_empty() && *m != crate::anthropic::CLAUDE_CODE_DEFAULT);
+        if mcp.is_some() || model.is_some() {
+            let desktop = model.map(|_| read_desktop_patch().unwrap_or_default()).unwrap_or_default();
+            v.extend(["--patch".into(), run_patch(&overlay_yaml(mcp, model, &desktop))]);
         }
         // No task positional means stdin. Unlike `-`, this fails as a missing task on older
         // Harness versions without stdin support, rather than submitting a literal dash.
@@ -68,6 +83,29 @@ impl AgentAdapter for DeepSeekHarness {
     /// failed flag check keeps this adapter rather than falling back to the plain one.
     fn plain_fallback(&self) -> bool {
         false
+    }
+
+    fn model_in_use(&self, options: Option<&BackendOptions>) -> Option<String> {
+        Some(options.and_then(|options| options.cli_model.clone()).unwrap_or_else(|| "DeepSeek Harness default".into()))
+    }
+
+    /// The models set up in the person's desktop Harness profile, as `provider/model`, after the
+    /// headless profile's own default and the built-in DeepSeek models.
+    fn model_choices(&self, config: &BackendConfig, _options: &BackendOptions) -> Result<Vec<String>, ToolError> {
+        let mut models = vec![crate::anthropic::CLAUDE_CODE_DEFAULT.to_string()];
+        // A harness on another machine keeps its profile there, out of reach of this list.
+        let local = config.ssh_host.as_deref().is_none_or(|h| h.trim().is_empty());
+        if local && let Some(text) = read_desktop_patch() {
+            models.extend(desktop_models(&text));
+        }
+        models.extend(BUILT_IN_MODELS.iter().map(|m| m.to_string()));
+        let mut seen = std::collections::HashSet::new();
+        models.retain(|m| seen.insert(m.clone()));
+        Ok(models)
+    }
+
+    fn offers_own_default(&self) -> bool {
+        true
     }
 
     fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
@@ -124,10 +162,10 @@ fn private_dir() -> std::fs::DirBuilder {
 /// a path that isn't there, so the run fails at startup instead of building without the tool server
 /// it was promised; [`check_tool_server`](AgentAdapter::check_tool_server) reports the everyday
 /// causes first, with a fix.
-fn tool_server_patch(mcp: &McpCommand) -> String {
+fn run_patch(yaml: &str) -> String {
     let Ok(dir) = overlay_dir() else { return missing_overlay() };
     let path = dir.join(OVERLAY_FILE);
-    match craft_anything_platform::write_atomic_private(&path, overlay_yaml(mcp).as_bytes()) {
+    match craft_anything_platform::write_atomic_private(&path, yaml.as_bytes()) {
         Ok(()) => path.display().to_string(),
         Err(e) => {
             log::warn!("the DeepSeek Harness tool-server overlay couldn't be written: {}", e.message);
@@ -141,23 +179,198 @@ fn missing_overlay() -> String {
     std::env::temp_dir().join(format!("craft-anything-dsh-{}-missing.yml", std::process::id())).display().to_string()
 }
 
-/// The overlay in the harness's patch format: a list of loader entries, one server inserted.
-fn overlay_yaml(mcp: &McpCommand) -> String {
+/// Models every Harness ships with, as `provider/model`.
+const BUILT_IN_MODELS: &[&str] = &["deepseek-official/deepseek-flash", "deepseek-official/deepseek-v4-pro"];
+
+/// The person's desktop profile patch layer (`$DSH_HOME/profiles/desktop/cordis.patch.yml`), where
+/// the desktop app saves the model providers set up in it.
+fn read_desktop_patch() -> Option<String> {
+    let home = std::env::var_os("DSH_HOME").filter(|h| !h.is_empty()).map(std::path::PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join(".dsh")))?;
+    let text = std::fs::read_to_string(home.join("profiles").join("desktop").join("cordis.patch.yml")).ok()?;
+    Some(text.trim_start_matches('\u{feff}').to_string())
+}
+
+/// `provider/model` for each model a desktop patch layer names: the providers' model lists, the
+/// default model and the models allowed for helpers.
+fn desktop_models(patch: &str) -> Vec<String> {
+    use yaml_rust2::{Yaml, YamlLoader};
+    let Ok(docs) = YamlLoader::load_from_str(patch) else { return Vec::new() };
+    let Some(Yaml::Array(entries)) = docs.into_iter().next() else { return Vec::new() };
+    let pair = |e: &Yaml| match (e["provider"].as_str(), e["model"].as_str()) {
+        (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => Some(format!("{p}/{m}")),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for e in &entries {
+        let id = e["id"].as_str().unwrap_or_default();
+        if id.starts_with("llm-") {
+            let Some(providers) = e["config"]["providers"].as_hash() else { continue };
+            for (name, p) in providers {
+                let Some(name) = name.as_str() else { continue };
+                for m in p["models"].as_vec().map(Vec::as_slice).unwrap_or_default() {
+                    if let Some(model) = m["id"].as_str().or_else(|| m.as_str()) {
+                        out.push(format!("{name}/{model}"));
+                    }
+                }
+            }
+        } else if id == "agent-default-model" {
+            out.extend(pair(&e["config"]));
+        } else if id == "subagent-model-selection-settings" {
+            out.extend(e["config"]["allowedModels"].as_vec().map(Vec::as_slice).unwrap_or_default().iter().filter_map(pair));
+        }
+    }
+    out
+}
+
+/// The desktop layer's provider entries (ids starting `llm-`), as written, so the headless run
+/// knows the same providers.
+///
+/// An entry starts at the list's own indentation, which YAML lets sit anywhere, and runs until the
+/// next one: a line at that indentation opening an entry, or anything less indented (a comment, or
+/// the end). A deeper line belongs to the entry. Whether an entry is a provider is read from the
+/// patch's own parsed entries, as [`desktop_models`] reads it, so the two always agree on what a
+/// provider entry is: `name` before `id`, a `-` on a line of its own, any indentation, a
+/// column-zero comment above the list and an anchor declared by an earlier entry all behave.
+fn provider_entries(patch: &str) -> String {
+    let lines: Vec<&str> = patch.lines().map(|l| l.trim_end_matches('\r')).collect();
+    // The list's indentation: the least that opens an entry, so a patch indented as a whole still
+    // finds its entries. None: no entry at all, so there's nothing to copy.
+    let indent = |l: &str| l.len() - l.trim_start_matches(' ').len();
+    let Some(base) = lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim_start();
+            t == "-" || t.starts_with("- ")
+        })
+        .map(|l| indent(l))
+        .min()
+    else {
+        return String::new();
+    };
+    let mut entries: Vec<Vec<&str>> = Vec::new();
+    for line in &lines {
+        let t = line.trim_start();
+        let at_entry = indent(line) == base && (t == "-" || t.starts_with("- "));
+        if at_entry {
+            entries.push(vec![line]);
+        } else if indent(line) > base
+            && let Some(last) = entries.last_mut()
+        {
+            last.push(line);
+        }
+        // Anything else sits outside the list: a comment above or below it, which belongs to no entry.
+    }
+    // Written back at this overlay's own indentation (none), since it sits in the same list as the
+    // entries we add; the entry's own shape, and its comments, stay as they were. Only the entries
+    // are dedented: a line outside the list keeps every character it had.
+    let dedent = |l: &str| l.get(base.min(l.len())..).unwrap_or_default().to_string();
+    let texts: Vec<String> = entries.iter().map(|e| e.iter().map(|l| dedent(l)).collect::<Vec<_>>().join("\n")).collect();
+    // Which entry is a provider is read from the whole patch as it was written, not one entry at a
+    // time: an entry may use an anchor an earlier one defined (`{api: &api …}` then `{api: *api}`),
+    // and a parser handed that entry alone rejects the unknown anchor, which would silently leave
+    // out the very provider its models were listed from. The patch is parsed as given because it is
+    // already a valid document: dedenting it would also strip a column-zero comment's `#` when the
+    // list is indented, which breaks the parse and takes the anchors with it.
+    let ids: Vec<String> = yaml_rust2::YamlLoader::load_from_str(patch)
+        .ok()
+        .and_then(|docs| {
+            docs.first().and_then(yaml_rust2::Yaml::as_vec).map(|items| items.iter().map(|i| i["id"].as_str().unwrap_or_default().to_string()).collect())
+        })
+        .unwrap_or_default();
+    // The text split and the parsed document name the same entries whenever the split is right. When
+    // their counts differ the split and the parser disagree, so each entry is read on its own again:
+    // that still finds a self-contained one, and never pairs an entry with another's id.
+    let aligned = ids.len() == texts.len();
+    let is_provider = |i: usize, text: &str| {
+        let id = match ids.get(i).filter(|_| aligned) {
+            Some(id) => id.clone(),
+            None => yaml_rust2::YamlLoader::load_from_str(text)
+                .ok()
+                .and_then(|docs| {
+                    docs.first().and_then(yaml_rust2::Yaml::as_vec).and_then(|items| items.first()).and_then(|item| item["id"].as_str()).map(str::to_string)
+                })
+                .unwrap_or_default(),
+        };
+        id.starts_with("llm-")
+    };
+    // Copied in source order, so an anchor and the entry that declares it stay in that order.
+    //
+    // An anchor a provider uses may be declared by an entry that isn't one. Copying the provider
+    // alone would then leave `*api` with nothing to resolve, and the harness refuses the overlay
+    // outright (`found unknown anchor`), while `desktop_models` still offered that model. So an
+    // entry declaring an anchor a copied provider uses, without declaring it itself, is copied too.
+    // It is a provider in all but name at that point: leaving it out is what breaks the run.
+    let providers: Vec<usize> = texts.iter().enumerate().filter(|(i, text)| is_provider(*i, text)).map(|(i, _)| i).collect();
+    let missing = |i: usize| -> Vec<String> {
+        let owned = anchors_declared_in(&texts[i]);
+        aliases_used_in(&texts[i]).into_iter().filter(|a| !owned.contains(a)).collect()
+    };
+    let wanted: std::collections::HashSet<String> = providers.iter().flat_map(|i| missing(*i)).collect();
+    let keeps = |i: usize| providers.contains(&i) || (!wanted.is_empty() && anchors_declared_in(&texts[i]).iter().any(|a| wanted.contains(a)));
+    texts.iter().enumerate().filter(|(i, _)| keeps(*i)).map(|(_, text)| text.clone() + "\n").collect()
+}
+
+/// The anchors an entry declares (`&api`, `&base`), by name.
+fn anchors_declared_in(text: &str) -> Vec<String> {
+    name_after(text, '&')
+}
+
+/// The names an entry takes values from (`*api`), by name.
+fn aliases_used_in(text: &str) -> Vec<String> {
+    name_after(text, '*')
+}
+
+/// Every name written after `sigil`, in order, without repeats. Scanning the text is enough here
+/// because the question is only which entry mentions which name; a name a quoted string happens to
+/// contain names an anchor the patch has to declare anyway, so copying that entry stays right.
+fn name_after(text: &str, sigil: char) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(sigil) {
+        rest = &rest[at + sigil.len_utf8()..];
+        let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name.clone());
+        }
+        rest = &rest[name.len()..];
+    }
+    out
+}
+
+/// The overlay in the harness's patch format: a list of loader entries. It inserts our tool server,
+/// and for a chosen model brings in the desktop profile's providers, turns the saved-key store back
+/// on (the headless profile leaves it off) and makes the model the default.
+fn overlay_yaml(mcp: Option<&McpCommand>, model: Option<&str>, desktop: &str) -> String {
     let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let args: String = mcp.args.iter().map(|a| format!("\n          - {}", q(a))).collect();
-    format!(
-        "# Craft Anything's tool server for this run. Generated; safe to delete.\n\
-         - insert:\n    \
-           - id: {OVERLAY_ID}\n      \
-             name: '@deepseek-ai/dsh-mcp-client'\n      \
-             config:\n        \
-               serverName: {OVERLAY_SERVER}\n        \
-               transport: stdio\n        \
-               command: {}\n        \
-               args:{args}\n        \
-               toolCallTimeoutMs: 300000\n",
-        q(&mcp.command)
-    )
+    let mut out = String::from("# Craft Anything's overlay for this run. Generated; safe to delete.\n");
+    if let Some(mcp) = mcp {
+        let args: String = mcp.args.iter().map(|a| format!("\n          - {}", q(a))).collect();
+        out.push_str(&format!(
+            "- insert:\n    \
+               - id: {OVERLAY_ID}\n      \
+                 name: '@deepseek-ai/dsh-mcp-client'\n      \
+                 config:\n        \
+                   serverName: {OVERLAY_SERVER}\n        \
+                   transport: stdio\n        \
+                   command: {}\n        \
+                   args:{args}\n        \
+                   toolCallTimeoutMs: 300000\n",
+            q(&mcp.command)
+        ));
+    }
+    if let Some(model) = model {
+        let (provider, name) = model.split_once('/').unwrap_or(("deepseek-official", model));
+        out.push_str(&provider_entries(desktop));
+        // The headless bundle leaves the key store off ("one-shot jobs use launch-time credentials"),
+        // so a key saved in the app is never seen; a chosen model needs it, and only then.
+        out.push_str("- id: credentials\n  disabled: false\n");
+        out.push_str(&format!(
+            "- id: agent-default-model\n  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n    provider: {}\n    model: {}\n",
+            q(provider),
+            q(name)
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -288,8 +501,189 @@ mod tests {
     #[test]
     fn quotes_are_escaped_for_yaml() {
         let mcp = McpCommand { command: "cli's.exe".into(), args: vec!["--project".into(), r"C:\it's here".into()], notes: None };
-        let y = overlay_yaml(&mcp);
+        let y = overlay_yaml(Some(&mcp), None, "");
         assert!(y.contains("command: 'cli''s.exe'"), "{y}");
         assert!(y.contains("- 'C:\\it''s here'"), "{y}");
+    }
+
+    const DESKTOP: &str = "# comment\n\
+        - id: web\n  config:\n    searchProvider: tavily\n\
+        - id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n      openrouter:\n        models:\n          - id: meta/muse\n        api: openai-completions\n      claude:\n        # note\n        models:\n          - id: claude-x\n\
+        # between\n\
+        - id: agent-default-model\n  config:\n    provider: claude\n    model: claude-x\n\
+        - id: subagent-model-selection-settings\n  config:\n    allowedModels:\n      - provider: buddy\n        model: flash\n";
+
+    /// Every model the desktop profile names is offered, with its provider.
+    #[test]
+    fn desktop_models_are_listed_with_their_provider() {
+        let models = desktop_models(DESKTOP);
+        for m in ["openrouter/meta/muse", "claude/claude-x", "buddy/flash"] {
+            assert!(models.iter().any(|x| x == m), "{m} missing from {models:?}");
+        }
+        assert!(desktop_models("not: [yaml").is_empty());
+    }
+
+    /// A chosen model brings the desktop providers and becomes the default, and nothing else of
+    /// the desktop profile comes along.
+    #[test]
+    fn chosen_model_overlay_carries_providers_and_default() {
+        let y = overlay_yaml(None, Some("openrouter/meta/muse"), DESKTOP);
+        let docs = yaml_rust2::YamlLoader::load_from_str(&y).expect("overlay parses");
+        let entries = docs[0].as_vec().expect("a list");
+        let ids: Vec<&str> = entries.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"llm-pi-ai") && ids.contains(&"credentials"), "{y}");
+        assert!(!ids.contains(&"web") && !ids.contains(&"subagent-model-selection-settings"), "{y}");
+        let default = entries.iter().find(|e| e["id"].as_str() == Some("agent-default-model")).expect("default");
+        assert_eq!(default["config"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(default["config"]["model"].as_str(), Some("meta/muse"));
+    }
+
+    /// A chosen model never puts an overlay on a question's command line, so no path written here
+    /// can reach a harness that runs on another computer.
+    #[test]
+    fn a_question_gets_no_model_overlay_even_when_one_is_chosen() {
+        let options = BackendOptions { cli_model: Some("deepseek-official/deepseek-v4-pro".into()), ..Default::default() };
+        let (argv, _) = args(&options, true);
+        assert_eq!(argv, ["--profile", "headless"], "a question is unchanged by a chosen model: {argv:?}");
+    }
+
+    /// A provider entry is found however the list is indented, and only the providers are copied.
+    #[test]
+    fn provider_entries_follow_the_lists_indentation() {
+        // The same layer indented as a whole, as a person (or an editor) may leave it.
+        let indented: String = DESKTOP.lines().map(|l| format!("  {l}\n")).collect();
+        for patch in [DESKTOP.to_string(), indented] {
+            let y = overlay_yaml(None, Some("claude/claude-x"), &patch);
+            let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{patch:?}"));
+            let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+            assert!(ids.contains(&"llm-pi-ai"), "the provider entry is copied: {y}");
+            assert!(!ids.contains(&"web"), "other entries stay behind: {y}");
+        }
+    }
+
+    /// Which entry is a provider is decided by its own `id` key, so the same entry is copied
+    /// whether `name` comes before `id` or the dash stands on a line of its own: the two halves of
+    /// this adapter must never disagree about what a provider entry is.
+    #[test]
+    fn provider_entries_are_chosen_by_their_id_key_not_the_line_order() {
+        for provider in [
+            // `id` first, sharing the dash, as the desktop app writes it.
+            "- id: llm-pi-ai\n  config:\n    providers:\n      claude:\n        models:\n          - id: claude-x\n",
+            // `name` before `id`, the order this repo's own patch uses.
+            "- name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  id: llm-pi-ai\n  config:\n    providers:\n      claude:\n        models:\n          - id: claude-x\n",
+            // The dash alone, so the mapping starts on the next line.
+            "-\n  id: llm-pi-ai\n  config:\n    providers:\n      claude:\n        models:\n          - id: claude-x\n",
+        ] {
+            let patch = format!("{provider}- id: web\n  config:\n    searchProvider: tavily\n");
+            let models = desktop_models(&patch);
+            assert!(models.iter().any(|m| m == "claude/claude-x"), "listed: {models:?} from {patch:?}");
+            let y = overlay_yaml(None, Some("claude/claude-x"), &patch);
+            let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{y}"));
+            let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+            assert!(ids.contains(&"llm-pi-ai"), "the provider its models came from is copied too: {y}");
+            assert!(!ids.contains(&"web"), "a non-provider entry stays behind: {y}");
+        }
+    }
+
+    /// An entry may take a value from an anchor an earlier entry declared. A parser handed that
+    /// entry alone rejects the unknown anchor, so the copy must read the whole layer: otherwise the
+    /// second provider is left out while its models are still offered, and a run choosing one has
+    /// no provider to resolve it with.
+    #[test]
+    fn a_provider_using_an_earlier_entrys_anchor_is_still_copied() {
+        let patch = "- id: llm-one\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n      first: {api: &api openai-completions, baseURL: 'http://127.0.0.1:1/v1', models: [{id: one}]}\n\
+                     - id: llm-two\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n      second: {api: *api, baseURL: 'http://127.0.0.1:2/v1', models: [{id: two}]}\n\
+                     - id: web\n  config:\n    searchProvider: tavily\n";
+        // Both entries are offered, so choosing either has to bring its provider along.
+        let models = desktop_models(patch);
+        for m in ["first/one", "second/two"] {
+            assert!(models.iter().any(|x| x == m), "{m} is offered: {models:?}");
+        }
+        let y = overlay_yaml(None, Some("second/two"), patch);
+        let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{y}"));
+        let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"llm-one") && ids.contains(&"llm-two"), "both providers, the anchor's and its user's: {y}");
+        assert!(!ids.contains(&"web"), "a non-provider entry stays behind: {y}");
+        // Source order, so the anchor is still declared before the entry that uses it.
+        let first = ids.iter().position(|id| *id == "llm-one").expect("llm-one");
+        let second = ids.iter().position(|id| *id == "llm-two").expect("llm-two");
+        assert!(first < second, "the entry declaring the anchor comes first: {y}");
+    }
+
+    /// The three awkward shapes at once: the list indented, a column-zero comment above it, and the
+    /// second provider taking the first's anchor. The patch is read as written for the ids, so the
+    /// comment keeps its `#` and the anchors still resolve; dedenting a line outside the list would
+    /// turn `# desktop` into `desktop` and take the whole classification down with it.
+    #[test]
+    fn an_indented_list_under_a_column_zero_comment_keeps_its_anchors() {
+        // Written one line at a time, so the indentation is exactly what the test means: a comment
+        // at the margin, then the list two spaces in.
+        let patch = [
+            "# desktop profile",
+            "  - id: llm-one",
+            "    name: \"@deepseek-ai/dsh-llm-pi-ai\"",
+            "    config:",
+            "      providers:",
+            "        first: {api: &api openai-completions, models: [{id: one}]}",
+            "  - id: llm-two",
+            "    name: \"@deepseek-ai/dsh-llm-pi-ai\"",
+            "    config:",
+            "      providers:",
+            "        second: {api: *api, models: [{id: two}]}",
+            "  - id: web",
+            "    config:",
+            "      searchProvider: tavily",
+            "",
+        ]
+        .join("\n");
+        let models = desktop_models(&patch);
+        for m in ["first/one", "second/two"] {
+            assert!(models.iter().any(|x| x == m), "{m} is offered: {models:?}");
+        }
+        let y = overlay_yaml(None, Some("second/two"), &patch);
+        let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{y}"));
+        let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"llm-one") && ids.contains(&"llm-two"), "both providers survive the comment: {y}");
+        assert!(!ids.contains(&"web"), "a non-provider entry stays behind: {y}");
+        // Written back at the overlay's own indentation, so the copied entries are siblings.
+        let copied = y.split("- id: llm-one").nth(1).expect("the copied provider");
+        assert!(copied.lines().next().is_some_and(|l| !l.starts_with(' ')), "not nested under the entry above: {y}");
+    }
+
+    /// An anchor a provider uses may be declared by an entry that isn't a provider. Copying the
+    /// provider without that entry leaves `*api` undefined, and the harness refuses the overlay
+    /// (`found unknown anchor`) while the model was offered. The declaring entry has to come too,
+    /// or choosing that model builds an overlay that can't start.
+    #[test]
+    fn a_provider_using_an_excluded_entrys_anchor_brings_it_along() {
+        let patch = [
+            "- id: web",
+            "  config:",
+            "    api: &api openai-completions",
+            "    searchProvider: tavily",
+            "- id: llm-pi-ai",
+            "  name: \"@deepseek-ai/dsh-llm-pi-ai\"",
+            "  config:",
+            "    providers:",
+            "      custom:",
+            "        api: *api",
+            "        models: [{id: custom-model}]",
+            "",
+        ]
+        .join("\n");
+        assert!(desktop_models(&patch).iter().any(|m| m == "custom/custom-model"), "the model is offered");
+        let y = overlay_yaml(None, Some("custom/custom-model"), &patch);
+        // The overlay has to parse: that is the failure this guards against.
+        let docs = yaml_rust2::YamlLoader::load_from_str(&y).unwrap_or_else(|e| panic!("overlay parses: {e}\n{y}"));
+        let ids: Vec<&str> = docs[0].as_vec().expect("a list").iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"web") && ids.contains(&"llm-pi-ai"), "the declaring entry comes along: {y}");
+        // The declaring entry is copied whole rather than line by line: dropping the lines that
+        // don't declare the anchor would mean editing another person's YAML entry by guesswork,
+        // and a key we cut is a key the harness then misses. Its settings are inert here.
+        assert!(!ids.contains(&"agent-default-model") || y.contains("agent-default-model"), "{y}");
+        // The anchor is declared before the entry that uses it, or the parser would still refuse it.
+        let declared = y.find("&api").expect("the anchor");
+        let used = y.find("*api").expect("the alias");
+        assert!(declared < used, "the declaration comes first: {y}");
     }
 }
