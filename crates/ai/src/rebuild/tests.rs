@@ -5068,3 +5068,146 @@ fn the_stop_files_are_the_projects_own() {
     use craft_anything_engine::workspace::OWN_NAMES;
     assert!(OWN_NAMES.contains(&craft_anything_engine::tools::deep::STOPPED) && OWN_NAMES.contains(&craft_anything_engine::tools::deep::STOP_LOCK));
 }
+
+/// #2341: after a `for_a_run` build leaves its workspace investigation attached in the app's
+/// shared session (and even while that build is still running in its own engine), starting a
+/// "Just look inside" API or CLI chat on the app detaches the app's session before journaling or
+/// creating a shared investigation, without interrupting the run engine or affecting explicit
+/// non-detached chats targeting a project.
+#[test]
+fn build_detach_and_api_chat_keep_build_investigations_isolated() {
+    use crate::agent::tests::{Scripted, turn};
+    use crate::agent::{ApiConversation, EngineHost, LoopConfig, ModelSlot};
+    use crate::model::{Block, StopReason};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("app-cfg");
+    let app = Engine::shared(craft_anything_engine::Session::isolated(&cfg_dir), Vec::new());
+    let ws_a = Workspace::create(dir.path(), "ProjectA", "Build A", TargetRef::None).unwrap();
+    let ws_b = Workspace::create(dir.path(), "ProjectB", "Build B", TargetRef::None).unwrap();
+
+    let journal_text = |root: &std::path::Path| {
+        let dir = root.join("journal");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return String::new() };
+        entries.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).collect::<Vec<_>>().join("\n")
+    };
+    let run_turn = |engine: &Arc<Engine>, detach: bool, msg: &str| {
+        let seen = Arc::default();
+        let mut script = Scripted { turns: std::collections::VecDeque::new(), seen: Arc::clone(&seen) };
+        script.turns.push_back(turn(vec![Block::Text { text: "Looked inside.".into() }], StopReason::EndTurn));
+        let slot = ModelSlot {
+            name: "Scripted".into(),
+            model: Box::new(script),
+            local: false,
+            effort: None,
+            max_turns: 4,
+            context_tokens: 0,
+            tools: Default::default(),
+        };
+        let host = Arc::new(EngineHost(engine.clone()));
+        let mut conv = ApiConversation::start(host, vec![slot], LoopConfig { detach_workspace_investigation: detach, ..LoopConfig::default() }).unwrap();
+        conv.send(msg);
+        let mut events = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            for event in conv.poll() {
+                let err = matches!(event, AgentEvent::Error { .. });
+                let done = matches!(event, AgentEvent::TurnDone { .. });
+                events.push(event);
+                assert!(!err, "agent turn returned an unexpected error: {events:?}");
+                if done {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("agent turn timed out without TurnDone: {events:?}");
+    };
+
+    // 1. A `for_a_run` build attaches A to both its own run engine and the app's shared session.
+    //    Even while the build is running, starting an API "Just look inside" chat on the app
+    //    (`detach_workspace_investigation: true`) detaches A from the app session before
+    //    journaling user_message, while the run engine keeps writing into A uninterrupted.
+    {
+        let mut worker_a = check_worker(&ws_a, false);
+        worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
+        worker_a.attach(&ws_a).unwrap();
+        assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
+
+        run_turn(&app, true, "Question during build A");
+        assert!(app.session().project.is_none(), "Just look inside API chat detached A from the app session");
+        assert!(
+            !journal_text(&ws_a.investigation_dir()).contains("Question during build A"),
+            "Just look inside user_message must not leak into build A's journal"
+        );
+        assert_eq!(
+            worker_a.engine.session().project.as_ref().map(|p| p.root.clone()),
+            Some(ws_a.investigation_dir()),
+            "run engine keeps build A's investigation attached"
+        );
+        run_turn(&worker_a.engine, false, "Build A step continues");
+        assert!(
+            journal_text(&ws_a.investigation_dir()).contains("Build A step continues"),
+            "run engine keeps writing into build A's journal after app chat detached"
+        );
+    }
+
+    // 2. After a `for_a_run` build ends (its run engine is dropped) leaving A attached in the
+    //    app's shared session, starting an API or AgentCli "Just look inside" chat on the app
+    //    detaches A instead of writing into A's investigation.
+    {
+        let mut worker_a = check_worker(&ws_a, false);
+        worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
+        worker_a.attach(&ws_a).unwrap();
+    }
+    assert_eq!(app.session().project.as_ref().map(|p| p.root.clone()), Some(ws_a.investigation_dir()));
+    run_turn(&app, true, "Unrelated Just look inside question");
+    assert!(app.session().project.is_none(), "post-build API Just look inside chat detached A");
+    assert!(
+        !journal_text(&ws_a.investigation_dir()).contains("Unrelated Just look inside question"),
+        "post-build Just look inside user_message must not leak into build A's journal"
+    );
+
+    // Re-attach A via a finished `for_a_run` build and verify `AiHub::start_detached` creates a
+    // fresh `investigations/session-*.cany` store for an AgentCli chat.
+    {
+        let mut worker_a = check_worker(&ws_a, false);
+        worker_a.engine = app.for_a_run(craft_anything_engine::testing::session);
+        worker_a.attach(&ws_a).unwrap();
+    }
+    let hub = crate::AiHub::with_stores(app.clone(), cfg_dir.join("config.toml"), crate::KeyStore::file_only(cfg_dir.join("keys.toml")));
+    hub.add_backend(
+        crate::BackendConfig { name: "MissingCli".into(), kind: BackendKind::AgentCli, model: "copilot".into(), base_url: None, ssh_host: None, enabled: true },
+        None,
+    )
+    .unwrap();
+    hub.set_command("MissingCli", Some("definitely-missing-copilot-for-detach-test")).unwrap();
+    let mut detached_conv = hub.start_detached(Some("MissingCli"), false).unwrap();
+    detached_conv.send("Look inside something else");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if detached_conv.poll().iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    let current = app.session().project.as_ref().map(|p| p.root.clone());
+    assert_ne!(current, Some(ws_a.investigation_dir()), "AiHub::start_detached must not keep ws_a attached");
+    assert!(
+        current.as_ref().is_some_and(|p| p.starts_with(cfg_dir.join("investigations"))),
+        "AiHub::start_detached created a fresh session investigation: {current:?}"
+    );
+
+    // 3. An explicit non-detached API chat (`detach_workspace_investigation: false`, as used by
+    //    `craft-anything-cli --project <B>/investigation.cany chat`) keeps B attached and writes
+    //    its journal entry into B.
+    let project_b = Project::open(&ws_b.investigation_dir()).or_else(|_| Project::create(&ws_b.investigation_dir(), "ProjectB", Purpose::default())).unwrap();
+    app.session().open_project(project_b).unwrap();
+    run_turn(&app, false, "Keep in project B");
+    assert_eq!(
+        app.session().project.as_ref().map(|p| p.root.clone()),
+        Some(ws_b.investigation_dir()),
+        "chat targeting project B keeps B's investigation attached"
+    );
+    assert!(journal_text(&ws_b.investigation_dir()).contains("Keep in project B"), "project B chat writes into B's journal");
+}

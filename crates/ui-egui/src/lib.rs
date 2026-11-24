@@ -476,6 +476,8 @@ pub struct CraftApp {
     pub view: SessionView,
     pub jobs: jobs::Jobs<Done>,
     pub conversation: Option<Box<dyn Conversation>>,
+    /// Whether `conversation` was started with workspace detachment (Beginner Ask vs workbench).
+    conversation_detaches: bool,
     pub backends: Vec<BackendConfig>,
     /// Each backend's options (an agent app's program and model), by name (Settings → AI).
     pub backend_options: std::collections::BTreeMap<String, craft_anything_ai::BackendOptions>,
@@ -636,6 +638,7 @@ impl CraftApp {
             view: SessionView::default(),
             jobs: jobs::Jobs::default(),
             conversation: None,
+            conversation_detaches: false,
             backends: Vec::new(),
             backend_options: Default::default(),
             program_replaced: Default::default(),
@@ -960,15 +963,15 @@ impl CraftApp {
                 bytes: t.target.bytes.clone(),
             })
             .collect();
+        let ledger_changed = self.view_dirty
+            || self.view.ledger_len != s.ledger_len()
+            || self.view.ledger.first().map(|e| &e.id) != s.ledger().next().map(|e| &e.id)
+            || self.view.project.as_deref() != s.project.as_ref().map(|p| p.meta.name.as_str());
         let view = SessionView {
             targets,
             active: s.active_id().cloned(),
             clean_room: s.clean_room(),
-            ledger: if self.view_dirty || self.view.ledger_len != s.ledger_len() {
-                s.ledger().take(LEDGER_VIEW_CAP).cloned().collect()
-            } else {
-                std::mem::take(&mut self.view.ledger)
-            },
+            ledger: if ledger_changed { s.ledger().take(LEDGER_VIEW_CAP).cloned().collect() } else { std::mem::take(&mut self.view.ledger) },
             ledger_len: s.ledger_len(),
             unknowns: s.unknowns().take(500).cloned().collect(),
             findings: craft_anything_engine::tools::investigation_tools::cached(&s).findings,
@@ -1016,6 +1019,13 @@ impl CraftApp {
 
     /// Run a tool on a worker; the result goes to `route`.
     pub fn run_tool(&mut self, tool: &str, params: Value, route: Route, consent: Consent) {
+        let detach_workspace = matches!(route, Route::Chat { .. });
+        self.run_tool_with(tool, params, route, consent, detach_workspace);
+    }
+
+    /// As [`CraftApp::run_tool`], letting the caller decide whether to detach any attached build
+    /// workspace's `investigation.cany` before running the tool (#2341).
+    pub(crate) fn run_tool_with(&mut self, tool: &str, params: Value, route: Route, consent: Consent, detach_workspace: bool) {
         let Some(spec) = self.engine.registry().get(tool).copied() else {
             self.log(true, format!("No tool named {tool}"));
             return;
@@ -1039,6 +1049,9 @@ impl CraftApp {
         self.log(false, format!("Running {id}"));
         let chat = matches!(route, Route::Chat { .. });
         let job = self.jobs.spawn(title, true, move |j| {
+            if detach_workspace {
+                engine.session().detach_workspace_investigation();
+            }
             let progress = j.reporter();
             let opts = CallOptions::new(Caller::Ui).with_consent(consent).with_cancel(j.cancel.clone()).with_progress(&progress);
             let result = engine.call(&id, params.clone(), opts);
@@ -1053,9 +1066,23 @@ impl CraftApp {
     /// as `Done::Acted` and is shown by `acted`. A click is the person's consent. The job's id lets
     /// a screen ignore an answer that a newer request has replaced.
     pub fn act(&mut self, tool: &'static str, params: Value, title: String) -> u64 {
+        self.act_with(tool, params, title, false)
+    }
+
+    /// As [`CraftApp::act`], but first detaches any build workspace's `investigation.cany` from
+    /// the shared session so "Just look inside" actions (such as Game files) never write evidence
+    /// or journal entries into a previously built project (#2341).
+    pub(crate) fn act_detached(&mut self, tool: &'static str, params: Value, title: String) -> u64 {
+        self.act_with(tool, params, title, true)
+    }
+
+    pub(crate) fn act_with(&mut self, tool: &'static str, params: Value, title: String, detach_workspace: bool) -> u64 {
         let engine = self.engine.clone();
         let scope = params.clone();
         self.jobs.spawn(title, false, move |j| {
+            if detach_workspace {
+                engine.session().detach_workspace_investigation();
+            }
             let progress = j.reporter();
             let opts = CallOptions::new(Caller::Ui).with_consent(Consent::Granted).with_cancel(j.cancel.clone()).with_progress(&progress);
             let result = engine.call(tool, params, opts).map(|o| o.to_json().get("result").cloned().unwrap_or(Value::Null));
@@ -1208,6 +1235,7 @@ impl CraftApp {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         self.toast(i18n::trf("Opening {name}…", &[("name", &name)]), false);
         self.jobs.spawn(i18n::trf("Open {name}", &[("name", &name)]), true, move |j| {
+            engine.session().detach_workspace_investigation();
             let params = json!({"path": path.to_string_lossy()});
             let result = engine.call("core_target_open", params, CallOptions::new(Caller::Ui).with_cancel(j.cancel.clone())).map(|o| match o {
                 ToolOutput::Value(v) => v,
@@ -1258,8 +1286,14 @@ impl CraftApp {
     }
 
     pub fn first_look(&mut self, intro: &str, cta: bool) {
+        self.first_look_with(intro, cta, true);
+    }
+
+    /// Run the overview tool for chat, letting the caller decide whether to detach any attached
+    /// build workspace's `investigation.cany` first (#2341).
+    pub(crate) fn first_look_with(&mut self, intro: &str, cta: bool, detach_workspace: bool) {
         if let Some(tool) = self.first_look_tool() {
-            self.run_tool(tool, json!({}), Route::Chat { intro: intro.to_string(), cta }, Consent::NotAsked);
+            self.run_tool_with(tool, json!({}), Route::Chat { intro: intro.to_string(), cta }, Consent::NotAsked, detach_workspace);
         }
     }
 
@@ -1420,7 +1454,11 @@ impl CraftApp {
     }
 
     /// Send a question: to the AI when one is set up, otherwise answered by the built-in engines.
-    pub fn send(&mut self, text: &str) {
+    ///
+    /// `detach_workspace` is `true` for Beginner Ask ("Just look inside") so a fresh conversation
+    /// or no-AI first look detaches any attached build workspace's `investigation.cany`, and
+    /// `false` for the Experienced workbench console so it stays attached to the current project.
+    pub fn send(&mut self, text: &str, detach_workspace: bool) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
@@ -1431,9 +1469,23 @@ impl CraftApp {
             // doesn't take over (and stop) the answer.
             self.backend_choices = self.backend_choices.wrapping_add(1);
         }
+        if self.conversation.is_some()
+            && self.conversation_detaches != detach_workspace
+            && let Some(mut c) = self.conversation.take()
+        {
+            c.stop();
+        }
         if self.state.backend.is_some() && self.conversation.is_none() {
-            match self.hub.start(self.state.backend.as_deref(), self.beginner()) {
-                Ok(c) => self.conversation = Some(c),
+            let started = if detach_workspace {
+                self.hub.start_detached(self.state.backend.as_deref(), self.beginner())
+            } else {
+                self.hub.start(self.state.backend.as_deref(), self.beginner())
+            };
+            match started {
+                Ok(c) => {
+                    self.conversation = Some(c);
+                    self.conversation_detaches = detach_workspace;
+                }
                 // The AI that was picked didn't start (it may be turned off), so the error is the
                 // answer; an AI is set up, so the built-in engines' "no AI brain" line would be wrong.
                 Err(e) => {
@@ -1459,7 +1511,7 @@ impl CraftApp {
             });
             return;
         }
-        self.first_look(&tr("There's no AI brain set up yet, so here's what the built-in engines found:"), true);
+        self.first_look_with(&tr("There's no AI brain set up yet, so here's what the built-in engines found:"), true, detach_workspace);
     }
 
     /// Stop the answer being worked on: the AI's, and tools working for the conversation. Builds,
@@ -2437,5 +2489,378 @@ mod backend_snapshot_tests {
         assert_eq!(app.backends.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["New"]);
         app.handle_done(jobs::Finished { job: 3, result: Ok(snapshot(11, "Newer")) });
         assert_eq!(app.backends.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["Newer"]);
+    }
+
+    /// #2341: opening a file (`open_path`) or website (`run_tool("web_site_open", Route::Chat)`)
+    /// from "Just look inside" detaches any build workspace's `investigation.cany` on the worker
+    /// thread before the tool runs.
+    #[test]
+    fn just_look_inside_open_path_and_web_site_open_detach_build_investigation() {
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = demo::engine(Mode::Beginner, true);
+        let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
+        let inv_a = ws.investigation_dir();
+        let attach = || {
+            let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
+            engine.session().open_project(p).unwrap();
+        };
+        let drain_jobs = |app: &mut CraftApp, targets: &[u64]| {
+            let mut pending: std::collections::HashSet<u64> = targets.iter().copied().collect();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !pending.is_empty() && std::time::Instant::now() < deadline {
+                for f in app.jobs.poll() {
+                    pending.remove(&f.job);
+                    app.handle_done(f);
+                }
+                if !pending.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            assert!(pending.is_empty(), "background jobs did not finish: {pending:?}");
+        };
+
+        let mut app = demo::app(engine.clone());
+        // Deep mode lets core_target_open load file_b instead of being refused by Clean room.
+        demo::deep(&mut app);
+        let journal_of_a = || {
+            std::fs::read_dir(inv_a.join("journal"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 1. `open_path` detaches build workspace A on its own worker (verified before
+        //    `Done::Opened` runs `first_look`), and any follow-up `first_look` chat job started in
+        //    Beginner mode finishes before later steps re-attach A.
+        attach();
+        let file_b = dir.path().join("other.bin");
+        std::fs::write(&file_b, b"unrelated target B").unwrap();
+        let chat_before = app.chat_jobs.len();
+        app.open_path(file_b.clone());
+        let open_job = app.jobs.list.last().expect("open_path spawned a job").id;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut opened = None;
+        while opened.is_none() && std::time::Instant::now() < deadline {
+            for f in app.jobs.poll() {
+                if f.job == open_job {
+                    opened = Some(f);
+                } else {
+                    app.handle_done(f);
+                }
+            }
+            if opened.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let opened = opened.expect("open_path job finished");
+        match &opened.result {
+            Ok(Done::Opened { result: Ok(_), .. }) => {}
+            Ok(Done::Opened { result: Err(e), .. }) => panic!("open_path failed for unrelated target B: {e:?}"),
+            Ok(_) => panic!("open_path job returned unexpected Done variant"),
+            Err(e) => panic!("open_path worker failed: {e}"),
+        }
+        assert!(engine.session().project.is_none(), "open_path worker detached build workspace A before first_look");
+        assert_eq!(
+            engine.session().active().expect("opened target B is active").target.path,
+            file_b,
+            "session active target must be file_b rather than the demo target"
+        );
+        app.handle_done(opened);
+        let follow_up: Vec<u64> = app.chat_jobs[chat_before..].to_vec();
+        if !follow_up.is_empty() {
+            drain_jobs(&mut app, &follow_up);
+        }
+
+        // 2. `run_tool("web_site_open", ..., Route::Chat)` detaches build workspace A.
+        attach();
+        app.run_tool("web_site_open", json!({"url": "not-a-valid-url"}), Route::Chat { intro: String::new(), cta: false }, Consent::NotAsked);
+        let web_job = *app.chat_jobs.last().expect("web_site_open spawned a chat job");
+        drain_jobs(&mut app, &[web_job]);
+        assert!(engine.session().project.is_none(), "web_site_open chat entry detached build workspace A");
+
+        // 3. With no AI backend configured, `send()` falls back to `first_look` (`Route::Chat` ->
+        //    `core_target_triage`), which must detach build workspace A before running so A's
+        //    journal does not record `core_target_triage`.
+        app.state.backend = None;
+        app.conversation = None;
+        app.refresh_view();
+        assert!(app.view.active.is_some(), "opened target from step 1 is active");
+        attach();
+        let chat_before = app.chat_jobs.len();
+        app.send("What is inside this file?", true);
+        let first_look_jobs: Vec<u64> = app.chat_jobs[chat_before..].to_vec();
+        assert!(!first_look_jobs.is_empty(), "send() without an AI backend spawned a first_look chat job");
+        drain_jobs(&mut app, &first_look_jobs);
+        assert!(engine.session().project.is_none(), "no-AI first_look chat detached build workspace A");
+        let journal = journal_of_a();
+        assert!(!journal.contains("core_target_triage"), "no-AI first_look must not leak core_target_triage into A's journal: {journal}");
+
+        // 4. "A game's files": each GameFiles action re-attaches A first, drains its own job(s),
+        //    and asserts A was detached and its tool was not journaled into A.
+        attach();
+        let game_dir = dir.path().join("unrelated-game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        game_files::folder_picked(&mut app, game_dir.clone());
+        let game_jobs: Vec<u64> = app.state.game.jobs.keys().copied().collect();
+        assert_eq!(game_jobs.len(), 2, "folder_picked spawned archive scan and triage jobs");
+        drain_jobs(&mut app, &game_jobs);
+        assert!(engine.session().project.is_none(), "game_files::folder_picked detached build workspace A");
+        let journal = journal_of_a();
+        assert!(
+            !journal.contains("game_archives_list") && !journal.contains("core_target_triage"),
+            "folder_picked tools must not leak into build project A's journal: {journal}"
+        );
+
+        let fake_archive = game_dir.join("missing.pak").display().to_string();
+        for (kind, tool) in
+            [("unreal_pak", "game_pak_list"), ("unity_assets", "game_unity_list"), ("unreal_iostore", "game_iostore_list"), ("other", "game_unity_bundle_list")]
+        {
+            attach();
+            let before_jobs = app.jobs.list.len();
+            game_files::open_archive(&mut app, fake_archive.clone(), kind.into());
+            let new_jobs: Vec<u64> = app.jobs.list[before_jobs..].iter().map(|j| j.id).collect();
+            assert_eq!(new_jobs.len(), 1, "open_archive({kind}) spawned a listing job");
+            drain_jobs(&mut app, &new_jobs);
+            assert!(engine.session().project.is_none(), "open_archive({kind}) detached build workspace A");
+            let journal = journal_of_a();
+            assert!(!journal.contains(tool), "open_archive({kind}) must not leak {tool} into A's journal: {journal}");
+        }
+
+        for (kind, item, tool) in [
+            ("unreal_pak", json!({"path": "Hero/Tex.uasset"}), "game_unreal_texture_export"),
+            ("unity_bundle", json!({"file": "CAB-1", "path_id": 1}), "game_unity_asset_export"),
+        ] {
+            attach();
+            app.state.game.pending = Some(state::PendingPicture { archive: fake_archive.clone(), kind: kind.into(), item, name: "pic.png".into() });
+            let before_jobs = app.jobs.list.len();
+            game_files::save_to(&mut app, dir.path().join(format!("out-{kind}.png")));
+            let new_jobs: Vec<u64> = app.jobs.list[before_jobs..].iter().map(|j| j.id).collect();
+            assert_eq!(new_jobs.len(), 1, "save_to({kind}) spawned an export job");
+            drain_jobs(&mut app, &new_jobs);
+            assert!(engine.session().project.is_none(), "save_to({kind}) detached build workspace A");
+            let journal = journal_of_a();
+            assert!(!journal.contains(tool), "save_to({kind}) must not leak {tool} into A's journal: {journal}");
+        }
+    }
+
+    /// #2341 review: `refresh_view` must reload the cached evidence ledger after detaching a build
+    /// project even when the new session records the same number of entries as the detached one.
+    #[test]
+    fn refresh_view_reloads_ledger_when_detached_project_has_same_entry_count() {
+        use craft_anything_engine::evidence::{Confidence, Environment, EvidenceBuilder, Subject};
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = craft_anything_engine::Session::isolated(&dir.path().join("cfg"));
+        session.settings.language = "en".into();
+        let engine = Arc::new(Engine::new(session));
+        let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
+        let inv_a = Project::create(&ws.investigation_dir(), "ProjectA", Purpose::default()).unwrap();
+        let make_ev = |tool: &str| {
+            EvidenceBuilder::new(tool, Subject { kind: "file".into(), sha256: None, name: Some(tool.into()) }, Environment::builtin(false))
+                .result(json!({"from": tool}))
+                .summary(tool)
+                .confidence(Confidence::Observed)
+                .build()
+                .unwrap()
+        };
+        let ev_a = make_ev("tool_from_project_a");
+        inv_a.store_evidence(&ev_a).unwrap();
+        engine.session().open_project(inv_a).unwrap();
+
+        let mut app = demo::app(engine.clone());
+        app.mark_dirty();
+        app.refresh_view();
+        assert_eq!(app.view.ledger.len(), 1);
+        assert_eq!(app.view.ledger[0].id, ev_a.id, "initial view shows project A's evidence");
+
+        // Detach project A and record 1 new evidence entry (same count as before) without marking
+        // `view_dirty`, simulating a periodic `refresh_view` after a detached worker call.
+        assert!(engine.session().detach_workspace_investigation());
+        let ev_b = make_ev("tool_after_detach");
+        engine.session().record(ev_b.clone()).unwrap();
+        assert!(!app.view_dirty);
+        app.last_view = Some(Instant::now() - Duration::from_secs(5));
+        app.refresh_view();
+
+        assert_eq!(app.view.ledger.len(), 1);
+        assert_eq!(app.view.ledger[0].id, ev_b.id, "refreshed view shows new evidence instead of detached project A's");
+        assert!(app.view.project.is_none());
+    }
+
+    /// Local loopback HTTP server that answers every request with HTTP 500 so `ApiConversation`
+    /// finishes a turn quickly without depending on closed-port timeout behaviour.
+    struct MockApiServer {
+        base_url: String,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockApiServer {
+        fn start() -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let (mut got, mut buf) = (Vec::new(), [0u8; 4096]);
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.flush();
+                }
+            });
+            Self { base_url: format!("http://{addr}/v1"), stop, thread: Some(thread) }
+        }
+    }
+
+    impl Drop for MockApiServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Build a headless `CraftApp` pointed at `server` with isolated English settings.
+    fn make_local_api_app(cfg_dir: &std::path::Path, mode: Mode, server: &MockApiServer) -> (Arc<Engine>, CraftApp) {
+        let mut session = craft_anything_engine::Session::isolated(cfg_dir);
+        session.settings.mode = mode;
+        session.settings.language = "en".into();
+        let engine = Arc::new(Engine::new(session));
+        let mut app = demo::app(engine.clone());
+        let cfg = BackendConfig {
+            name: "LocalBox".into(),
+            kind: craft_anything_ai::BackendKind::OpenaiCompatible,
+            model: "m".into(),
+            base_url: Some(server.base_url.clone()),
+            ssh_host: None,
+            enabled: true,
+        };
+        app.hub.add_backend(cfg, None).unwrap();
+        app.state.backend = Some("LocalBox".into());
+        (engine, app)
+    }
+
+    /// Poll `app`'s active conversation until the current turn finishes (up to 30s).
+    fn wait_turn(app: &mut CraftApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            app.poll_conversation();
+            if !app.answering() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("conversation did not finish turn");
+    }
+
+    /// #2341 review: sending from the Experienced workbench console (`detach_workspace = false`)
+    /// keeps build project A attached, while sending from Beginner Ask (`detach_workspace = true`)
+    /// detaches A.
+    #[test]
+    fn workbench_send_keeps_build_project_while_ask_send_detaches_it() {
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let server = MockApiServer::start();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
+        let inv_a = ws.investigation_dir();
+        let make_attached = |mode: Mode| {
+            let (engine, app) = make_local_api_app(&dir.path().join(format!("cfg-{mode:?}")), mode, &server);
+            let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
+            engine.session().open_project(p).unwrap();
+            (engine, app)
+        };
+
+        // 1. Experienced workbench console path keeps build project A attached.
+        let (wb_engine, mut wb_app) = make_attached(Mode::Experienced);
+        wb_app.send("Inspect build project A", false);
+        wait_turn(&mut wb_app);
+        assert_eq!(
+            wb_engine.session().project.as_ref().map(|p| p.root.clone()),
+            Some(inv_a.clone()),
+            "workbench console chat must keep build project A attached"
+        );
+
+        // 2. Beginner Ask ("Just look inside") path detaches build project A.
+        let (ask_engine, mut ask_app) = make_attached(Mode::Beginner);
+        ask_app.send("Look inside something else", true);
+        wait_turn(&mut ask_app);
+        assert!(ask_engine.session().project.is_none(), "Beginner Ask chat must detach build project A");
+    }
+
+    /// #2341 review: switching between Beginner Ask (`detach_workspace = true`) and the
+    /// Experienced workbench console (`detach_workspace = false`) on the same `CraftApp` replaces
+    /// the active conversation with the matching mode without clearing `state.chat`.
+    #[test]
+    fn send_switches_conversation_when_detach_mode_changes() {
+        use craft_anything_engine::project::{Project, Purpose};
+        use craft_anything_engine::workspace::{TargetRef, Workspace};
+
+        let server = MockApiServer::start();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(&dir.path().join("projects"), "ProjectA", "Build A", TargetRef::None).unwrap();
+        let inv_a = ws.investigation_dir();
+        let attach = |engine: &Arc<Engine>| {
+            let p = Project::open(&inv_a).or_else(|_| Project::create(&inv_a, "ProjectA", Purpose::default())).unwrap();
+            engine.session().open_project(p).unwrap();
+        };
+
+        // 1. Ask (detached) -> attach A -> workbench (attached): A must stay attached and chat stays intact.
+        let (engine1, mut app1) = make_local_api_app(&dir.path().join("cfg-ask-to-wb"), Mode::Beginner, &server);
+        app1.send("First ask", true);
+        wait_turn(&mut app1);
+        attach(&engine1);
+        app1.send("Continue in workbench", false);
+        wait_turn(&mut app1);
+        assert_eq!(
+            engine1.session().project.as_ref().map(|p| p.root.clone()),
+            Some(inv_a.clone()),
+            "switching from Ask to workbench chat must keep build project A attached"
+        );
+        assert!(
+            app1.state.chat.iter().any(|item| matches!(item, ChatItem::User(t) if t == "First ask")),
+            "switching conversation mode must not clear existing chat history"
+        );
+
+        // 2. Workbench (attached) -> attach A -> Ask (detached): A must be detached and chat stays intact.
+        let (engine2, mut app2) = make_local_api_app(&dir.path().join("cfg-wb-to-ask"), Mode::Experienced, &server);
+        app2.send("First workbench", false);
+        wait_turn(&mut app2);
+        attach(&engine2);
+        app2.send("Switch to Ask", true);
+        wait_turn(&mut app2);
+        assert!(engine2.session().project.is_none(), "switching from workbench to Ask chat must detach build project A");
+        assert!(
+            app2.state.chat.iter().any(|item| matches!(item, ChatItem::User(t) if t == "First workbench")),
+            "switching conversation mode must not clear existing chat history"
+        );
     }
 }
