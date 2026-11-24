@@ -46,7 +46,7 @@ pub mod usage;
 pub mod widgets;
 pub mod workbench;
 
-use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, Conversation, Detected};
+use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, BackendEntry, BackendOptions, Conversation, Detected};
 use craft_anything_engine::evidence::{ErrorCode, Evidence, ToolError, Unknown};
 use craft_anything_engine::tools::site_sign_in::{self, SIGN_IN_TOOL, SIGN_OUT_TOOL};
 use craft_anything_engine::{CallOptions, Caller, Consent, Engine, Mode, Settings, TargetKind, ToolOutput, clean_room};
@@ -1476,11 +1476,17 @@ impl CraftApp {
     }
 
     pub fn add_backend(&mut self, config: BackendConfig, key: Option<String>) {
+        self.add_backend_with_options(config, BackendOptions::default(), key);
+    }
+
+    /// Add a backend with options (an SSH agent's remote command), cancellable with its job.
+    pub fn add_backend_with_options(&mut self, config: BackendConfig, options: BackendOptions, key: Option<String>) {
         let hub = self.hub.clone();
         let name = config.name.clone();
         let choices = self.backend_choices;
-        self.jobs.spawn(i18n::trf("Connect {name}", &[("name", &name)]), true, move |_| {
-            let result = hub.add_backend(config, key);
+        self.jobs.spawn(i18n::trf("Connect {name}", &[("name", &name)]), true, move |j| {
+            let entry = BackendEntry { config, options };
+            let result = hub.add_backend_with_until(entry, key, &j.cancel);
             Ok(Done::BackendAdded { name, result, choices, address: String::new() })
         });
     }
@@ -1907,6 +1913,7 @@ impl CraftApp {
                         self.server_form = ServerForm::default();
                     }
                     self.toast(i18n::trf("{name} is ready", &[("name", &name)]), false);
+                    self.state.remote_commands.remove(&name);
                     // Picking another AI (or none) while this one connected wins.
                     if choices == self.backend_choices {
                         self.select_backend(Some(name));
