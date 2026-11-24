@@ -28,6 +28,7 @@ pub enum Made {
     Love,
     CryEngine,
     Cocos,
+    Axmol,
 }
 
 impl Made {
@@ -45,6 +46,7 @@ impl Made {
             Made::Love => "LÖVE",
             Made::CryEngine => "CryEngine",
             Made::Cocos => "Cocos",
+            Made::Axmol => "Axmol",
         }
     }
 }
@@ -178,7 +180,7 @@ pub fn detect_in(files: &[(String, PathBuf)]) -> Option<Found> {
         return Some(found(Made::Godot, Some(v), l, Some("Its game data is packed inside the program.")));
     }
     type Rule<'a> = (Made, &'a dyn Fn(&str) -> bool);
-    let rules: [Rule; 9] = [
+    let rules: [Rule; 10] = [
         (Made::Source, &|l| file_name(l) == "gameinfo.txt" || l.ends_with("_dir.vpk")),
         (Made::Cube, &|l| l.starts_with("packages/") && (l.ends_with(".cgz") || l.ends_with(".ogz"))),
         (Made::GameMaker, &|l| ["data.win", "game.unx", "game.ios"].contains(&file_name(l))),
@@ -187,6 +189,7 @@ pub fn detect_in(files: &[(String, PathBuf)]) -> Option<Found> {
         (Made::MonoGame, &|l| ["monogame.framework.dll", "microsoft.xna.framework.dll", "fna.dll"].contains(&file_name(l))),
         (Made::Love, &|l| file_name(l) == "love.dll" || l.ends_with(".love")),
         (Made::CryEngine, &|l| file_name(l) == "crysystem.dll"),
+        (Made::Axmol, &|l| ["axmol.dll", "libaxmol.so", "libaxmol.dylib"].contains(&file_name(l))),
         (Made::Cocos, &|l| file_name(l).starts_with("libcocos2d")),
     ];
     rules.iter().find_map(|(engine, pred)| find(*pred).map(|(l, _)| found(*engine, None, l, None)))
@@ -1110,6 +1113,22 @@ mod tests {
         assert_eq!(Builder::for_game(Some(f.engine)), Builder::Unity, "engines we can't build with default to Unity");
 
         assert!(detect(&d.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn profiles_axmol_games_with_their_shared_engine_library() {
+        for library in ["Bin/Axmol.dll", "lib/libaxmol.so", "Game.app/Contents/Frameworks/libaxmol.dylib"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch(dir.path(), "axmol-notes.txt", b"notes");
+            assert!(profile(dir.path()).found.is_none());
+
+            touch(dir.path(), library, b"engine library");
+            let game = profile(dir.path());
+            assert_eq!(game.engine.as_deref(), Some("Axmol"), "{library}");
+            let found = game.found.unwrap();
+            assert_eq!(found.clue, library.to_ascii_lowercase());
+            assert_eq!(found.version, None);
+        }
     }
 
     #[test]
