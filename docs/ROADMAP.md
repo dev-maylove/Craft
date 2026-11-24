@@ -3651,6 +3651,9 @@ Owner: open · Status: in progress
       that need its own parsers (managed PE, Java class versus a universal Mach-O, APK by name
       or manifest, ASAR, text). Fat Mach-O files that start 0xCAFEBABF are now recognized.
       — claimed: FredApps, branch refactor/target-kind-craft-sniff
+- [x] Associated type paths (`A.Element.Iterator`, `A.Content.ID`, ...) decoded from multi-name
+      `QZ`/`QY` forms (and `qx`/`QX`/`Qa`), including nested-depth generic parameters.
+      — claimed: Chr0mium24, branch bugfix/r3.12-swift-demangle-assoc-type-unsupported
 
 ### R3.13 Web inspection correctness
 Owner: open · Status: in progress
