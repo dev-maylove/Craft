@@ -46,6 +46,10 @@ mod kept_check;
 pub mod kinds;
 mod locate;
 pub mod notes;
+pub mod oracle_console;
+#[cfg(test)]
+mod oracle_line;
+pub mod oracles;
 mod output;
 pub mod project;
 pub mod question;

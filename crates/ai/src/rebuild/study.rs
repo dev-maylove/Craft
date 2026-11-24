@@ -167,7 +167,7 @@ impl Worker {
                 if runtime && may_start(&program) && kinds::runs::is_console(&program) {
                     // A console program draws no window: run it with each input instead.
                     self.step(ws, Step::Study, Status::Inspecting, "Running it with a few inputs to see what it prints…")?;
-                    if let Some(section) = self.capture_runs(&program, &capture)? {
+                    if let Some(section) = self.capture_runs(ws, &program, &capture)? {
                         notes.push_str(&section);
                         console = true;
                     }

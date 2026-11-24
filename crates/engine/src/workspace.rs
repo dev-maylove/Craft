@@ -81,10 +81,11 @@ fn copy_tree(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize)
 }
 
 /// The current `craft.json` format version. Bumping it means appending a step to [`MANIFEST_STEPS`].
-pub const MANIFEST_VERSION: u32 = 5;
+pub const MANIFEST_VERSION: u32 = 6;
 
 /// The steps that bring an older `craft.json` forward; step `i` goes from version `i` to `i + 1`.
-const MANIFEST_STEPS: &[versioned::Step<Value>] = &[manifest_v0_to_v1, manifest_v1_to_v2, manifest_v2_to_v3, manifest_v3_to_v4, manifest_v4_to_v5];
+const MANIFEST_STEPS: &[versioned::Step<Value>] =
+    &[manifest_v0_to_v1, manifest_v1_to_v2, manifest_v2_to_v3, manifest_v3_to_v4, manifest_v4_to_v5, manifest_v5_to_v6];
 const _: () = assert!(MANIFEST_STEPS.len() == MANIFEST_VERSION as usize, "one step per craft.json version");
 
 /// Version 0 (no `version` field) has the same shape as version 1; only the number is new.
@@ -127,6 +128,13 @@ fn manifest_v4_to_v5(doc: &mut Value) -> Result<(), String> {
         obj.insert("capture_deep".into(), Value::Bool(true));
     }
     Ok(())
+}
+
+/// Version 6 adds the recorded behaviour a build is compared against (`script`). A version-5
+/// manifest has none: it was made before anything was recorded, so the step adds nothing and the
+/// project keeps the checks it had.
+fn manifest_v5_to_v6(doc: &mut Value) -> Result<(), String> {
+    if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
 }
 
 /// Read a `craft.json` document of any version this build understands. A newer manifest is read
@@ -426,6 +434,11 @@ pub struct Manifest {
     /// build recorded it (a failed study, or a capture copied in), so a run studies again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_deep: Option<bool>,
+    /// The behaviour recorded from the original, which a build is compared against: the script
+    /// and what the original was seen to do. None: nothing was recorded, so no build is judged
+    /// this way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<crate::oracle::Script>,
     /// Kinds of agent action the person allowed for this workspace ("bash:npm", "web_fetch"…).
     #[serde(default)]
     pub allowed_actions: Vec<String>,
@@ -505,6 +518,7 @@ impl Manifest {
             agent_session_by: None,
             agent_session_deep: None,
             capture_deep: None,
+            script: None,
             allowed_actions: Vec::new(),
             last_reply: String::new(),
             asset_budget_usd: ASSET_BUDGET_USD,
@@ -1862,7 +1876,9 @@ mod tests {
         assert_eq!(Workspace::list(dir.path().parent().unwrap()).iter().filter(|w| w.root == dir.path()).count(), 1, "still listed");
 
         // A newer manifest whose shape this build can't read at all is refused, in plain words.
-        std::fs::write(dir.path().join(MANIFEST), r#"{"version": 7, "name": {"parts": []}}"#).unwrap();
+        // A version this build does not know: the file is newer than this build.
+        let newer_version = MANIFEST_VERSION + 1;
+        std::fs::write(dir.path().join(MANIFEST), format!(r#"{{"version": {newer_version}, "name": {{"parts": []}}}}"#)).unwrap();
         let err = Workspace::open(dir.path()).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotSupported);
         assert!(err.message.contains("newer Craft Anything") && err.remediation.is_some());

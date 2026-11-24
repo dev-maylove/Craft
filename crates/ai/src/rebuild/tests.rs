@@ -2959,9 +2959,10 @@ fn console_study_keeps_two_real_observations_for_each_input() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let ws = Workspace::create(d.path(), "Counter", "Rebuild this console tool", TargetRef::Local { path: program.clone() }).unwrap();
+    let mut ws = Workspace::create(d.path(), "Counter", "Rebuild this console tool", TargetRef::Local { path: program.clone() }).unwrap();
     let worker = check_worker(&ws, true);
-    worker.capture_runs(&program, &ws.capture_dir()).unwrap();
+    let capture = ws.capture_dir();
+    worker.capture_runs(&mut ws, &program, &capture).unwrap();
     let records = kinds::runs::captured(&ws);
     assert_eq!(records.len(), kinds::runs::CASES.len());
     assert_eq!(std::fs::read_to_string(d.path().join("run-count.txt")).unwrap().trim(), "6");
@@ -3167,15 +3168,15 @@ impl TargetKind for LaterChecks {
     }
 }
 
-/// The app's sheet only.
-const APP_SHEET_ONLY: LaterChecks = LaterChecks(&AppKind, 3);
+/// The app's sheet only. The behaviour check sits before it, so it is the fourth.
+const APP_SHEET_ONLY: LaterChecks = LaterChecks(&AppKind, 4);
 
 #[test]
 fn apps_keep_the_sheet_only_when_deep_mode_decompiles_a_program() {
     let d = tempfile::tempdir().unwrap();
     let prog = Workspace::create(d.path(), "Tool", "Rebuild this app", TargetRef::Local { path: d.path().join("tool.exe") }).unwrap();
     let ids = AppKind.checks(&prog).iter().map(|c| c.id()).collect::<Vec<_>>();
-    assert_eq!(ids, ["build", "app-runs", "app-screenshot", "mechanics"]);
+    assert_eq!(ids, ["build", "app-runs", "console-behaviour", "app-screenshot", "mechanics"]);
     assert!(brief(&prog, "app", true, false, None, false, None).contains(kinds::mechanics::MECHANICS_CONTRACT));
     assert!(!brief(&prog, "app", false, false, None, false, None).contains("app/mechanics.json"), "Clean room doesn't ask for it");
 
