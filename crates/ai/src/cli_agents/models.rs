@@ -198,6 +198,23 @@ fn from_private_server(config: &BackendConfig, options: &BackendOptions, directo
         serve = serve.cwd(dir);
     }
     let Ok(mut server) = serve.spawn() else { return Ok(None) };
+    let found = ask_private_server(&mut server, &rx, config, options, directory, stop);
+    // Dropping only flags the kill; a CLI that exits next would leave the server running.
+    server.kill_and_wait(Duration::from_secs(5));
+    found
+}
+
+/// Read where the started server listens and its password, then ask it until its models arrive.
+/// A successful empty list is the answer once [`CATALOGUE_WAIT`] is up; with no successful answer
+/// by then, the last "still starting" or timed-out request's error is.
+fn ask_private_server(
+    server: &mut craft_anything_platform::RunningProcess,
+    rx: &std::sync::mpsc::Receiver<String>,
+    config: &BackendConfig,
+    options: &BackendOptions,
+    directory: Option<&Path>,
+    stop: &Stop,
+) -> Result<Option<Vec<AgentModel>>, ToolError> {
     let (mut url, mut password) = (None, None);
     let started = std::time::Instant::now();
     while url.is_none() || password.is_none() {
@@ -216,30 +233,36 @@ fn from_private_server(config: &BackendConfig, options: &BackendOptions, directo
     let (Some(url), Some(password)) = (url, password) else { return Ok(None) };
     let at_server = BackendOptions { args: vec!["--server".into(), url], ..options.clone() };
     let until = std::time::Instant::now() + CATALOGUE_WAIT;
-    let models = loop {
-        let models = match query_once(config, &at_server, directory, stop, Some(&password)) {
-            Ok(out) => parse_models(&out.stdout)?,
-            Err(e) if still_starting(&e) => Vec::new(),
+    loop {
+        let left = until.saturating_duration_since(std::time::Instant::now()).max(Duration::from_secs(1));
+        let answer = match query_once(config, &at_server, directory, stop, Some((&password, left))) {
+            Ok(out) => Ok(parse_models(&out.stdout)?),
+            Err(e) if still_starting(&e) || e.code == ErrorCode::TimedOut => Err(e),
             Err(e) => return Err(e),
         };
-        if !models.is_empty() || std::time::Instant::now() >= until {
-            break models;
+        if answer.as_ref().is_ok_and(|m| !m.is_empty()) || std::time::Instant::now() >= until {
+            return answer.map(Some);
         }
         pause(stop, Duration::from_millis(250))?;
-    };
-    server.kill_and_wait(Duration::from_secs(5));
-    Ok(Some(models))
+    }
 }
 
 /// Ask for the model list once. OpenCode prints its typed error (`{"_tag":…,"message":…}`) on
 /// stdout but only `HTTP 503 Service Unavailable` on stderr, and a failed run's error keeps only
 /// stderr (#1859), so the typed answer is read here, named in the message and kept in the details.
-fn query_once(config: &BackendConfig, options: &BackendOptions, directory: Option<&Path>, stop: &Stop, password: Option<&str>) -> Result<Output, ToolError> {
+/// `private`: the password and time limit for a private server's request (#2372).
+fn query_once(
+    config: &BackendConfig,
+    options: &BackendOptions,
+    directory: Option<&Path>,
+    stop: &Stop,
+    private: Option<(&str, Duration)>,
+) -> Result<Output, ToolError> {
     let (program, args) = query_command(config, options, directory)?;
     let stop = stop.clone();
     let mut process = query_process(config, options, directory)?;
-    if let Some(password) = password {
-        process = process.env("OPENCODE_SERVER_PASSWORD", password);
+    if let Some((password, limit)) = private {
+        process = process.env("OPENCODE_SERVER_PASSWORD", password).timeout(limit).idle_timeout(limit);
     }
     let out = process
         .cancel_when(move || stop.is_stopped())
