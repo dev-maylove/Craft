@@ -70,6 +70,12 @@ pub fn open_questions(ws: &Workspace) -> Vec<craft_anything_evidence::Unknown> {
     open
 }
 
+/// The owned-project tests record an intentional skip in their note. This is display only:
+/// the check can still let the project finish, including when reopening an older run.
+fn tests_not_run(check: &CheckResult) -> bool {
+    check.check == kinds::own::OwnTestsCheck::ID && check.passed && check.note.starts_with(check::NO_TESTS_RAN)
+}
+
 /// One plain line on how a round of checks went: how alike when compared, else how many checks
 /// pass, and how many of their claims hold ("about 93% like the original, 5 of 5 claims hold";
 /// "all 4 checks pass, 5 of 5 claims hold").
@@ -77,12 +83,24 @@ pub fn summary(checks: &[CheckResult], good_enough: f64) -> String {
     let claims: Vec<_> = checks.iter().flat_map(|c| &c.claims).collect();
     let held = claims.iter().filter(|c| c.passed).count();
     let claims_part = if claims.is_empty() { String::new() } else { format!(", {held} of {} claims hold", claims.len()) };
-    let good = checks.iter().filter(|c| c.good(good_enough)).count();
-    let mut text = match checks.iter().find_map(|c| c.similarity) {
-        Some(s) => format!("about {s:.0}% like the original{claims_part}"),
-        None if good == checks.len() => format!("all {} checks pass{claims_part}", checks.len()),
-        None => format!("{good} of {} checks pass{claims_part}", checks.len()),
+    let ran: Vec<_> = checks.iter().filter(|c| !tests_not_run(c)).collect();
+    let skipped_tests = ran.len() < checks.len();
+    let good = ran.iter().filter(|c| c.good(good_enough)).count();
+    let mut text = match ran.as_slice() {
+        [] if skipped_tests => return "no tests ran".into(),
+        [build] if skipped_tests && build.check == CheckResult::BUILD => {
+            // A static site can be ready without running a build command either.
+            if build.passed { build.note.trim_end_matches('.').into() } else { "build check failed".into() }
+        }
+        _ => match ran.iter().find_map(|c| c.similarity) {
+            Some(s) => format!("about {s:.0}% like the original{claims_part}"),
+            None if good == ran.len() => format!("all {} checks pass{claims_part}", ran.len()),
+            None => format!("{good} of {} checks pass{claims_part}", ran.len()),
+        },
     };
+    if skipped_tests {
+        text.push_str(" · no tests ran");
+    }
     let unverified: usize = checks.iter().map(|c| c.unknowns.len()).sum();
     match unverified {
         0 => {}
@@ -101,7 +119,14 @@ pub fn report(checks: &[CheckResult], good_enough: f64, open: &[craft_anything_e
     }
     let mut lines = Vec::new();
     for c in checks {
-        let mut line = format!("{}: {}", c.check, if c.passed { "passed" } else { "failed" });
+        let outcome = if tests_not_run(c) {
+            "not run"
+        } else if c.passed {
+            "passed"
+        } else {
+            "failed"
+        };
+        let mut line = format!("{}: {outcome}", c.check);
         if !c.good(good_enough) && !can_refine(c) {
             line.push_str(" (incomplete; another builder turn cannot resolve this)");
         }

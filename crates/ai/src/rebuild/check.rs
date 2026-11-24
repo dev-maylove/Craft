@@ -120,23 +120,25 @@ fn own_build(app: &Path, tool: &stacks::Toolchain, stop: &CheckStop) -> Result<(
     }
 }
 
+pub(super) const NO_TESTS_RAN: &str = "No tests ran";
+
 /// A person's own project: run its tests. Output that says none ran isn't a failure, and neither
 /// is a project we know no way to test, and the note says so.
 pub(super) fn own_tests_check(app: &Path, tool: Option<&stacks::Toolchain>, stop: &CheckStop) -> Result<(bool, String), ToolError> {
-    let Some(tool) = tool else { return Ok((true, "No tests ran: Craft Anything doesn't know how to test this kind of project.".into())) };
+    let Some(tool) = tool else { return Ok((true, format!("{NO_TESTS_RAN}: Craft Anything doesn't know how to test this kind of project."))) };
     let says_none = |text: &str| tool.no_tests.iter().find(|n| text.contains(n.as_str())).cloned();
     if let Some(name) = &tool.test_script {
         // shortcut: `workspaces=true` in .npmrc can give a root with no script tests; they aren't
         // run, and the note says so. Read .npmrc if that turns up.
         let script = craft_anything_engine::outputs::npm_script(app, name).unwrap_or_default();
         if script.is_empty() || tool.no_tests.iter().any(|n| n == script.trim()) {
-            return Ok((true, format!("No tests ran: package.json has no `{name}` script to run.")));
+            return Ok((true, format!("{NO_TESTS_RAN}: package.json has no `{name}` script to run.")));
         }
     }
     match run_tool(app, tool, &tool.test, 30, stop) {
         Ok((true, _)) => Ok((true, format!("`{}` passed.", tool.test.join(" ")))),
         Ok((false, out)) => match says_none(&out).filter(|_| tool.test_script.is_none()) {
-            Some(why) => Ok((true, format!("No tests ran: {}.", why.trim_end_matches('.')))),
+            Some(why) => Ok((true, format!("{NO_TESTS_RAN}: {}.", why.trim_end_matches('.')))),
             None => Ok((false, format!("The project's tests failed:\n{}", last_lines(&out, 20)))),
         },
         Err(e) => step_error("tests", e),

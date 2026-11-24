@@ -4464,6 +4464,12 @@ fn a_persons_own_project_is_judged_by_its_own_build_and_tests_whatever_its_kind(
     assert_eq!(r.iter().map(|c| c.check.as_str()).collect::<Vec<_>>(), [CheckResult::BUILD, kinds::own::OwnTestsCheck::ID]);
     assert!(r.iter().all(|c| c.passed), "{r:?}");
     assert!(r[1].note.starts_with("No tests ran"), "says what wasn't run: {}", r[1].note);
+    let summary = self_check::summary(&r, 90.0);
+    assert!(summary.contains("static site"), "{summary}");
+    assert!(summary.contains("no tests ran"), "{summary}");
+    assert!(!summary.contains("all 2 checks pass"), "{summary}");
+    let report = self_check::report(&r, 90.0, &[], |_| false);
+    assert!(report.contains("own-tests: not run"), "{report}");
 }
 
 /// A round of the builder's own checks has a time limit and looks at Pause before each check. A
