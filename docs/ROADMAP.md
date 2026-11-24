@@ -536,6 +536,11 @@ been run live.
       `TurnDone` left them out while coding agents count them. It counts them now; a live run on
       Ollama 0.40.7 had recorded 5,323 input tokens of 75,014
       — claimed: SoldierPePe, branch bugfix/r5.4-usage-cached-tokens
+- [x] A Claude Code turn's input tokens leave out the tokens it wrote to the prompt cache: the
+      `result` line's usage adds `input_tokens` and `cache_read_input_tokens` but not
+      `cache_creation_input_tokens`, so `TurnDone`, `usage.json` and "N tokens in" undercount a
+      fresh or resumed session, unlike the built-in loop above. It adds all three now
+      — claimed: thejesh23, branch bugfix/r5.4-claude-code-cache-writes
 - [ ] Told that its `cargo new app` made `app/app/`, the model kept editing `app/app/Cargo.toml`
       and running `cargo build` in `app/`, and checks 2 and 3 still found the project one folder
       down (live, GPU). See whether naming the move gets it out, or whether the run should move it
