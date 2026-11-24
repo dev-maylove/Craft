@@ -2377,8 +2377,13 @@ Owner: open · Status: in progress
       during replay, and report `cached_body_unavailable` when the best matching group has no
       usable answer. Build results count them; cached bodies still answer as 200 (#543)
       — claimed: Afloat16, branch bugfix/r3.11-standin-empty-304-20261103
-- [ ] Godot format 4 and IL2CPP metadata 38 and 39 are header-only; read their tables once a real
+- [ ] Godot format 4 and IL2CPP metadata 35 and 38 are header-only; read their tables once a real
       file can be checked
+- [x] Read IL2CPP metadata 39 (380-byte header of (offset, size, count) triples, literals found by
+      their start offsets, two-byte type indexes), with its layout measured on a shipped game's file
+      and the type names of its largest assembly (5,394) checked against another tool's reading of
+      the same file
+      — claimed: MarkusHalle, branch feature/r3.11-il2cpp-v39
 - [x] Bun: take each module's stored source map and bytecode out as files.
       — claimed: Afloat16, branch feature/r3.11-bun-module-payloads
 - [x] A standalone `.pyz`: a PyInstaller PYZ archive given on its own is its own packed reader
