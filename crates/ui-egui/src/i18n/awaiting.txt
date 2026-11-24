@@ -55,3 +55,4 @@ This run's builder didn't report how many tokens it used.
 Take a sound out of an Unreal game
 Hold to the floor
 Add with key
+Rust's installer is on this computer. Run `rustup default stable` in a terminal to finish setting it up.
