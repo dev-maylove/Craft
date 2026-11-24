@@ -3651,6 +3651,8 @@ Owner: open · Status: in progress
       that need its own parsers (managed PE, Java class versus a universal Mach-O, APK by name
       or manifest, ASAR, text). Fat Mach-O files that start 0xCAFEBABF are now recognized.
       — claimed: FredApps, branch refactor/target-kind-craft-sniff
+- [x] Swift local declarations decode: `L_` reads as a numbered local declaration (`f #1 … in main`), `Ll` as an anonymous file-discriminated one (`main.(in f)`), and `Le` as a related declaration (`related decl 'e' for …`).
+      — claimed: Chr0mium24, branch bugfix/r3.12-swift-demangle-local-decls
 
 ### R3.13 Web inspection correctness
 Owner: open · Status: in progress
